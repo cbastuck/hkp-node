@@ -1,0 +1,57 @@
+export type JsonRecord = Record<string, unknown>;
+
+export type ServiceRegistryEntry = {
+  serviceId: string;
+  serviceName: string;
+};
+
+export type ServiceConfiguration = {
+  serviceId: string;
+  uuid: string;
+  name?: string;
+  serviceName?: string;
+  state?: JsonRecord;
+};
+
+export type RuntimeConfiguration = {
+  id: string;
+  name: string;
+  boardName?: string;
+  services: ServiceConfiguration[];
+  inputs?: Array<Record<string, unknown>>;
+};
+
+export type RuntimeDescriptor = {
+  id: string;
+  name: string;
+  boardName: string;
+  services: ServiceDescriptor[];
+  inputs: Array<Record<string, unknown>>;
+  outputUrl?: string;
+};
+
+export type ServiceDescriptor = {
+  serviceId: string;
+  serviceName: string;
+  uuid: string;
+  state: JsonRecord;
+};
+
+export interface HostedService {
+  readonly serviceId: string;
+  readonly serviceName: string;
+  readonly uuid: string;
+  configure(config: JsonRecord): JsonRecord;
+  getState(): JsonRecord;
+  process(input: unknown, notify: (payload: unknown) => void): unknown;
+}
+
+export type HostedServiceFactory = {
+  descriptor: ServiceRegistryEntry;
+  create: (config: ServiceConfiguration) => HostedService;
+};
+
+export type RuntimeNotification = {
+  instanceId: string;
+  payload: unknown;
+};
