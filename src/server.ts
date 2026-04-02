@@ -5,6 +5,7 @@ import cors from "cors";
 import express, { NextFunction, Request, Response } from "express";
 import { WebSocketServer, WebSocket } from "ws";
 
+import { MapService, mapDescriptor } from "./services/map";
 import { MonitorService, monitorDescriptor } from "./services/monitor";
 import { HostedRuntime, RuntimeApp } from "./runtime";
 import {
@@ -38,6 +39,13 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
         create: (config) => new MonitorService(config),
       },
     ],
+    [
+      mapDescriptor.serviceId,
+      {
+        descriptor: mapDescriptor,
+        create: (config) => new MapService(config),
+      },
+    ],
   ]);
 
   const runtimeApp = new RuntimeApp(factories);
@@ -67,7 +75,10 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
     return runtime.serialize(runtimeOutputUrl(runtime.id));
   }
 
-  function sendJsonNotification(runtimeId: string, notification: RuntimeNotification) {
+  function sendJsonNotification(
+    runtimeId: string,
+    notification: RuntimeNotification,
+  ) {
     const sockets = runtimeSockets.get(runtimeId);
     if (!sockets || sockets.size === 0) {
       return;
@@ -93,7 +104,10 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
     socket.send(JSON.stringify({ type: "result", data: result }));
   }
 
-  function getRuntimeOr404(res: Response, runtimeId: string): HostedRuntime | null {
+  function getRuntimeOr404(
+    res: Response,
+    runtimeId: string,
+  ): HostedRuntime | null {
     const runtime = runtimeApp.getRuntime(runtimeId);
     if (!runtime) {
       res.sendStatus(404);
@@ -104,7 +118,9 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
 
   expressApp.get("/runtimes", (_req, res) => {
     res.json({
-      runtimes: runtimeApp.getRuntimes().map((runtime) => serializeRuntime(runtime)),
+      runtimes: runtimeApp
+        .getRuntimes()
+        .map((runtime) => serializeRuntime(runtime)),
       registry: runtimeApp.getRegistry(),
     });
   });
@@ -115,7 +131,10 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
   });
 
   expressApp.post("/runtimes", (req, res) => {
-    if (!req.body || (typeof req.body !== "object" && !Array.isArray(req.body))) {
+    if (
+      !req.body ||
+      (typeof req.body !== "object" && !Array.isArray(req.body))
+    ) {
       res.sendStatus(400);
       return;
     }
@@ -159,7 +178,10 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
     if (!runtime) {
       return;
     }
-    if (!Array.isArray(req.body) || !req.body.every((entry) => typeof entry === "string")) {
+    if (
+      !Array.isArray(req.body) ||
+      !req.body.every((entry) => typeof entry === "string")
+    ) {
       res.sendStatus(400);
       return;
     }
@@ -229,7 +251,9 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
     }
 
     try {
-      const state = runtime.addService(config, (serviceConfig) => runtimeApp.createService(serviceConfig));
+      const state = runtime.addService(config, (serviceConfig) =>
+        runtimeApp.createService(serviceConfig),
+      );
       res.json(state);
     } catch {
       res.sendStatus(400);
@@ -302,13 +326,15 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
     },
   );
 
-  expressApp.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
-    if (err instanceof SyntaxError) {
-      res.sendStatus(400);
-      return;
-    }
-    res.status(500).json({ error: err.message });
-  });
+  expressApp.use(
+    (err: Error, _req: Request, res: Response, _next: NextFunction) => {
+      if (err instanceof SyntaxError) {
+        res.sendStatus(400);
+        return;
+      }
+      res.status(500).json({ error: err.message });
+    },
+  );
 
   httpServer.on("upgrade", (request, socket, head) => {
     const url = new URL(request.url ?? "/", `http://${request.headers.host}`);
@@ -324,43 +350,46 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
     });
   });
 
-  webSocketServer.on("connection", (socket: WebSocket, _request: http.IncomingMessage, runtimeId: string) => {
-    const sockets = runtimeSockets.get(runtimeId) ?? new Set<WebSocket>();
-    sockets.add(socket);
-    runtimeSockets.set(runtimeId, sockets);
+  webSocketServer.on(
+    "connection",
+    (socket: WebSocket, _request: http.IncomingMessage, runtimeId: string) => {
+      const sockets = runtimeSockets.get(runtimeId) ?? new Set<WebSocket>();
+      sockets.add(socket);
+      runtimeSockets.set(runtimeId, sockets);
 
-    socket.on("close", () => {
-      const current = runtimeSockets.get(runtimeId);
-      current?.delete(socket);
-      if (current && current.size === 0) {
-        runtimeSockets.delete(runtimeId);
-      }
-    });
+      socket.on("close", () => {
+        const current = runtimeSockets.get(runtimeId);
+        current?.delete(socket);
+        if (current && current.size === 0) {
+          runtimeSockets.delete(runtimeId);
+        }
+      });
 
-    socket.on("message", (raw) => {
-      let message: WsInboundMessage;
-      try {
-        message = JSON.parse(raw.toString());
-      } catch {
-        return;
-      }
-
-      if (message.type === "readwrite") {
-        return;
-      }
-
-      if (message.type === "processRuntime" && isJsonRecord(message.params)) {
-        const runtime = runtimeApp.getRuntime(runtimeId);
-        if (!runtime) {
+      socket.on("message", (raw) => {
+        let message: WsInboundMessage;
+        try {
+          message = JSON.parse(raw.toString());
+        } catch {
           return;
         }
-        const result = runtime.process(message.params, (notification) => {
-          sendJsonNotification(runtimeId, notification);
-        });
-        sendJsonResult(socket, result);
-      }
-    });
-  });
+
+        if (message.type === "readwrite") {
+          return;
+        }
+
+        if (message.type === "processRuntime" && isJsonRecord(message.params)) {
+          const runtime = runtimeApp.getRuntime(runtimeId);
+          if (!runtime) {
+            return;
+          }
+          const result = runtime.process(message.params, (notification) => {
+            sendJsonNotification(runtimeId, notification);
+          });
+          sendJsonResult(socket, result);
+        }
+      });
+    },
+  );
 
   return {
     expressApp,
@@ -407,7 +436,9 @@ function isJsonRecord(value: unknown): value is JsonRecord {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function validateRuntimeConfiguration(value: unknown): RuntimeConfiguration | null {
+function validateRuntimeConfiguration(
+  value: unknown,
+): RuntimeConfiguration | null {
   if (!isJsonRecord(value)) {
     return null;
   }
@@ -430,12 +461,15 @@ function validateRuntimeConfiguration(value: unknown): RuntimeConfiguration | nu
   return {
     id: value.id,
     name: value.name,
-    boardName: typeof value.boardName === "string" ? value.boardName : undefined,
+    boardName:
+      typeof value.boardName === "string" ? value.boardName : undefined,
     services,
   };
 }
 
-function validateServiceConfiguration(value: unknown): ServiceConfiguration | null {
+function validateServiceConfiguration(
+  value: unknown,
+): ServiceConfiguration | null {
   if (!isJsonRecord(value)) {
     return null;
   }
@@ -450,7 +484,8 @@ function validateServiceConfiguration(value: unknown): ServiceConfiguration | nu
     serviceId: value.serviceId,
     uuid: value.uuid,
     name: typeof value.name === "string" ? value.name : undefined,
-    serviceName: typeof value.serviceName === "string" ? value.serviceName : undefined,
+    serviceName:
+      typeof value.serviceName === "string" ? value.serviceName : undefined,
     state: value.state,
   };
 }

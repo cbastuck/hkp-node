@@ -87,7 +87,9 @@ export class HostedRuntime {
   removeService(uuid: string): boolean {
     const deleted = this.services.delete(uuid);
     if (deleted) {
-      this.serviceOrder = this.serviceOrder.filter((serviceUuid) => serviceUuid !== uuid);
+      this.serviceOrder = this.serviceOrder.filter(
+        (serviceUuid) => serviceUuid !== uuid,
+      );
     }
     return deleted;
   }
@@ -119,8 +121,28 @@ export class HostedRuntime {
         continue;
       }
 
+      onNotification({
+        instanceId: uuid,
+        payload: {
+          __internal: {
+            state: "call-process",
+            data: result,
+          },
+        },
+      });
+
       result = service.process(result, (payload) => {
         onNotification({ instanceId: uuid, payload });
+      });
+
+      onNotification({
+        instanceId: uuid,
+        payload: {
+          __internal: {
+            state: "call-process-finished",
+            data: result,
+          },
+        },
       });
 
       if (result === null || result === undefined) {

@@ -3,6 +3,7 @@ import request from "supertest";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { createRuntimeServer } from "../src/server";
+import { mapDescriptor } from "../src/services/map";
 import { monitorDescriptor } from "../src/services/monitor";
 
 describe("hkp-node runtime server", () => {
@@ -33,7 +34,7 @@ describe("hkp-node runtime server", () => {
       })
       .expect(200);
 
-    expect(response.body.registry).toEqual([monitorDescriptor]);
+    expect(response.body.registry).toEqual([monitorDescriptor, mapDescriptor]);
     expect(response.body.runtimes).toHaveLength(1);
     expect(response.body.runtimes[0]).toMatchObject({
       id: "rt-1",
@@ -42,7 +43,9 @@ describe("hkp-node runtime server", () => {
       services: [],
       inputs: [],
     });
-    expect(response.body.runtimes[0].outputUrl).toBe(`${baseUrl.replace("http", "ws")}/rt-1`);
+    expect(response.body.runtimes[0].outputUrl).toBe(
+      `${baseUrl.replace("http", "ws")}/rt-1`,
+    );
   });
 
   it("adds, configures, queries, and removes services", async () => {
@@ -127,7 +130,43 @@ describe("hkp-node runtime server", () => {
       socket.on("message", (raw) => {
         const message = JSON.parse(raw.toString());
         collected.push(message);
-        if (collected.some((entry) => entry.type === "notification") && collected.some((entry) => entry.type === "result")) {
+        const notifications = collected.filter(
+          (entry) => entry.type === "notification",
+        );
+        const hasProcessStart = notifications.some((entry) => {
+          try {
+            return (
+              JSON.parse(entry.value)?.__internal?.state === "call-process"
+            );
+          } catch {
+            return false;
+          }
+        });
+        const hasProcessDone = notifications.some((entry) => {
+          try {
+            return (
+              JSON.parse(entry.value)?.__internal?.state ===
+              "call-process-finished"
+            );
+          } catch {
+            return false;
+          }
+        });
+        const hasPayloadNotification = notifications.some((entry) => {
+          try {
+            const parsed = JSON.parse(entry.value);
+            return parsed?.hello === "world";
+          } catch {
+            return false;
+          }
+        });
+
+        if (
+          hasProcessStart &&
+          hasProcessDone &&
+          hasPayloadNotification &&
+          collected.some((entry) => entry.type === "result")
+        ) {
           clearTimeout(timeout);
           socket.close();
           resolve(collected);
@@ -140,11 +179,40 @@ describe("hkp-node runtime server", () => {
       });
     });
 
-    const notification = messages.find((entry) => entry.type === "notification");
+    const notifications = messages.filter(
+      (entry) => entry.type === "notification",
+    );
+    const payloadNotification = notifications.find((entry) => {
+      try {
+        const parsed = JSON.parse(entry.value);
+        return parsed?.hello === "world";
+      } catch {
+        return false;
+      }
+    });
+    const startNotification = notifications.find((entry) => {
+      try {
+        return JSON.parse(entry.value)?.__internal?.state === "call-process";
+      } catch {
+        return false;
+      }
+    });
+    const finishNotification = notifications.find((entry) => {
+      try {
+        return (
+          JSON.parse(entry.value)?.__internal?.state === "call-process-finished"
+        );
+      } catch {
+        return false;
+      }
+    });
     const result = messages.find((entry) => entry.type === "result");
 
-    expect(JSON.parse(notification.value)).toEqual({ hello: "world" });
-    expect(notification.instanceId).toBe("svc-1");
+    expect(startNotification).toBeDefined();
+    expect(finishNotification).toBeDefined();
+    expect(payloadNotification).toBeDefined();
+    expect(JSON.parse(payloadNotification.value)).toEqual({ hello: "world" });
+    expect(payloadNotification.instanceId).toBe("svc-1");
     expect(result.data).toEqual({ hello: "world" });
 
     await request(server.httpServer)
@@ -152,6 +220,49 @@ describe("hkp-node runtime server", () => {
       .expect(200)
       .expect(({ body }) => {
         expect(body.message).toContain('"hello": "world"');
+      });
+  });
+
+  it("maps runtime payloads using map templates and mode semantics", async () => {
+    await createRuntime([
+      {
+        serviceId: mapDescriptor.serviceId,
+        uuid: "map-1",
+        state: {
+          mode: "overwrite",
+          template: {
+            greeting: "hello",
+            "count=": "params.count + 1",
+            "meta.kind": "mapped",
+          },
+        },
+      },
+    ]);
+
+    await request(server.httpServer)
+      .post("/runtimes/rt-1")
+      .send({ count: 3, preserved: true })
+      .expect(200)
+      .expect(({ body }) => {
+        expect(body).toEqual({
+          count: 4,
+          preserved: true,
+          greeting: "hello",
+          meta: { kind: "mapped" },
+        });
+      });
+
+    await request(server.httpServer)
+      .post("/runtimes/rt-1/services/map-1")
+      .send({ mode: "add", template: { "count=": "42" } })
+      .expect(200);
+
+    await request(server.httpServer)
+      .post("/runtimes/rt-1")
+      .send({ count: 10 })
+      .expect(200)
+      .expect(({ body }) => {
+        expect(body.count).toBe(10);
       });
   });
 
