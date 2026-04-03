@@ -87,6 +87,9 @@ export class HostedRuntime {
   }
 
   removeService(uuid: string): boolean {
+    const service = this.services.get(uuid);
+    service?.destroy?.();
+
     const deleted = this.services.delete(uuid);
     if (deleted) {
       this.serviceOrder = this.serviceOrder.filter(
@@ -94,6 +97,14 @@ export class HostedRuntime {
       );
     }
     return deleted;
+  }
+
+  destroy(): void {
+    for (const service of this.services.values()) {
+      service.destroy?.();
+    }
+    this.services.clear();
+    this.serviceOrder = [];
   }
 
   rearrangeServices(newOrder: string[]): boolean {
@@ -162,6 +173,9 @@ export class RuntimeApp {
   constructor(private readonly registry: Map<string, HostedServiceFactory>) {}
 
   createRuntime(config: RuntimeConfiguration): HostedRuntime {
+    const existing = this.runtimes.get(config.id);
+    existing?.destroy();
+
     const runtime = new HostedRuntime(config, (serviceConfig) =>
       this.createService(serviceConfig),
     );
@@ -178,10 +192,15 @@ export class RuntimeApp {
   }
 
   removeRuntime(runtimeId: string): boolean {
+    const runtime = this.runtimes.get(runtimeId);
+    runtime?.destroy();
     return this.runtimes.delete(runtimeId);
   }
 
   removeAllRuntimes(): void {
+    for (const runtime of this.runtimes.values()) {
+      runtime.destroy();
+    }
     this.runtimes.clear();
   }
 

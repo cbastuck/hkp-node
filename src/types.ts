@@ -53,6 +53,7 @@ export interface HostedService {
     input: unknown,
     notify: (payload: unknown, instanceId?: string) => void,
   ): unknown;
+  destroy?(): void;
 }
 
 export type ServiceCreator = (config: ServiceConfiguration) => HostedService;

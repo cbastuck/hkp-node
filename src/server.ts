@@ -8,6 +8,10 @@ import { WebSocketServer, WebSocket } from "ws";
 import { MapService, mapDescriptor } from "./services/map";
 import { MonitorService, monitorDescriptor } from "./services/monitor";
 import { SubService, subServiceDescriptor } from "./services/sub-service";
+import {
+  HttpServerSubservicesService,
+  httpServerSubservicesDescriptor,
+} from "./services/http-server";
 import { HostedRuntime, RuntimeApp } from "./runtime";
 import {
   HostedServiceFactory,
@@ -53,6 +57,14 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
         descriptor: subServiceDescriptor,
         create: (config, createService) =>
           new SubService(config, createService),
+      },
+    ],
+    [
+      httpServerSubservicesDescriptor.serviceId,
+      {
+        descriptor: httpServerSubservicesDescriptor,
+        create: (config, createService) =>
+          new HttpServerSubservicesService(config, createService),
       },
     ],
   ]);
@@ -279,23 +291,34 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
     res.json(serializeRuntime(runtime));
   });
 
-  expressApp.post("/runtimes/:runtimeId/services/:instanceId", (req, res) => {
-    const runtime = getRuntimeOr404(res, req.params.runtimeId);
-    if (!runtime) {
-      return;
-    }
-    if (!isJsonRecord(req.body)) {
-      res.sendStatus(400);
-      return;
-    }
+  expressApp.post(
+    "/runtimes/:runtimeId/services/:instanceId",
+    async (req, res) => {
+      const runtime = getRuntimeOr404(res, req.params.runtimeId);
+      if (!runtime) {
+        return;
+      }
+      if (!isJsonRecord(req.body)) {
+        res.sendStatus(400);
+        return;
+      }
 
-    const state = runtime.configureService(req.params.instanceId, req.body);
-    if (!state) {
-      res.sendStatus(404);
-      return;
-    }
-    res.json(state);
-  });
+      let state = runtime.configureService(req.params.instanceId, req.body);
+      if (!state) {
+        res.sendStatus(404);
+        return;
+      }
+
+      // Some services (for example http-server-subservices with port 0)
+      // transition asynchronously and update state shortly after configure().
+      state = await waitForServiceActivationState(
+        runtime,
+        req.params.instanceId,
+      );
+
+      res.json(state);
+    },
+  );
 
   expressApp.get("/runtimes/:runtimeId/services/:instanceId", (req, res) => {
     const runtime = getRuntimeOr404(res, req.params.runtimeId);
@@ -495,4 +518,44 @@ function validateServiceConfiguration(
       typeof value.serviceName === "string" ? value.serviceName : undefined,
     state: value.state,
   };
+}
+
+async function waitForServiceActivationState(
+  runtime: HostedRuntime,
+  instanceId: string,
+): Promise<JsonRecord> {
+  const maxAttempts = 20;
+  const delayMs = 10;
+
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    const service = runtime.getService(instanceId);
+    if (!service) {
+      return {};
+    }
+
+    const state = service.getState();
+    const bypass = state.bypass;
+    const port = state.port;
+
+    if (
+      typeof bypass === "boolean" &&
+      bypass === false &&
+      typeof port === "number" &&
+      port === 0
+    ) {
+      await sleep(delayMs);
+      continue;
+    }
+
+    return state;
+  }
+
+  const service = runtime.getService(instanceId);
+  return service?.getState() ?? {};
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
 }
