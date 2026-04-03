@@ -3,6 +3,8 @@ export type JsonRecord = Record<string, unknown>;
 export type ServiceRegistryEntry = {
   serviceId: string;
   serviceName: string;
+  version?: string;
+  capabilities?: string[];
 };
 
 export type ServiceConfiguration = {
@@ -33,6 +35,8 @@ export type RuntimeDescriptor = {
 export type ServiceDescriptor = {
   serviceId: string;
   serviceName: string;
+  version?: string;
+  capabilities?: string[];
   uuid: string;
   state: JsonRecord;
 };
@@ -40,6 +44,8 @@ export type ServiceDescriptor = {
 export interface HostedService {
   readonly serviceId: string;
   readonly serviceName: string;
+  readonly version?: string;
+  readonly capabilities?: string[];
   readonly uuid: string;
   configure(config: JsonRecord): JsonRecord;
   getState(): JsonRecord;

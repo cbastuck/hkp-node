@@ -6,8 +6,10 @@ import {
 } from "../types";
 
 export const mapDescriptor: ServiceRegistryEntry = {
-  serviceId: "hookup.to/service/map",
+  serviceId: "map",
   serviceName: "Map",
+  version: "v1",
+  capabilities: [],
 };
 
 type MapMode = "replace" | "add" | "overwrite";
@@ -21,6 +23,8 @@ type MapState = JsonRecord & {
 export class MapService implements HostedService {
   readonly serviceId = mapDescriptor.serviceId;
   readonly serviceName = mapDescriptor.serviceName;
+  readonly version = mapDescriptor.version;
+  readonly capabilities = mapDescriptor.capabilities;
   readonly uuid: string;
 
   private state: MapState;

@@ -6,7 +6,7 @@ import {
 } from "../types";
 
 export const monitorDescriptor: ServiceRegistryEntry = {
-  serviceId: "hookup.to/service/monitor",
+  serviceId: "monitor",
   serviceName: "Monitor",
 };
 

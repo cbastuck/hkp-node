@@ -53,6 +53,8 @@ export class HostedRuntime {
       .map((service) => ({
         serviceId: service.serviceId,
         serviceName: service.serviceName,
+        version: service.version,
+        capabilities: service.capabilities,
         uuid: service.uuid,
         state: service.getState(),
       }));
