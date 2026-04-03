@@ -5,6 +5,7 @@ import {
   RuntimeConfiguration,
   RuntimeDescriptor,
   RuntimeNotification,
+  ServiceCreator,
   ServiceConfiguration,
   ServiceDescriptor,
 } from "./types";
@@ -16,6 +17,7 @@ export class HostedRuntime {
 
   private readonly services = new Map<string, HostedService>();
   private serviceOrder: string[] = [];
+  private readonly createService: ServiceCreator;
 
   constructor(
     config: RuntimeConfiguration,
@@ -24,9 +26,10 @@ export class HostedRuntime {
     this.id = config.id;
     this.name = config.name;
     this.boardName = config.boardName ?? "";
+    this.createService = createService;
 
     for (const serviceConfig of config.services) {
-      this.addService(serviceConfig, createService);
+      this.addService(serviceConfig);
     }
   }
 
@@ -64,15 +67,12 @@ export class HostedRuntime {
     return this.services.get(uuid);
   }
 
-  addService(
-    config: ServiceConfiguration,
-    createService: (config: ServiceConfiguration) => HostedService,
-  ): JsonRecord {
+  addService(config: ServiceConfiguration): JsonRecord {
     if (this.services.has(config.uuid)) {
       throw new Error(`Service already exists: ${config.uuid}`);
     }
 
-    const service = createService(config);
+    const service = this.createService(config);
     this.services.set(service.uuid, service);
     this.serviceOrder.push(service.uuid);
     return service.getState();
@@ -113,7 +113,7 @@ export class HostedRuntime {
   }
 
   process(
-    input: JsonRecord,
+    input: unknown,
     onNotification: (notification: RuntimeNotification) => void,
   ): unknown {
     let result: unknown = input;
@@ -133,8 +133,8 @@ export class HostedRuntime {
         },
       });
 
-      result = service.process(result, (payload) => {
-        onNotification({ instanceId: uuid, payload });
+      result = service.process(result, (payload, instanceId) => {
+        onNotification({ instanceId: instanceId ?? uuid, payload });
       });
 
       onNotification({
@@ -194,6 +194,8 @@ export class RuntimeApp {
     if (!factory) {
       throw new Error(`Unknown serviceId: ${config.serviceId}`);
     }
-    return factory.create(config);
+    return factory.create(config, (serviceConfig) =>
+      this.createService(serviceConfig),
+    );
   }
 }

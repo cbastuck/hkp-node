@@ -49,12 +49,20 @@ export interface HostedService {
   readonly uuid: string;
   configure(config: JsonRecord): JsonRecord;
   getState(): JsonRecord;
-  process(input: unknown, notify: (payload: unknown) => void): unknown;
+  process(
+    input: unknown,
+    notify: (payload: unknown, instanceId?: string) => void,
+  ): unknown;
 }
+
+export type ServiceCreator = (config: ServiceConfiguration) => HostedService;
 
 export type HostedServiceFactory = {
   descriptor: ServiceRegistryEntry;
-  create: (config: ServiceConfiguration) => HostedService;
+  create: (
+    config: ServiceConfiguration,
+    createService: ServiceCreator,
+  ) => HostedService;
 };
 
 export type RuntimeNotification = {

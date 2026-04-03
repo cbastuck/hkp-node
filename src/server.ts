@@ -7,6 +7,7 @@ import { WebSocketServer, WebSocket } from "ws";
 
 import { MapService, mapDescriptor } from "./services/map";
 import { MonitorService, monitorDescriptor } from "./services/monitor";
+import { SubService, subServiceDescriptor } from "./services/sub-service";
 import { HostedRuntime, RuntimeApp } from "./runtime";
 import {
   HostedServiceFactory,
@@ -36,14 +37,22 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
       monitorDescriptor.serviceId,
       {
         descriptor: monitorDescriptor,
-        create: (config) => new MonitorService(config),
+        create: (config, _createService) => new MonitorService(config),
       },
     ],
     [
       mapDescriptor.serviceId,
       {
         descriptor: mapDescriptor,
-        create: (config) => new MapService(config),
+        create: (config, _createService) => new MapService(config),
+      },
+    ],
+    [
+      subServiceDescriptor.serviceId,
+      {
+        descriptor: subServiceDescriptor,
+        create: (config, createService) =>
+          new SubService(config, createService),
       },
     ],
   ]);
@@ -251,9 +260,7 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
     }
 
     try {
-      const state = runtime.addService(config, (serviceConfig) =>
-        runtimeApp.createService(serviceConfig),
-      );
+      const state = runtime.addService(config);
       res.json(state);
     } catch {
       res.sendStatus(400);

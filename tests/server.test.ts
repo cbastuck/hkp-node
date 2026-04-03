@@ -5,6 +5,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { createRuntimeServer } from "../src/server";
 import { mapDescriptor } from "../src/services/map";
 import { monitorDescriptor } from "../src/services/monitor";
+import { subServiceDescriptor } from "../src/services/sub-service";
 
 describe("hkp-node runtime server", () => {
   const server = createRuntimeServer({ externalHost: "127.0.0.1" });
@@ -34,7 +35,11 @@ describe("hkp-node runtime server", () => {
       })
       .expect(200);
 
-    expect(response.body.registry).toEqual([monitorDescriptor, mapDescriptor]);
+    expect(response.body.registry).toEqual([
+      monitorDescriptor,
+      mapDescriptor,
+      subServiceDescriptor,
+    ]);
     expect(response.body.runtimes).toHaveLength(1);
     expect(response.body.runtimes[0]).toMatchObject({
       id: "rt-1",
@@ -263,6 +268,92 @@ describe("hkp-node runtime server", () => {
       .expect(200)
       .expect(({ body }) => {
         expect(body.count).toBe(10);
+      });
+  });
+
+  it("supports sub-service pipelines with append/remove/configure operations", async () => {
+    await createRuntime([
+      {
+        serviceId: subServiceDescriptor.serviceId,
+        uuid: "sub-1",
+        state: {
+          pipeline: [
+            {
+              serviceId: monitorDescriptor.serviceId,
+              instanceId: "sub-monitor-1",
+              state: { logToConsole: false },
+            },
+          ],
+        },
+      },
+    ]);
+
+    const afterAppend = await request(server.httpServer)
+      .post("/runtimes/rt-1/services/sub-1")
+      .send({
+        appendService: {
+          serviceId: mapDescriptor.serviceId,
+          state: {
+            mode: "replace",
+            template: {
+              "count=": "params.count + 1",
+            },
+          },
+        },
+      })
+      .expect(200);
+
+    expect(afterAppend.body.pipeline).toHaveLength(2);
+    const appendedMap = afterAppend.body.pipeline.find(
+      (entry: any) => entry.serviceId === mapDescriptor.serviceId,
+    );
+    expect(typeof appendedMap.instanceId).toBe("string");
+    expect(appendedMap.instanceId.length).toBeGreaterThan(0);
+
+    await request(server.httpServer)
+      .post("/runtimes/rt-1")
+      .send({ count: 3 })
+      .expect(200)
+      .expect(({ body }) => {
+        expect(body).toEqual({ count: 4 });
+      });
+
+    await request(server.httpServer)
+      .post("/runtimes/rt-1/services/sub-1")
+      .send({
+        configureService: {
+          instanceId: appendedMap.instanceId,
+          state: {
+            mode: "add",
+            template: {
+              tag: "ok",
+            },
+          },
+        },
+      })
+      .expect(200)
+      .expect(({ body }) => {
+        const mapEntry = body.pipeline.find(
+          (entry: any) => entry.instanceId === appendedMap.instanceId,
+        );
+        expect(mapEntry.state.mode).toBe("add");
+      });
+
+    await request(server.httpServer)
+      .post("/runtimes/rt-1")
+      .send({ count: 3 })
+      .expect(200)
+      .expect(({ body }) => {
+        expect(body).toEqual({ tag: "ok", count: 3 });
+      });
+
+    await request(server.httpServer)
+      .post("/runtimes/rt-1/services/sub-1")
+      .send({ removeService: "sub-monitor-1" })
+      .expect(200)
+      .expect(({ body }) => {
+        expect(body.pipeline).toHaveLength(1);
+        expect(body.pipeline[0].serviceId).toBe(mapDescriptor.serviceId);
       });
   });
 
