@@ -4,19 +4,24 @@ import {
   JsonRecord,
   RuntimeConfiguration,
   RuntimeDescriptor,
+  RuntimeHost,
   RuntimeNotification,
   ServiceCreator,
   ServiceConfiguration,
   ServiceDescriptor,
 } from "./types";
 
-export class HostedRuntime {
+export class HostedRuntime implements RuntimeHost {
   readonly id: string;
   readonly name: string;
   readonly boardName: string;
 
   private readonly services = new Map<string, HostedService>();
   private serviceOrder: string[] = [];
+  private readonly notificationTargets = new Set<
+    (notification: RuntimeNotification) => void
+  >();
+  private readonly resultTargets = new Set<(result: unknown) => void>();
   private readonly createService: ServiceCreator;
 
   constructor(
@@ -73,6 +78,9 @@ export class HostedRuntime {
     }
 
     const service = this.createService(config);
+
+    service.setHost?.(this);
+
     this.services.set(service.uuid, service);
     this.serviceOrder.push(service.uuid);
     return service.getState();
@@ -105,6 +113,30 @@ export class HostedRuntime {
     }
     this.services.clear();
     this.serviceOrder = [];
+    this.notificationTargets.clear();
+    this.resultTargets.clear();
+  }
+
+  registerNotificationTarget(
+    target: (notification: RuntimeNotification) => void,
+  ): () => void {
+    this.notificationTargets.add(target);
+    return () => {
+      this.notificationTargets.delete(target);
+    };
+  }
+
+  registerResultTarget(target: (result: unknown) => void): () => void {
+    this.resultTargets.add(target);
+    return () => {
+      this.resultTargets.delete(target);
+    };
+  }
+
+  emitResult(output: unknown): void {
+    for (const target of this.resultTargets) {
+      target(output);
+    }
   }
 
   rearrangeServices(newOrder: string[]): boolean {
@@ -127,36 +159,71 @@ export class HostedRuntime {
     input: unknown,
     onNotification: (notification: RuntimeNotification) => void,
   ): unknown {
+    return this.processFromIndex(0, input, onNotification);
+  }
+
+  // ── RuntimeHost ────────────────────────────────────────────────────────────
+
+  processFrom(
+    startAfterUuid: string,
+    input: unknown,
+    onNotification: (notification: RuntimeNotification) => void,
+  ): unknown {
+    const startIndex = this.serviceOrder.indexOf(startAfterUuid) + 1;
+    return this.processFromIndex(startIndex, input, onNotification);
+  }
+
+  notify(payload: unknown, instanceId: string): void {
+    this.emitNotification({ instanceId, payload }, () => {});
+  }
+
+  // ──────────────────────────────────────────────────────────────────────────
+
+  private processFromIndex(
+    startIndex: number,
+    input: unknown,
+    onNotification: (notification: RuntimeNotification) => void,
+  ): unknown {
     let result: unknown = input;
-    for (const uuid of this.serviceOrder) {
+
+    for (const uuid of this.serviceOrder.slice(startIndex)) {
       const service = this.services.get(uuid);
       if (!service) {
         continue;
       }
 
-      onNotification({
-        instanceId: uuid,
-        payload: {
-          __internal: {
-            state: "call-process",
-            data: result,
+      this.emitNotification(
+        {
+          instanceId: uuid,
+          payload: {
+            __internal: {
+              state: "call-process",
+              data: result,
+            },
           },
         },
-      });
+        onNotification,
+      );
 
       result = service.process(result, (payload, instanceId) => {
-        onNotification({ instanceId: instanceId ?? uuid, payload });
+        this.emitNotification(
+          { instanceId: instanceId ?? uuid, payload },
+          onNotification,
+        );
       });
 
-      onNotification({
-        instanceId: uuid,
-        payload: {
-          __internal: {
-            state: "call-process-finished",
-            data: result,
+      this.emitNotification(
+        {
+          instanceId: uuid,
+          payload: {
+            __internal: {
+              state: "call-process-finished",
+              data: result,
+            },
           },
         },
-      });
+        onNotification,
+      );
 
       if (result === null || result === undefined) {
         break;
@@ -164,6 +231,16 @@ export class HostedRuntime {
     }
 
     return result;
+  }
+
+  private emitNotification(
+    notification: RuntimeNotification,
+    onNotification: (notification: RuntimeNotification) => void,
+  ): void {
+    onNotification(notification);
+    for (const target of this.notificationTargets) {
+      target(notification);
+    }
   }
 }
 

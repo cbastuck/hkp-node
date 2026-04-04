@@ -171,6 +171,16 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
       }
 
       const runtime = runtimeApp.createRuntime(config);
+      runtime.registerNotificationTarget((notification) => {
+        sendJsonNotification(runtime.id, notification);
+      });
+      runtime.registerResultTarget((result) => {
+        const sockets = runtimeSockets.get(runtime.id);
+        if (!sockets) return;
+        for (const socket of sockets) {
+          sendJsonResult(socket, result);
+        }
+      });
       runtimes.push(serializeRuntime(runtime));
     }
 
@@ -223,8 +233,8 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
       return;
     }
 
-    const result = runtime.process(req.body, (notification) => {
-      sendJsonNotification(runtime.id, notification);
+    const result = runtime.process(req.body, () => {
+      // Notifications are broadcast through runtime notification targets.
     });
     res.json(result);
   });
@@ -412,8 +422,8 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
           if (!runtime) {
             return;
           }
-          const result = runtime.process(message.params, (notification) => {
-            sendJsonNotification(runtimeId, notification);
+          const result = runtime.process(message.params, () => {
+            // Notifications are broadcast through runtime notification targets.
           });
           sendJsonResult(socket, result);
         }

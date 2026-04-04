@@ -53,6 +53,7 @@ export interface HostedService {
     input: unknown,
     notify: (payload: unknown, instanceId?: string) => void,
   ): unknown;
+  setHost?(host: RuntimeHost): void;
   destroy?(): void;
 }
 
@@ -70,3 +71,13 @@ export type RuntimeNotification = {
   instanceId: string;
   payload: unknown;
 };
+
+export interface RuntimeHost {
+  processFrom(
+    startAfterUuid: string,
+    data: unknown,
+    onNotification: (notification: RuntimeNotification) => void,
+  ): unknown;
+  notify(payload: unknown, instanceId: string): void;
+  emitResult(output: unknown): void;
+}

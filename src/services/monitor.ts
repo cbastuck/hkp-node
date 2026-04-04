@@ -55,7 +55,8 @@ export class MonitorService implements HostedService {
   }
 
   getState(): JsonRecord {
-    return { ...this.state };
+    const { message: _message, ...config } = this.state;
+    return config;
   }
 
   process(input: unknown, notify: (payload: unknown) => void): unknown {

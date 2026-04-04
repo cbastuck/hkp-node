@@ -5,6 +5,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { createRuntimeServer } from "../src/server";
 import { mapDescriptor } from "../src/services/map";
 import { monitorDescriptor } from "../src/services/monitor";
+import { httpServerSubservicesDescriptor } from "../src/services/http-server";
 import { subServiceDescriptor } from "../src/services/sub-service";
 
 describe("hkp-node runtime server", () => {
@@ -39,6 +40,7 @@ describe("hkp-node runtime server", () => {
       monitorDescriptor,
       mapDescriptor,
       subServiceDescriptor,
+      httpServerSubservicesDescriptor,
     ]);
     expect(response.body.runtimes).toHaveLength(1);
     expect(response.body.runtimes[0]).toMatchObject({
@@ -68,7 +70,6 @@ describe("hkp-node runtime server", () => {
     expect(createServiceResponse.body).toMatchObject({
       logToConsole: true,
       renderTextEditor: false,
-      message: "",
     });
 
     await request(server.httpServer)
@@ -224,7 +225,7 @@ describe("hkp-node runtime server", () => {
       .get("/runtimes/rt-1/services/svc-1")
       .expect(200)
       .expect(({ body }) => {
-        expect(body.message).toContain('"hello": "world"');
+        expect(body.message).toBeUndefined();
       });
   });
 
@@ -354,6 +355,115 @@ describe("hkp-node runtime server", () => {
       .expect(({ body }) => {
         expect(body.pipeline).toHaveLength(1);
         expect(body.pipeline[0].serviceId).toBe(mapDescriptor.serviceId);
+      });
+  });
+
+  it("injects HTTP subservice output into downstream outer runtime services", async () => {
+    await createRuntime([
+      {
+        serviceId: httpServerSubservicesDescriptor.serviceId,
+        uuid: "http-sub-1",
+        state: {
+          bypass: false,
+          mode: "process_on_session",
+          port: 0,
+          pipeline: [
+            {
+              serviceId: mapDescriptor.serviceId,
+              instanceId: "inner-map-1",
+              state: {
+                mode: "replace",
+                template: {
+                  source: "http",
+                  "path=": "params.path",
+                  "method=": "params.method",
+                },
+              },
+            },
+          ],
+        },
+      },
+      {
+        serviceId: monitorDescriptor.serviceId,
+        uuid: "outer-monitor-1",
+      },
+    ]);
+
+    const configureResponse = await request(server.httpServer)
+      .post("/runtimes/rt-1/services/http-sub-1")
+      .send({ bypass: false })
+      .expect(200);
+
+    const port = configureResponse.body.port;
+    expect(typeof port).toBe("number");
+    expect(port).toBeGreaterThan(0);
+
+    const curlLifecycleSeen = new Promise<void>((resolve, reject) => {
+      const socket = new WebSocket(
+        `ws://127.0.0.1:${new URL(baseUrl).port}/rt-1`,
+      );
+      let sawStart = false;
+      let sawFinish = false;
+      const timeout = setTimeout(() => {
+        socket.close();
+        reject(
+          new Error("Timed out waiting for curl process lifecycle events"),
+        );
+      }, 5000);
+
+      socket.on("message", (raw) => {
+        const message = JSON.parse(raw.toString());
+        if (
+          message.type !== "notification" ||
+          message.instanceId !== "http-sub-1"
+        ) {
+          return;
+        }
+
+        const payload = JSON.parse(message.value);
+        if (payload?.__internal?.state === "call-process") {
+          sawStart = true;
+        }
+        if (payload?.__internal?.state === "call-process-finished") {
+          sawFinish = true;
+        }
+
+        if (sawStart && sawFinish) {
+          clearTimeout(timeout);
+          socket.close();
+          resolve();
+        }
+      });
+
+      socket.on("open", async () => {
+        try {
+          const response = await fetch(`http://127.0.0.1:${port}/hello`);
+          expect(response.status).toBe(200);
+        } catch (error) {
+          clearTimeout(timeout);
+          socket.close();
+          reject(error);
+        }
+      });
+
+      socket.on("error", (error) => {
+        clearTimeout(timeout);
+        reject(error);
+      });
+    });
+
+    await expect(curlLifecycleSeen).resolves.toBeUndefined();
+
+    const innerResponse = await fetch(`http://127.0.0.1:${port}/hello`);
+    expect(innerResponse.status).toBe(200);
+    const payload = await innerResponse.json();
+    expect(payload).toEqual({ source: "http", path: "/hello", method: "GET" });
+
+    await request(server.httpServer)
+      .get("/runtimes/rt-1/services/outer-monitor-1")
+      .expect(200)
+      .expect(({ body }) => {
+        expect(body.message).toBeUndefined();
       });
   });
 

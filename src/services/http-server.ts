@@ -5,6 +5,7 @@ import { HostedRuntime } from "../runtime";
 import {
   HostedService,
   JsonRecord,
+  RuntimeHost,
   ServiceConfiguration,
   ServiceCreator,
   ServiceRegistryEntry,
@@ -44,9 +45,7 @@ export class HttpServerSubservicesService implements HostedService {
   private pipelineConfig: ServiceConfiguration[] = [];
   private pipeline: HostedRuntime | null = null;
   private readonly createService: ServiceCreator;
-  private notifyFromProcess:
-    | ((payload: unknown, instanceId?: string) => void)
-    | null = null;
+  private host: RuntimeHost | null = null;
 
   constructor(config: ServiceConfiguration, createService: ServiceCreator) {
     this.uuid = config.uuid;
@@ -139,12 +138,14 @@ export class HttpServerSubservicesService implements HostedService {
     return state;
   }
 
+  setHost(host: RuntimeHost): void {
+    this.host = host;
+  }
+
   process(
     input: unknown,
-    notify: (payload: unknown, instanceId?: string) => void,
+    _notify: (payload: unknown, instanceId?: string) => void,
   ): unknown {
-    this.notifyFromProcess = notify;
-
     if (this.mode === "process_on_data") {
       this.latestData = input;
     }
@@ -182,7 +183,7 @@ export class HttpServerSubservicesService implements HostedService {
       const address = this.server?.address();
       if (address && typeof address !== "string") {
         this.port = address.port;
-        this.notifyFromProcess?.({ port: this.port }, this.uuid);
+        this.notify({ port: this.port }, this.uuid);
       }
     });
   }
@@ -213,16 +214,45 @@ export class HttpServerSubservicesService implements HostedService {
     }
 
     let output: unknown;
+    let processInput: unknown;
     if (this.mode === "process_on_data") {
-      output = this.latestData;
+      processInput = this.latestData;
+      output = processInput;
     } else {
       const url = new URL(req.url ?? "/", "http://localhost");
-      const input = {
+      processInput = {
         path: url.pathname,
         method: req.method ?? "GET",
       };
-      output = this.processSessionInput(input);
+      output = this.processSessionInput(processInput);
     }
+
+    this.notify(
+      {
+        __internal: {
+          state: "call-process",
+          data: processInput,
+        },
+      },
+      this.uuid,
+    );
+
+    if (this.host) {
+      output = this.host.processFrom(this.uuid, output, (notification) => {
+        this.notify(notification.payload, notification.instanceId);
+      });
+      this.host.emitResult(output);
+    }
+
+    this.notify(
+      {
+        __internal: {
+          state: "call-process-finished",
+          data: output,
+        },
+      },
+      this.uuid,
+    );
 
     res.statusCode = 200;
     res.setHeader("content-type", "application/json");
@@ -236,8 +266,12 @@ export class HttpServerSubservicesService implements HostedService {
     }
 
     return this.pipeline.process(input, (notification) => {
-      this.notifyFromProcess?.(notification.payload, notification.instanceId);
+      this.notify(notification.payload, notification.instanceId);
     });
+  }
+
+  private notify(payload: unknown, instanceId?: string): void {
+    this.host?.notify(payload, instanceId ?? this.uuid);
   }
 
   private syncStates(): void {
