@@ -12,6 +12,7 @@ import {
   HttpServerSubservicesService,
   httpServerSubservicesDescriptor,
 } from "./services/http-server";
+import { TimerService, timerDescriptor } from "./services/timer";
 import { HostedRuntime, RuntimeApp } from "./runtime";
 import {
   HostedServiceFactory,
@@ -65,6 +66,13 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
         descriptor: httpServerSubservicesDescriptor,
         create: (config, createService) =>
           new HttpServerSubservicesService(config, createService),
+      },
+    ],
+    [
+      timerDescriptor.serviceId,
+      {
+        descriptor: timerDescriptor,
+        create: (config, _createService) => new TimerService(config),
       },
     ],
   ]);
