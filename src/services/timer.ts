@@ -1,3 +1,15 @@
+/**
+ * Service Documentation
+ * Service ID: timer
+ * Service Name: Timer
+ * Runtime: hkp-node
+ * Modes: periodic | oneShot
+ * Key Config: service-specific timer fields (period, units, triggers)
+ * IO: in=any -> out=tick payload or delayed payload
+ * Arrays: treated as generic input
+ * Binary: pass-through when payload-based
+ * MixedData: not native in runtime
+ */
 import {
   JsonRecord,
   RuntimeHost,

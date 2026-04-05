@@ -1,3 +1,15 @@
+/**
+ * Service Documentation
+ * Service ID: monitor
+ * Service Name: Monitor
+ * Runtime: hkp-node
+ * Modes: observe
+ * Key Config: runtime-specific observe/log settings
+ * IO: in=any -> out=identity
+ * Arrays: pass-through
+ * Binary: inspect/log support depends on runtime UI/logging
+ * MixedData: not native in runtime
+ */
 import {
   HostedService,
   JsonRecord,

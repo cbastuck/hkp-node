@@ -1,3 +1,15 @@
+/**
+ * Service Documentation
+ * Service ID: map
+ * Service Name: Map
+ * Runtime: hkp-node
+ * Modes: replace | add | overwrite | sensingMode
+ * Key Config: template, mode, sensingMode
+ * IO: in=object|array|scalar -> out=mapped payload
+ * Arrays: maps each element
+ * Binary: not intended for raw binary
+ * MixedData: not native in runtime
+ */
 import {
   HostedService,
   JsonRecord,

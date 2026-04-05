@@ -1,3 +1,15 @@
+/**
+ * Service Documentation
+ * Service ID: sub-service
+ * Service Name: SubService
+ * Runtime: hkp-node
+ * Modes: sub-pipeline execution
+ * Key Config: pipeline/subservices configuration
+ * IO: in=any -> out=pipeline result
+ * Arrays: service-defined, typically forwarded
+ * Binary: depends on nested services
+ * MixedData: not native in runtime
+ */
 import { randomUUID } from "node:crypto";
 
 import { HostedRuntime } from "../runtime";

@@ -1,3 +1,15 @@
+/**
+ * Service Documentation
+ * Service ID: http-server-subservices
+ * Service Name: HttpServerSubservices
+ * Runtime: hkp-node
+ * Modes: session pipeline hosting
+ * Key Config: host/port/routes/subservices
+ * IO: in=request envelope -> out=response envelope
+ * Arrays: not primary
+ * Binary: depends on endpoint + nested services
+ * MixedData: not native in runtime
+ */
 import http, { IncomingMessage, ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
 
