@@ -7,6 +7,7 @@ import { mapDescriptor } from "../src/services/map";
 import { monitorDescriptor } from "../src/services/monitor";
 import { httpServerSubservicesDescriptor } from "../src/services/http-server";
 import { subServiceDescriptor } from "../src/services/sub-service";
+import { timerDescriptor } from "../src/services/timer";
 
 describe("hkp-node runtime server", () => {
   const server = createRuntimeServer({ externalHost: "127.0.0.1" });
@@ -41,6 +42,7 @@ describe("hkp-node runtime server", () => {
       mapDescriptor,
       subServiceDescriptor,
       httpServerSubservicesDescriptor,
+      timerDescriptor,
     ]);
     expect(response.body.runtimes).toHaveLength(1);
     expect(response.body.runtimes[0]).toMatchObject({
