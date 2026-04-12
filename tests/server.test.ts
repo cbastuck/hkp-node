@@ -8,6 +8,7 @@ import { monitorDescriptor } from "../src/services/monitor";
 import { httpServerSubservicesDescriptor } from "../src/services/http-server";
 import { subServiceDescriptor } from "../src/services/sub-service";
 import { timerDescriptor } from "../src/services/timer";
+import { peerServerDescriptor } from "../src/services/peer-server";
 
 describe("hkp-node runtime server", () => {
   const server = createRuntimeServer({ externalHost: "127.0.0.1" });
@@ -43,6 +44,7 @@ describe("hkp-node runtime server", () => {
       subServiceDescriptor,
       httpServerSubservicesDescriptor,
       timerDescriptor,
+      peerServerDescriptor,
     ]);
     expect(response.body.runtimes).toHaveLength(1);
     expect(response.body.runtimes[0]).toMatchObject({
@@ -406,6 +408,7 @@ describe("hkp-node runtime server", () => {
       );
       let sawStart = false;
       let sawFinish = false;
+      let sawOuterMonitorPayload = false;
       const timeout = setTimeout(() => {
         socket.close();
         reject(
@@ -415,22 +418,34 @@ describe("hkp-node runtime server", () => {
 
       socket.on("message", (raw) => {
         const message = JSON.parse(raw.toString());
-        if (
-          message.type !== "notification" ||
-          message.instanceId !== "http-sub-1"
-        ) {
+        if (message.type !== "notification") {
           return;
         }
 
         const payload = JSON.parse(message.value);
-        if (payload?.__internal?.state === "call-process") {
+        if (
+          message.instanceId === "http-sub-1" &&
+          payload?.__internal?.state === "call-process"
+        ) {
           sawStart = true;
         }
-        if (payload?.__internal?.state === "call-process-finished") {
+        if (
+          message.instanceId === "http-sub-1" &&
+          payload?.__internal?.state === "call-process-finished"
+        ) {
           sawFinish = true;
         }
 
-        if (sawStart && sawFinish) {
+        if (
+          message.instanceId === "outer-monitor-1" &&
+          payload?.source === "http" &&
+          payload?.path === "/hello" &&
+          payload?.method === "GET"
+        ) {
+          sawOuterMonitorPayload = true;
+        }
+
+        if (sawStart && sawFinish && sawOuterMonitorPayload) {
           clearTimeout(timeout);
           socket.close();
           resolve();
@@ -460,13 +475,6 @@ describe("hkp-node runtime server", () => {
     expect(innerResponse.status).toBe(200);
     const payload = await innerResponse.json();
     expect(payload).toEqual({ source: "http", path: "/hello", method: "GET" });
-
-    await request(server.httpServer)
-      .get("/runtimes/rt-1/services/outer-monitor-1")
-      .expect(200)
-      .expect(({ body }) => {
-        expect(body.message).toBeUndefined();
-      });
   });
 
   async function createRuntime(services: Array<Record<string, unknown>> = []) {

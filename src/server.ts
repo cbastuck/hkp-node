@@ -13,6 +13,10 @@ import {
   httpServerSubservicesDescriptor,
 } from "./services/http-server";
 import { TimerService, timerDescriptor } from "./services/timer";
+import {
+  PeerServerService,
+  peerServerDescriptor,
+} from "./services/peer-server";
 import { HostedRuntime, RuntimeApp } from "./runtime";
 import {
   HostedServiceFactory,
@@ -73,6 +77,13 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
       {
         descriptor: timerDescriptor,
         create: (config, _createService) => new TimerService(config),
+      },
+    ],
+    [
+      peerServerDescriptor.serviceId,
+      {
+        descriptor: peerServerDescriptor,
+        create: (config, _createService) => new PeerServerService(config),
       },
     ],
   ]);
@@ -204,11 +215,9 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
   });
 
   expressApp.delete("/runtimes/:runtimeId", (req, res) => {
-    const removed = runtimeApp.removeRuntime(req.params.runtimeId);
-    if (!removed) {
-      res.sendStatus(404);
-      return;
-    }
+    // Always return success — if the runtime was already destroyed (e.g. by a
+    // WebSocket disconnect) the desired state is the same as an explicit delete.
+    runtimeApp.removeRuntime(req.params.runtimeId);
     res.json({ id: req.params.runtimeId });
   });
 
@@ -410,6 +419,10 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
         current?.delete(socket);
         if (current && current.size === 0) {
           runtimeSockets.delete(runtimeId);
+          // Last client disconnected — destroy the runtime immediately so its
+          // resources (ports, file handles, etc.) are released. If the board is
+          // saved and the page reloads, POST /runtimes will recreate it cleanly.
+          runtimeApp.removeRuntime(runtimeId);
         }
       });
 
