@@ -21,6 +21,14 @@ import {
   ImapEmailService,
   imapEmailDescriptor,
 } from "./services/imap-email";
+import {
+  TelegramListenerService,
+  telegramListenerDescriptor,
+} from "./services/telegram-listener";
+import {
+  TelegramSenderService,
+  telegramSenderDescriptor,
+} from "./services/telegram-sender";
 import { HostedRuntime, RuntimeApp } from "./runtime";
 import {
   HostedServiceFactory,
@@ -95,6 +103,21 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
       {
         descriptor: imapEmailDescriptor,
         create: (config, _createService) => new ImapEmailService(config),
+      },
+    ],
+    [
+      telegramListenerDescriptor.serviceId,
+      {
+        descriptor: telegramListenerDescriptor,
+        create: (config, _createService) =>
+          new TelegramListenerService(config),
+      },
+    ],
+    [
+      telegramSenderDescriptor.serviceId,
+      {
+        descriptor: telegramSenderDescriptor,
+        create: (config, _createService) => new TelegramSenderService(config),
       },
     ],
   ]);
