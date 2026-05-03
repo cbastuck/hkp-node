@@ -17,6 +17,10 @@ import {
   PeerServerService,
   peerServerDescriptor,
 } from "./services/peer-server";
+import {
+  ImapEmailService,
+  imapEmailDescriptor,
+} from "./services/imap-email";
 import { HostedRuntime, RuntimeApp } from "./runtime";
 import {
   HostedServiceFactory,
@@ -84,6 +88,13 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
       {
         descriptor: peerServerDescriptor,
         create: (config, _createService) => new PeerServerService(config),
+      },
+    ],
+    [
+      imapEmailDescriptor.serviceId,
+      {
+        descriptor: imapEmailDescriptor,
+        create: (config, _createService) => new ImapEmailService(config),
       },
     ],
   ]);
