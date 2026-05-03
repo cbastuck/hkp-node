@@ -29,6 +29,10 @@ import {
   TelegramSenderService,
   telegramSenderDescriptor,
 } from "./services/telegram-sender";
+import {
+  SmtpEmailService,
+  smtpEmailDescriptor,
+} from "./services/smtp-email";
 import { HostedRuntime, RuntimeApp } from "./runtime";
 import {
   HostedServiceFactory,
@@ -47,7 +51,7 @@ type CreateRuntimeServerOptions = {
 
 type WsInboundMessage = {
   type?: string;
-  params?: JsonRecord;
+  params?: unknown;
 };
 
 export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
@@ -118,6 +122,13 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
       {
         descriptor: telegramSenderDescriptor,
         create: (config, _createService) => new TelegramSenderService(config),
+      },
+    ],
+    [
+      smtpEmailDescriptor.serviceId,
+      {
+        descriptor: smtpEmailDescriptor,
+        create: (config, _createService) => new SmtpEmailService(config),
       },
     ],
   ]);
@@ -279,7 +290,7 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
     if (!runtime) {
       return;
     }
-    if (!isJsonRecord(req.body)) {
+    if (req.body === undefined) {
       res.sendStatus(400);
       return;
     }
@@ -472,7 +483,7 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
           return;
         }
 
-        if (message.type === "processRuntime" && isJsonRecord(message.params)) {
+        if (message.type === "processRuntime" && message.params !== undefined) {
           const runtime = runtimeApp.getRuntime(runtimeId);
           if (!runtime) {
             return;

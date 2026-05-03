@@ -12,6 +12,7 @@ import { peerServerDescriptor } from "../src/services/peer-server";
 import { imapEmailDescriptor } from "../src/services/imap-email";
 import { telegramListenerDescriptor } from "../src/services/telegram-listener";
 import { telegramSenderDescriptor } from "../src/services/telegram-sender";
+import { smtpEmailDescriptor } from "../src/services/smtp-email";
 
 describe("hkp-node runtime server", () => {
   const server = createRuntimeServer({ externalHost: "127.0.0.1" });
@@ -51,6 +52,7 @@ describe("hkp-node runtime server", () => {
       imapEmailDescriptor,
       telegramListenerDescriptor,
       telegramSenderDescriptor,
+      smtpEmailDescriptor,
     ]);
     expect(response.body.runtimes).toHaveLength(1);
     expect(response.body.runtimes[0]).toMatchObject({
