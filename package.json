@@ -1,16 +1,31 @@
 {
   "name": "hkp-node",
   "version": "1.0.0",
-  "description": "Node.js implementation of the Hookup realtime runtime API",
-  "main": "dist/index.js",
+  "description": "Node.js implementation of the Hookup runtime API",
+  "main": "dist/src/index.js",
+  "bin": {
+    "hkp-node": "dist/src/index.js"
+  },
+  "files": [
+    "dist/src"
+  ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "dev": "tsx src/index.ts",
     "start": "npm run dev",
-    "test": "vitest run"
+    "test": "vitest run",
+    "prepublishOnly": "npm run build"
   },
-  "author": "",
-  "license": "ISC",
+  "author": "cbastuck <mail@cbastuck.de>",
+  "license": "AGPL-3.0-only",
+  "homepage": "https://hookitapp.com",
+  "repository": {
+    "type": "git",
+    "url": "https://codeberg.org/cbastuck/hkp-node.git"
+  },
+  "bugs": {
+    "url": "https://codeberg.org/cbastuck/hkp-node/issues"
+  },
   "dependencies": {
     "cors": "^2.8.5",
     "express": "^5.1.0",
