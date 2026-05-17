@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+// Copyright (c) 2026 cbastuck
+// SPDX-License-Identifier: AGPL-3.0-only
 import { createRuntimeServer } from "./server";
 
 async function main() {
