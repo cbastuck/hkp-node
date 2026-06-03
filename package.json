@@ -1,6 +1,6 @@
 {
   "name": "hkp-node",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Node.js implementation of the Hookup runtime API",
   "main": "dist/src/index.js",
   "bin": {
@@ -13,6 +13,7 @@
     "build": "tsc -p tsconfig.json",
     "dev": "tsx src/index.ts",
     "start": "npm run dev",
+    "withCoordinator": "COORDINATOR_ENABLED=true npm run dev",
     "test": "vitest run",
     "prepublishOnly": "npm run build",
     "publish:npm": "npm publish --access public"
@@ -31,6 +32,8 @@
     "cors": "^2.8.5",
     "express": "^5.1.0",
     "imapflow": "^1.3.3",
+    "jsonwebtoken": "^9.0.2",
+    "jwks-rsa": "^3.1.0",
     "mailparser": "^3.9.8",
     "nodemailer": "^8.0.7",
     "peer": "^1.0.2",
@@ -39,6 +42,7 @@
   "devDependencies": {
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.3",
+    "@types/jsonwebtoken": "^9.0.7",
     "@types/mailparser": "^3.4.6",
     "@types/node": "^24.6.1",
     "@types/nodemailer": "^8.0.0",

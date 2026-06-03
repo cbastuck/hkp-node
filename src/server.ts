@@ -139,7 +139,7 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
     cors({
       origin: allowedOrigins === "*" ? true : allowedOrigins,
       methods: ["GET", "POST", "DELETE", "OPTIONS"],
-      allowedHeaders: ["Content-Type"],
+      allowedHeaders: ["Content-Type", "Authorization"],
     }),
   );
   expressApp.use(express.json());
@@ -232,6 +232,15 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
       if (!config) {
         res.sendStatus(400);
         return;
+      }
+
+      // Reuse an existing runtime with the same ID rather than destroying it.
+      // This lets a browser reconnect to a coordinator-managed board without
+      // killing services (e.g. a running timer) that the coordinator started.
+      const existing = runtimeApp.getRuntime(config.id);
+      if (existing) {
+        runtimes.push(serializeRuntime(existing));
+        continue;
       }
 
       const runtime = runtimeApp.createRuntime(config);
@@ -438,8 +447,23 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
     },
   );
 
+  const bridgeWsServer = new WebSocketServer({ noServer: true });
+  let bridgeUpgradeHandler: ((ws: WebSocket) => void) | undefined;
+
   httpServer.on("upgrade", (request, socket, head) => {
+    // Protocol is irrelevant — base is only needed to resolve the relative path.
     const url = new URL(request.url ?? "/", `http://${request.headers.host}`);
+
+    if (url.pathname === "/coordinator/bridge") {
+      if (bridgeUpgradeHandler) {
+        bridgeWsServer.handleUpgrade(request, socket, head, bridgeUpgradeHandler);
+      } else {
+        socket.write("HTTP/1.1 503 Service Unavailable\r\n\r\n");
+        socket.destroy();
+      }
+      return;
+    }
+
     const runtimeId = url.pathname.slice(1);
     if (!runtimeId || !runtimeApp.getRuntime(runtimeId)) {
       socket.write("HTTP/1.1 404 Not Found\r\n\r\n");
@@ -516,6 +540,9 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
         port: address.port,
         baseUrl: `http://${host}:${address.port}`,
       };
+    },
+    setBridgeUpgradeHandler(handler: (ws: WebSocket) => void) {
+      bridgeUpgradeHandler = handler;
     },
     async stop() {
       for (const sockets of runtimeSockets.values()) {
