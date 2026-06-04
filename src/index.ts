@@ -1,10 +1,13 @@
 #!/usr/bin/env node
 // Copyright (c) 2026 cbastuck
 // SPDX-License-Identifier: AGPL-3.0-only
+import path from "path";
+import { config as loadEnv } from "dotenv";
 import { createRuntimeServer } from "./server";
 import { createCoordinatorRouter } from "./coordinator";
 
 async function main() {
+  loadEnv({ path: path.join(__dirname, "..", ".env") });
   const port = readInteger(process.env.PORT, 8080);
   const host = process.env.HOST ?? "0.0.0.0";
   const externalHost = process.env.EXTERNAL_HOST ?? "127.0.0.1";
