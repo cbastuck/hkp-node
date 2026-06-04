@@ -6,7 +6,7 @@ declare global {
   // eslint-disable-next-line @typescript-eslint/no-namespace
   namespace Express {
     interface Request {
-      authenticatedUser?: { sub: string };
+      authenticatedUser?: { sub: string; nickname: string };
     }
   }
 }
@@ -31,7 +31,7 @@ export function createAuthMiddleware(): AuthMiddleware {
         res.sendStatus(401);
         return;
       }
-      req.authenticatedUser = { sub: username };
+      req.authenticatedUser = { sub: username, nickname: username };
       next();
     };
   }
@@ -73,7 +73,15 @@ export function createAuthMiddleware(): AuthMiddleware {
         res.sendStatus(401);
         return;
       }
-      req.authenticatedUser = { sub };
+
+      const nickname =
+        typeof decoded.nickname === "string" ? decoded.nickname : null;
+      if (!nickname) {
+        res.sendStatus(401);
+        return;
+      }
+
+      req.authenticatedUser = { nickname, sub };
       next();
     });
   };
@@ -91,7 +99,7 @@ export function requireSelf(
   }
   // In trust mode sub equals the requested username (missing username is rejected above).
   // In JWT mode, sub must match the username param.
-  if (user.sub !== req.params.username) {
+  if (user.nickname !== req.params.username) {
     res.sendStatus(403);
     return;
   }
