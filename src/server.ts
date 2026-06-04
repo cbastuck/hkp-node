@@ -34,6 +34,7 @@ import {
   smtpEmailDescriptor,
 } from "./services/smtp-email";
 import { HostedRuntime, RuntimeApp } from "./runtime";
+import { createServerAuthMiddleware } from "./auth";
 import {
   HostedServiceFactory,
   JsonRecord,
@@ -145,6 +146,7 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
     }),
   );
   expressApp.use(express.json());
+  expressApp.use(createServerAuthMiddleware());
 
   const httpServer = http.createServer(expressApp);
   const webSocketServer = new WebSocketServer({ noServer: true });
