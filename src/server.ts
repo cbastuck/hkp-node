@@ -45,6 +45,7 @@ import {
 type CreateRuntimeServerOptions = {
   allowedOrigins?: string;
   externalHost?: string;
+  externalSecure?: boolean;
   host?: string;
   name?: string;
 };
@@ -57,6 +58,7 @@ type WsInboundMessage = {
 export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
   const allowedOrigins = options.allowedOrigins ?? "*";
   const externalHost = options.externalHost ?? options.host ?? "127.0.0.1";
+  const externalSecure = options.externalSecure ?? false;
   const factories = new Map<string, HostedServiceFactory>([
     [
       monitorDescriptor.serviceId,
@@ -152,6 +154,9 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
     const address = httpServer.address();
     if (!address || typeof address === "string") {
       return undefined;
+    }
+    if (externalSecure) {
+      return `wss://${externalHost}/${runtimeId}`;
     }
     return `ws://${externalHost}:${address.port}/${runtimeId}`;
   }

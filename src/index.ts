@@ -8,12 +8,14 @@ async function main() {
   const port = readInteger(process.env.PORT, 8080);
   const host = process.env.HOST ?? "0.0.0.0";
   const externalHost = process.env.EXTERNAL_HOST ?? "127.0.0.1";
+  const externalSecure = process.env.EXTERNAL_SECURE === "true";
   const allowedOrigins = process.env.ALLOWED_ORIGINS ?? "*";
   const coordinatorEnabled = process.env.COORDINATOR_ENABLED === "true";
 
   const server = createRuntimeServer({
     allowedOrigins,
     externalHost,
+    externalSecure,
     host,
     name: process.env.NAME ?? "hkp-node",
   });
