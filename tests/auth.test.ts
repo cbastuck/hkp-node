@@ -3,11 +3,15 @@ import request from "supertest";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { createRuntimeServer } from "../src/server";
-import { isLoopbackHost, type AuthConfig } from "../src/auth";
+import {
+  createAuthenticator,
+  isLoopbackHost,
+  type AuthConfig,
+} from "../src/auth";
 
 // A non-resolvable domain keeps these tests offline: every code path we exercise
-// either rejects before verifying a token (missing/blank bearer) or short-circuits
-// on the service token, so the JWKS endpoint is never contacted.
+// either rejects before verifying a token (missing/blank bearer) or resolves an
+// opaque session token locally, so the JWKS endpoint is never contacted.
 const JWT_AUTH: AuthConfig = {
   mode: "jwt",
   domain: "auth.invalid",
@@ -34,9 +38,12 @@ function wsUrl(baseUrl: string, path: string, token?: string): string {
 }
 
 /** Resolves "open" if the socket connected, "rejected" if the upgrade failed. */
-function wsOutcome(url: string): Promise<"open" | "rejected"> {
+function wsOutcome(
+  url: string,
+  headers?: Record<string, string>,
+): Promise<"open" | "rejected"> {
   return new Promise((resolve) => {
-    const socket = new WebSocket(url);
+    const socket = new WebSocket(url, headers ? { headers } : undefined);
     socket.on("open", () => {
       socket.close();
       resolve("open");
@@ -58,36 +65,44 @@ describe("hkp-node authentication", () => {
     await request(baseUrl).get("/runtimes").expect(401);
   });
 
-  it("accepts the service token as a bearer on HTTP routes", async () => {
-    const { baseUrl } = await startServer({
-      auth: JWT_AUTH,
-      serviceToken: "s3cr3t",
+  it("resolves opaque session tokens before falling back to JWT verification", async () => {
+    const authenticator = createAuthenticator(JWT_AUTH, {
+      resolveOpaqueToken: (token) =>
+        token === "sess-1" ? { sub: "auth0|user-1" } : null,
     });
-    await request(baseUrl)
-      .get("/runtimes")
-      .set("Authorization", "Bearer s3cr3t")
-      .expect(200);
-    await request(baseUrl)
-      .get("/runtimes")
-      .set("Authorization", "Bearer wrong")
-      .expect(401);
+    expect(await authenticator.verifyToken("sess-1")).toEqual({
+      sub: "auth0|user-1",
+    });
+    expect(await authenticator.verifyToken(undefined)).toBeNull();
   });
 
   it("rejects WebSocket upgrades without a valid token under JWT auth", async () => {
-    const { baseUrl } = await startServer({
-      auth: JWT_AUTH,
-      serviceToken: "s3cr3t",
-    });
-    // Create a runtime (using the service token) so the path itself is valid.
+    const { baseUrl } = await startServer({ auth: JWT_AUTH });
+    // Auth is checked on the upgrade before the runtime is even looked up, so a
+    // missing or unknown token is rejected regardless of the path.
+    expect(await wsOutcome(wsUrl(baseUrl, "/rt-1"))).toBe("rejected");
+    expect(await wsOutcome(wsUrl(baseUrl, "/rt-1", "nope"))).toBe("rejected");
+  });
+
+  it("mints a session token and accepts it on the WS Authorization header", async () => {
+    const { baseUrl } = await startServer({ auth: { mode: "none" } });
     await request(baseUrl)
       .post("/runtimes")
-      .set("Authorization", "Bearer s3cr3t")
       .send({ id: "rt-1", name: "Node", services: [] })
       .expect(200);
 
-    expect(await wsOutcome(wsUrl(baseUrl, "/rt-1"))).toBe("rejected");
-    expect(await wsOutcome(wsUrl(baseUrl, "/rt-1", "nope"))).toBe("rejected");
-    expect(await wsOutcome(wsUrl(baseUrl, "/rt-1", "s3cr3t"))).toBe("open");
+    const { body } = await request(baseUrl)
+      .post("/runtimes/rt-1/session-token")
+      .expect(200);
+    expect(typeof body.token).toBe("string");
+    expect(body.token.length).toBeGreaterThan(0);
+
+    // Coordinator-style: token in the Authorization header, not the URL.
+    expect(
+      await wsOutcome(wsUrl(baseUrl, "/rt-1"), {
+        Authorization: `Bearer ${body.token}`,
+      }),
+    ).toBe("open");
   });
 
   it("rejects WebSocket upgrades from a disallowed Origin", async () => {

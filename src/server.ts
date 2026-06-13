@@ -1,6 +1,7 @@
 import http from "node:http";
 import { AddressInfo } from "node:net";
 import { Duplex } from "node:stream";
+import { randomBytes } from "node:crypto";
 
 import cors from "cors";
 import express, { NextFunction, Request, Response } from "express";
@@ -54,11 +55,17 @@ import {
 type CreateRuntimeServerOptions = {
   auth?: AuthConfig;
   allowedOrigins?: AllowedOrigins;
-  serviceToken?: string;
   externalHost?: string;
   externalSecure?: boolean;
   host?: string;
   name?: string;
+};
+
+/** A coordinator session token, bound to the user it was minted for and the
+ *  runtime it grants access to. */
+type SessionToken = {
+  sub: string;
+  runtimeId: string;
 };
 
 type WsInboundMessage = {
@@ -71,10 +78,19 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
   // config and fails closed for the published package (see resolveServerAuthConfig).
   const authConfig: AuthConfig = options.auth ?? { mode: "none" };
   const allowedOrigins: AllowedOrigins = options.allowedOrigins ?? "*";
-  const authenticator: Authenticator = createAuthenticator(
-    authConfig,
-    options.serviceToken,
-  );
+
+  // Coordinator session tokens this runtime has issued (see POST .../session-token).
+  // Opaque, in-memory, and bound to the minting user — so they resolve back to a
+  // real `sub`, not an unscoped superuser. They live only as long as this process:
+  // if the runtime dies, the coordinator must re-provision (which needs a live
+  // user JWT). That bound is intentional for v1 — see the session-token route.
+  const sessionTokens = new Map<string, SessionToken>();
+  const authenticator: Authenticator = createAuthenticator(authConfig, {
+    resolveOpaqueToken: (token) => {
+      const session = sessionTokens.get(token);
+      return session ? { sub: session.sub } : null;
+    },
+  });
   const externalHost = options.externalHost ?? options.host ?? "127.0.0.1";
   const externalSecure = options.externalSecure ?? false;
   const factories = new Map<string, HostedServiceFactory>([
@@ -225,6 +241,17 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
     return runtime;
   }
 
+  // Tear a runtime down and drop any session tokens it issued, so a dead
+  // runtime's tokens can't linger as valid credentials.
+  function removeRuntimeAndSessions(runtimeId: string): void {
+    runtimeApp.removeRuntime(runtimeId);
+    for (const [token, info] of sessionTokens) {
+      if (info.runtimeId === runtimeId) {
+        sessionTokens.delete(token);
+      }
+    }
+  }
+
   expressApp.get("/runtimes", (_req, res) => {
     res.json({
       runtimes: runtimeApp
@@ -236,6 +263,7 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
 
   expressApp.delete("/runtimes", (_req, res) => {
     runtimeApp.removeAllRuntimes();
+    sessionTokens.clear();
     res.sendStatus(200);
   });
 
@@ -295,8 +323,29 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
   expressApp.delete("/runtimes/:runtimeId", (req, res) => {
     // Always return success — if the runtime was already destroyed (e.g. by a
     // WebSocket disconnect) the desired state is the same as an explicit delete.
-    runtimeApp.removeRuntime(req.params.runtimeId);
+    removeRuntimeAndSessions(req.params.runtimeId);
     res.json({ id: req.params.runtimeId });
+  });
+
+  // Mint a coordinator session token for a runtime. Gated by the normal auth
+  // middleware, so the caller must present a valid user JWT (the "bootstrap").
+  // The returned opaque token is bound to that user and this runtime, and the
+  // coordinator then uses it for its long-lived machine calls (the result WS,
+  // teardown) without needing a user JWT that would expire.
+  //
+  // Limitation (v1): tokens live only in this process. If the runtime restarts
+  // the token is gone and the coordinator must re-provision — which requires a
+  // live user JWT. Boards therefore don't self-heal across a runtime restart
+  // while the user is offline; persisting these bindings is future work.
+  expressApp.post("/runtimes/:runtimeId/session-token", (req, res) => {
+    const runtime = getRuntimeOr404(res, req.params.runtimeId);
+    if (!runtime) {
+      return;
+    }
+    const sub = req.authenticatedUser?.sub ?? "anonymous";
+    const token = randomBytes(32).toString("hex");
+    sessionTokens.set(token, { sub, runtimeId: req.params.runtimeId });
+    res.json({ token });
   });
 
   expressApp.post("/runtimes/:runtimeId/rearrange", (req, res) => {
@@ -500,8 +549,17 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
       return;
     }
 
+    // Browsers can't set headers on a WS handshake, so they pass the token as
+    // ?access_token=. Non-browser clients (the coordinator) use the standard
+    // Authorization header, keeping the token out of URLs/logs.
+    const authHeader = request.headers.authorization;
+    const bearer = authHeader?.startsWith("Bearer ")
+      ? authHeader.slice(7)
+      : undefined;
+    const token = bearer ?? url.searchParams.get("access_token");
+
     void authenticator
-      .verifyToken(url.searchParams.get("access_token"))
+      .verifyToken(token)
       .then((user) => {
         if (!user) {
           rejectUpgrade(socket, 401, "Unauthorized");
@@ -549,7 +607,7 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
           // Last client disconnected — destroy the runtime immediately so its
           // resources (ports, file handles, etc.) are released. If the board is
           // saved and the page reloads, POST /runtimes will recreate it cleanly.
-          runtimeApp.removeRuntime(runtimeId);
+          removeRuntimeAndSessions(runtimeId);
         }
       });
 

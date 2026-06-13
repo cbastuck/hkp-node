@@ -7,16 +7,13 @@ import { CloudBoardConfig, CloudRuntimeDescriptor, CloudServiceDescriptor } from
 export type CoordinatorRouterOptions = {
   coordinator?: BoardCoordinator;
   auth?: AuthConfig;
-  serviceToken?: string;
 };
 
 export function createCoordinatorRouter(
   options: CoordinatorRouterOptions = {},
 ): { router: Router; coordinator: BoardCoordinator } {
   const authConfig: AuthConfig = options.auth ?? { mode: "none" };
-  const coordinator =
-    options.coordinator ??
-    new BoardCoordinator({ serviceToken: options.serviceToken });
+  const coordinator = options.coordinator ?? new BoardCoordinator();
   const router = Router();
   const auth = createAuthMiddleware(authConfig);
 
@@ -40,7 +37,17 @@ export function createCoordinatorRouter(
       }
 
       try {
-        const session = await coordinator.registerBoard(username, config);
+        // Forward the caller's JWT so the session can provision runtimes and
+        // mint delegated session tokens on their behalf.
+        const authHeader = req.headers.authorization;
+        const userJwt = authHeader?.startsWith("Bearer ")
+          ? authHeader.slice(7)
+          : undefined;
+        const session = await coordinator.registerBoard(
+          username,
+          config,
+          userJwt,
+        );
         res.status(201).json({
           boardName: session.boardName,
           status: session.getStatus(),

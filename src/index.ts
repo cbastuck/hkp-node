@@ -15,13 +15,11 @@ async function main() {
   const externalSecure = process.env.EXTERNAL_SECURE === "true";
   const allowedOrigins = parseAllowedOrigins(process.env.ALLOWED_ORIGINS);
   const coordinatorEnabled = process.env.COORDINATOR_ENABLED === "true";
-  const serviceToken = process.env.HKP_SERVICE_TOKEN || undefined;
   const authConfig = resolveServerAuthConfig(host);
 
   const server = createRuntimeServer({
     auth: authConfig,
     allowedOrigins,
-    serviceToken,
     externalHost,
     externalSecure,
     host,
@@ -31,7 +29,6 @@ async function main() {
   if (coordinatorEnabled) {
     const { router: coordinatorRouter, coordinator } = createCoordinatorRouter({
       auth: authConfig,
-      serviceToken,
     });
     server.expressApp.use("/coordinator", coordinatorRouter);
     server.setBridgeUpgradeHandler((ws, user) => {
@@ -66,13 +63,8 @@ async function main() {
         const { userId, boardName, runtimeIds = [] } = msg;
 
         // A browser may only bridge its own board. In no-auth dev mode there is
-        // no real identity, so this is only enforced under JWT auth. The service
-        // token (sub "service") is allowed through for machine bridging.
-        if (
-          authConfig.mode === "jwt" &&
-          user.sub !== userId &&
-          user.sub !== "service"
-        ) {
+        // no real identity, so this is only enforced under JWT auth.
+        if (authConfig.mode === "jwt" && user.sub !== userId) {
           console.warn(
             `[bridge] Authenticated user "${user.sub}" may not bridge board for userId="${userId}" — closing`,
           );

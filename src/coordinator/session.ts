@@ -28,31 +28,25 @@ export class BoardSession {
     string,
     (data: unknown) => void
   >();
+  // Per-runtime session tokens this session minted (runtimeId → token). Used for
+  // the long-lived machine calls (result WS, teardown) that outlive the user's JWT.
+  private readonly sessionTokens = new Map<string, string>();
 
   constructor(
     readonly boardName: string,
     readonly userId: string,
     readonly config: CloudBoardConfig,
-    private readonly serviceToken?: string,
+    // The user's JWT, captured while they create/modify the board. It bootstraps
+    // provisioning and is exchanged for per-runtime session tokens. Undefined when
+    // auth is off (local dev), in which case runtimes are passthrough.
+    private readonly userJwt?: string,
   ) {
     this.createdAt = new Date().toISOString();
   }
 
-  /** Authorization header for runtime calls, when a service token is configured. */
-  private authHeaders(): Record<string, string> {
-    return this.serviceToken
-      ? { Authorization: `Bearer ${this.serviceToken}` }
-      : {};
-  }
-
-  /** Append the service token so authenticated runtimes accept the WS upgrade. */
-  private withAccessToken(wsUrl: string): string {
-    if (!this.serviceToken) {
-      return wsUrl;
-    }
-    const url = new URL(wsUrl);
-    url.searchParams.set("access_token", this.serviceToken);
-    return url.toString();
+  /** Bearer Authorization header for a token, or empty when there is none. */
+  private bearer(token: string | undefined): Record<string, string> {
+    return token ? { Authorization: `Bearer ${token}` } : {};
   }
 
   async start(): Promise<void> {
@@ -96,7 +90,12 @@ export class BoardSession {
         .map(({ descriptor }) =>
           fetch(
             `${descriptor.url}/runtimes/${encodeURIComponent(descriptor.id)}`,
-            { method: "DELETE", headers: this.authHeaders() },
+            {
+              method: "DELETE",
+              // Teardown can happen after the user is gone, so use the session
+              // token (still valid for this runtime's lifetime), not the JWT.
+              headers: this.bearer(this.sessionTokens.get(descriptor.id)),
+            },
           ).catch((err) => {
             console.error(
               `[coordinator] Failed to DELETE runtime "${descriptor.id}":`,
@@ -206,53 +205,93 @@ export class BoardSession {
   ): Promise<string> {
     const { url, id } = runtime;
     const baseUrl = url!;
+    // Provisioning runs while the user is creating/modifying the board, so it is
+    // authenticated with their JWT — the runtime validates it the same way it
+    // validates a browser's. The JWT is then exchanged for a session token below.
+    const userAuth = this.bearer(this.userJwt);
+
+    let outputUrl: string | undefined;
 
     const existing = await fetch(
       `${baseUrl}/runtimes/${encodeURIComponent(id)}`,
-      { headers: this.authHeaders() },
+      { headers: userAuth },
     );
     if (existing.ok) {
       const descriptor = (await existing.json()) as { outputUrl?: string };
-      if (descriptor.outputUrl) {
-        return descriptor.outputUrl;
+      outputUrl = descriptor.outputUrl;
+    }
+
+    if (!outputUrl) {
+      const payload = {
+        id,
+        name: runtime.name,
+        boardName: this.boardName,
+        services: services.map((svc) => ({
+          uuid: svc.uuid,
+          serviceId: svc.serviceId,
+          serviceName: svc.serviceName ?? svc.name ?? svc.serviceId,
+          state: svc.state ?? {},
+        })),
+      };
+
+      const response = await fetch(`${baseUrl}/runtimes`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...userAuth },
+        body: JSON.stringify(payload),
+      });
+
+      if (!response.ok) {
+        throw new Error(`POST /runtimes returned ${response.status}`);
       }
+
+      const body = (await response.json()) as {
+        runtimes?: Array<{ outputUrl?: string }>;
+      };
+      outputUrl = body.runtimes?.[0]?.outputUrl;
     }
 
-    const payload = {
-      id,
-      name: runtime.name,
-      boardName: this.boardName,
-      services: services.map((svc) => ({
-        uuid: svc.uuid,
-        serviceId: svc.serviceId,
-        serviceName: svc.serviceName ?? svc.name ?? svc.serviceId,
-        state: svc.state ?? {},
-      })),
-    };
-
-    const response = await fetch(`${baseUrl}/runtimes`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", ...this.authHeaders() },
-      body: JSON.stringify(payload),
-    });
-
-    if (!response.ok) {
-      throw new Error(`POST /runtimes returned ${response.status}`);
-    }
-
-    const body = (await response.json()) as {
-      runtimes?: Array<{ outputUrl?: string }>;
-    };
-    const outputUrl = body.runtimes?.[0]?.outputUrl;
     if (!outputUrl) {
       throw new Error("Runtime provisioned but no outputUrl returned");
     }
+
+    // Exchange the user JWT for a long-lived session token scoped to this runtime.
+    await this.mintSessionToken(baseUrl, id);
+
     return outputUrl;
+  }
+
+  /**
+   * Ask the runtime to issue a session token (delegated from the user JWT) that
+   * this session will present on its machine calls. Skipped when there is no user
+   * JWT (auth off / local dev), where the runtime is passthrough anyway.
+   */
+  private async mintSessionToken(
+    baseUrl: string,
+    runtimeId: string,
+  ): Promise<void> {
+    if (!this.userJwt) {
+      return;
+    }
+    const res = await fetch(
+      `${baseUrl}/runtimes/${encodeURIComponent(runtimeId)}/session-token`,
+      { method: "POST", headers: this.bearer(this.userJwt) },
+    );
+    if (!res.ok) {
+      throw new Error(`Failed to mint session token (${res.status})`);
+    }
+    const body = (await res.json()) as { token?: string };
+    if (body.token) {
+      this.sessionTokens.set(runtimeId, body.token);
+    }
   }
 
   private connect(entry: ProvisionedRuntime): void {
     const { descriptor: runtime, wsUrl } = entry;
-    const socket = new WebSocket(this.withAccessToken(wsUrl));
+    // As a non-browser client we can authenticate the WS upgrade with a header,
+    // keeping the session token out of the URL.
+    const socket = new WebSocket(wsUrl, {
+      headers: this.bearer(this.sessionTokens.get(runtime.id)),
+    });
     this.sockets.set(runtime.id, socket);
 
     socket.on("open", () => {

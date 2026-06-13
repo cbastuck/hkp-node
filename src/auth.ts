@@ -32,10 +32,24 @@ export type AuthConfig =
   | { mode: "none" };
 
 /**
+ * Resolves an opaque (non-JWT) bearer token to a principal, or null if unknown.
+ * Used for coordinator **session tokens**: short random strings the runtime
+ * itself mints (gated by a user JWT) and hands to the coordinator, so the
+ * coordinator can make long-lived machine calls on that user's behalf without a
+ * user JWT that would expire. The token resolves back to the user it was minted
+ * for, so there is no unscoped "service" superuser.
+ */
+export type OpaqueTokenResolver = (
+  token: string,
+) => AuthenticatedUser | null;
+
+export type AuthenticatorOptions = {
+  resolveOpaqueToken?: OpaqueTokenResolver;
+};
+
+/**
  * Resolved auth surface shared by HTTP and WebSocket entry points so both apply
- * the exact same checks. `serviceToken`, when set, is a shared machine-to-machine
- * secret accepted in place of a user JWT (used by the coordinator to reach the
- * runtimes it provisions).
+ * the exact same checks.
  */
 export type Authenticator = {
   /** Express middleware for HTTP routes. Sets req.authenticatedUser on success. */
@@ -85,7 +99,7 @@ function createJwtVerifier(
 
 export function createAuthenticator(
   config: AuthConfig,
-  serviceToken?: string,
+  options: AuthenticatorOptions = {},
 ): Authenticator {
   if (config.mode === "none") {
     return {
@@ -104,8 +118,11 @@ export function createAuthenticator(
     if (!token) {
       return null;
     }
-    if (serviceToken && token === serviceToken) {
-      return { sub: "service" };
+    // Session tokens are opaque and resolve locally without a network round-trip,
+    // so check them before falling back to JWT verification.
+    const opaque = options.resolveOpaqueToken?.(token);
+    if (opaque) {
+      return opaque;
     }
     return verify(token);
   };

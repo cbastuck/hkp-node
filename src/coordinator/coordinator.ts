@@ -1,23 +1,16 @@
 import { CloudBoardConfig, BoardSessionInfo } from "./types";
 import { BoardSession } from "./session";
 
-export type BoardCoordinatorOptions = {
-  /** Shared M2M token presented to the runtimes this coordinator provisions. */
-  serviceToken?: string;
-};
-
 export class BoardCoordinator {
   // userId → boardName → BoardSession
   private readonly sessions = new Map<string, Map<string, BoardSession>>();
-  private readonly serviceToken?: string;
-
-  constructor(options: BoardCoordinatorOptions = {}) {
-    this.serviceToken = options.serviceToken;
-  }
 
   async registerBoard(
     userId: string,
     config: CloudBoardConfig,
+    // The caller's JWT, forwarded so the session can provision runtimes and mint
+    // delegated session tokens on the user's behalf.
+    userJwt?: string,
   ): Promise<BoardSession> {
     const existing = this.sessions.get(userId)?.get(config.boardName);
     // Lift the browser bridge out of the old session before destroying it so
@@ -28,12 +21,7 @@ export class BoardCoordinator {
       await existing.destroy();
     }
 
-    const session = new BoardSession(
-      config.boardName,
-      userId,
-      config,
-      this.serviceToken,
-    );
+    const session = new BoardSession(config.boardName, userId, config, userJwt);
     await session.start();
 
     if (existingBridge && existingBridge.ws.readyState === 1 /* OPEN */) {

@@ -48,7 +48,6 @@ All options are passed as environment variables.
 | `AUTH0_DOMAIN` | — | Auth0 tenant domain. **Required** (with `AUTH0_AUDIENCE`) to start. |
 | `AUTH0_AUDIENCE` | — | Auth0 API audience the access token must target. **Required** to start. |
 | `ALLOW_NO_AUTH` | — | Set to `true` to run **without authentication**. Only honoured for a local source checkout; the published npm package ignores it. Local development only. |
-| `HKP_SERVICE_TOKEN` | — | Shared machine-to-machine token. When set, it is accepted in place of a user JWT and is presented by the coordinator to the runtimes it provisions. |
 | `NAME` | `hkp-node` | Server name reported to clients |
 
 ### Authentication
@@ -60,6 +59,17 @@ as an `?access_token=` query parameter on the WS URL.
 
 A single instance serves a **single tenant** — any valid token may access any runtime on the
 server. Run one instance per user; do not share an instance between users.
+
+**Coordinator → runtime (delegated session tokens).** The coordinator reaches runtimes as a
+machine client over long-lived connections, so it can't use a user JWT (those expire and the
+user may be offline). Instead, while the user is creating/modifying a board the coordinator
+provisions runtimes **with the user's JWT**, then exchanges it via `POST
+/runtimes/:id/session-token` for an opaque, per-runtime **session token** that resolves back to
+that user. The coordinator presents this token (in the `Authorization` header) on its result
+WebSocket and teardown calls. Tokens are in-memory only and bound to the runtime's lifetime: if a
+runtime restarts, the coordinator must re-provision, which needs a live user JWT — so boards
+don't self-heal across a runtime restart while the user is offline (persisting these bindings is
+future work). There is no shared static service secret.
 
 **Loopback bind = no auth required.** When `HOST` is a loopback address (`127.0.0.1`, `::1`,
 `localhost`), the server is reachable only from the local machine, so the loopback bind is
