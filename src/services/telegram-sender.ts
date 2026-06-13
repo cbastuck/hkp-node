@@ -52,11 +52,14 @@ export class TelegramSenderService implements HostedService {
   }
 
   getState(): JsonRecord {
-    return { ...this._state };
+    // Secrets are write-only: never echo the bot token back to clients.
+    const { botToken, ...rest } = this._state;
+    return { ...rest, botToken: "", botTokenConfigured: botToken.length > 0 };
   }
 
   configure(config: JsonRecord): JsonRecord {
-    if (typeof config.botToken === "string") {
+    // Empty string means "no change" (what masked getState() round-trips back).
+    if (typeof config.botToken === "string" && config.botToken !== "") {
       this._state.botToken = config.botToken;
     }
     if (typeof config.chatId === "string") {

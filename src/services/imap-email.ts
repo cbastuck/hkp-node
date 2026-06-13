@@ -68,7 +68,10 @@ export class ImapEmailService implements HostedService {
   }
 
   getState(): JsonRecord {
-    return { ...this.state };
+    // Secrets are write-only: never echo the stored password back to clients.
+    // Expose a boolean so UIs can show "configured" without revealing it.
+    const { password, ...rest } = this.state;
+    return { ...rest, password: "", passwordConfigured: password.length > 0 };
   }
 
   configure(config: JsonRecord): JsonRecord {
@@ -81,7 +84,9 @@ export class ImapEmailService implements HostedService {
     if (typeof config.username === "string") {
       this.state.username = config.username;
     }
-    if (typeof config.password === "string") {
+    // Empty string means "no change" — this is what a masked getState() round-trips
+    // back as, so it must not wipe a previously stored password.
+    if (typeof config.password === "string" && config.password !== "") {
       this.state.password = config.password;
     }
     if (typeof config.tls === "boolean") {

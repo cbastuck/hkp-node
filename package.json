@@ -1,7 +1,7 @@
 {
   "name": "hkp-node",
-  "version": "1.0.4",
-  "description": "Node.js implementation of the Hookup runtime API",
+  "version": "1.0.5",
+  "description": "Node.js implementation of the Hookup runtime API. Single-tenant: requires Auth0 (fails closed) and serves one user per instance.",
   "main": "dist/src/index.js",
   "bin": {
     "hkp-node": "dist/src/index.js"
@@ -13,6 +13,7 @@
     "build": "tsc -p tsconfig.json",
     "dev": "tsx src/index.ts",
     "start": "npm run dev",
+    "localOnly": "HOST=127.0.0.1 npm run dev",
     "withCoordinator": "COORDINATOR_ENABLED=true npm run dev",
     "test": "vitest run",
     "prepublishOnly": "npm run build",

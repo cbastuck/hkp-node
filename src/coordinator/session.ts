@@ -33,8 +33,26 @@ export class BoardSession {
     readonly boardName: string,
     readonly userId: string,
     readonly config: CloudBoardConfig,
+    private readonly serviceToken?: string,
   ) {
     this.createdAt = new Date().toISOString();
+  }
+
+  /** Authorization header for runtime calls, when a service token is configured. */
+  private authHeaders(): Record<string, string> {
+    return this.serviceToken
+      ? { Authorization: `Bearer ${this.serviceToken}` }
+      : {};
+  }
+
+  /** Append the service token so authenticated runtimes accept the WS upgrade. */
+  private withAccessToken(wsUrl: string): string {
+    if (!this.serviceToken) {
+      return wsUrl;
+    }
+    const url = new URL(wsUrl);
+    url.searchParams.set("access_token", this.serviceToken);
+    return url.toString();
   }
 
   async start(): Promise<void> {
@@ -78,7 +96,7 @@ export class BoardSession {
         .map(({ descriptor }) =>
           fetch(
             `${descriptor.url}/runtimes/${encodeURIComponent(descriptor.id)}`,
-            { method: "DELETE" },
+            { method: "DELETE", headers: this.authHeaders() },
           ).catch((err) => {
             console.error(
               `[coordinator] Failed to DELETE runtime "${descriptor.id}":`,
@@ -191,6 +209,7 @@ export class BoardSession {
 
     const existing = await fetch(
       `${baseUrl}/runtimes/${encodeURIComponent(id)}`,
+      { headers: this.authHeaders() },
     );
     if (existing.ok) {
       const descriptor = (await existing.json()) as { outputUrl?: string };
@@ -213,7 +232,7 @@ export class BoardSession {
 
     const response = await fetch(`${baseUrl}/runtimes`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...this.authHeaders() },
       body: JSON.stringify(payload),
     });
 
@@ -233,7 +252,7 @@ export class BoardSession {
 
   private connect(entry: ProvisionedRuntime): void {
     const { descriptor: runtime, wsUrl } = entry;
-    const socket = new WebSocket(wsUrl);
+    const socket = new WebSocket(this.withAccessToken(wsUrl));
     this.sockets.set(runtime.id, socket);
 
     socket.on("open", () => {

@@ -5,6 +5,7 @@ import path from "path";
 import { config as loadEnv } from "dotenv";
 import { createRuntimeServer } from "./server";
 import { createCoordinatorRouter } from "./coordinator";
+import { AllowedOrigins, AuthConfig, isLoopbackHost } from "./auth";
 
 async function main() {
   loadEnv({ path: path.join(__dirname, "..", ".env") });
@@ -12,11 +13,15 @@ async function main() {
   const host = process.env.HOST ?? "0.0.0.0";
   const externalHost = process.env.EXTERNAL_HOST ?? "127.0.0.1";
   const externalSecure = process.env.EXTERNAL_SECURE === "true";
-  const allowedOrigins = process.env.ALLOWED_ORIGINS ?? "*";
+  const allowedOrigins = parseAllowedOrigins(process.env.ALLOWED_ORIGINS);
   const coordinatorEnabled = process.env.COORDINATOR_ENABLED === "true";
+  const serviceToken = process.env.HKP_SERVICE_TOKEN || undefined;
+  const authConfig = resolveServerAuthConfig(host);
 
   const server = createRuntimeServer({
+    auth: authConfig,
     allowedOrigins,
+    serviceToken,
     externalHost,
     externalSecure,
     host,
@@ -24,10 +29,12 @@ async function main() {
   });
 
   if (coordinatorEnabled) {
-    const { router: coordinatorRouter, coordinator } =
-      createCoordinatorRouter();
+    const { router: coordinatorRouter, coordinator } = createCoordinatorRouter({
+      auth: authConfig,
+      serviceToken,
+    });
     server.expressApp.use("/coordinator", coordinatorRouter);
-    server.setBridgeUpgradeHandler((ws) => {
+    server.setBridgeUpgradeHandler((ws, user) => {
       ws.once("message", (raw) => {
         const text = raw.toString();
         let msg: {
@@ -57,6 +64,21 @@ async function main() {
           return;
         }
         const { userId, boardName, runtimeIds = [] } = msg;
+
+        // A browser may only bridge its own board. In no-auth dev mode there is
+        // no real identity, so this is only enforced under JWT auth. The service
+        // token (sub "service") is allowed through for machine bridging.
+        if (
+          authConfig.mode === "jwt" &&
+          user.sub !== userId &&
+          user.sub !== "service"
+        ) {
+          console.warn(
+            `[bridge] Authenticated user "${user.sub}" may not bridge board for userId="${userId}" — closing`,
+          );
+          ws.close();
+          return;
+        }
         // The session may not exist yet if the bridge connects before
         // onBoardInfrastructureChange has registered the board (500 ms debounce).
         // Poll for up to 3 s before giving up.
@@ -106,4 +128,59 @@ function readInteger(value: string | undefined, fallback: number): number {
 
   const parsed = Number.parseInt(value, 10);
   return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function parseAllowedOrigins(value: string | undefined): AllowedOrigins {
+  if (!value || value.trim() === "*") {
+    return "*";
+  }
+  return value
+    .split(",")
+    .map((origin) => origin.trim())
+    .filter(Boolean);
+}
+
+/**
+ * A development checkout runs from the source tree; the published package runs
+ * from inside node_modules. Only the former may opt out of authentication.
+ */
+function isDevCheckout(): boolean {
+  return !__dirname.split(path.sep).includes("node_modules");
+}
+
+/**
+ * Fail closed: refuse to start without authentication unless the server is
+ * reachable only locally (loopback bind) or this is a local checkout that
+ * explicitly opts in via ALLOW_NO_AUTH=true. The npm package bound to a public
+ * interface can never reach no-auth mode.
+ */
+function resolveServerAuthConfig(host: string): AuthConfig {
+  const domain = process.env.AUTH0_DOMAIN;
+  const audience = process.env.AUTH0_AUDIENCE;
+  if (domain && audience) {
+    return { mode: "jwt", domain, audience };
+  }
+
+  if (isLoopbackHost(host)) {
+    console.warn(
+      `[hkp-node] No Auth0 configured; bound to loopback (${host}), so the server ` +
+        "is reachable only from this machine. Running without authentication.",
+    );
+    return { mode: "none" };
+  }
+
+  if (isDevCheckout() && process.env.ALLOW_NO_AUTH === "true") {
+    console.warn(
+      "[hkp-node] AUTH0_DOMAIN/AUTH0_AUDIENCE not set and ALLOW_NO_AUTH=true — running " +
+        `with NO AUTHENTICATION on a non-loopback bind (${host}). Local development only; never expose this.`,
+    );
+    return { mode: "none" };
+  }
+
+  console.error(
+    `[hkp-node] Refusing to start without authentication on a non-loopback bind (${host}). ` +
+      "Set AUTH0_DOMAIN and AUTH0_AUDIENCE, bind to 127.0.0.1 for local-only use, or " +
+      "(from a checkout) set ALLOW_NO_AUTH=true.",
+  );
+  process.exit(1);
 }

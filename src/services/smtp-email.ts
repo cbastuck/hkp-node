@@ -65,7 +65,9 @@ export class SmtpEmailService implements HostedService {
   }
 
   getState(): JsonRecord {
-    return { ...this._state };
+    // Secrets are write-only: never echo the stored password back to clients.
+    const { password, ...rest } = this._state;
+    return { ...rest, password: "", passwordConfigured: password.length > 0 };
   }
 
   configure(config: JsonRecord): JsonRecord {
@@ -78,7 +80,8 @@ export class SmtpEmailService implements HostedService {
     if (typeof config.username === "string") {
       this._state.username = config.username;
     }
-    if (typeof config.password === "string") {
+    // Empty string means "no change" (what masked getState() round-trips back).
+    if (typeof config.password === "string" && config.password !== "") {
       this._state.password = config.password;
     }
     if (typeof config.tls === "boolean") {

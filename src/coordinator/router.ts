@@ -1,18 +1,24 @@
 import { Router, Request, Response } from "express";
 import { BoardCoordinator } from "./coordinator";
 import { createAuthMiddleware, requireSelf } from "./auth";
+import { AuthConfig } from "../auth";
 import { CloudBoardConfig, CloudRuntimeDescriptor, CloudServiceDescriptor } from "./types";
 
 export type CoordinatorRouterOptions = {
   coordinator?: BoardCoordinator;
+  auth?: AuthConfig;
+  serviceToken?: string;
 };
 
 export function createCoordinatorRouter(
   options: CoordinatorRouterOptions = {},
 ): { router: Router; coordinator: BoardCoordinator } {
-  const coordinator = options.coordinator ?? new BoardCoordinator();
+  const authConfig: AuthConfig = options.auth ?? { mode: "none" };
+  const coordinator =
+    options.coordinator ??
+    new BoardCoordinator({ serviceToken: options.serviceToken });
   const router = Router();
-  const auth = createAuthMiddleware();
+  const auth = createAuthMiddleware(authConfig);
 
   // All /users/:username routes require a valid token that matches the username.
   router.use("/users/:username", auth, requireSelf);

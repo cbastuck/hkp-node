@@ -1,5 +1,6 @@
 import http from "node:http";
 import { AddressInfo } from "node:net";
+import { Duplex } from "node:stream";
 
 import cors from "cors";
 import express, { NextFunction, Request, Response } from "express";
@@ -34,7 +35,14 @@ import {
   smtpEmailDescriptor,
 } from "./services/smtp-email";
 import { HostedRuntime, RuntimeApp } from "./runtime";
-import { createServerAuthMiddleware } from "./auth";
+import {
+  AllowedOrigins,
+  AuthConfig,
+  AuthenticatedUser,
+  Authenticator,
+  createAuthenticator,
+  isOriginAllowed,
+} from "./auth";
 import {
   HostedServiceFactory,
   JsonRecord,
@@ -44,7 +52,9 @@ import {
 } from "./types";
 
 type CreateRuntimeServerOptions = {
-  allowedOrigins?: string;
+  auth?: AuthConfig;
+  allowedOrigins?: AllowedOrigins;
+  serviceToken?: string;
   externalHost?: string;
   externalSecure?: boolean;
   host?: string;
@@ -57,7 +67,14 @@ type WsInboundMessage = {
 };
 
 export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
-  const allowedOrigins = options.allowedOrigins ?? "*";
+  // Tests and local dev default to no auth; index.ts always resolves an explicit
+  // config and fails closed for the published package (see resolveServerAuthConfig).
+  const authConfig: AuthConfig = options.auth ?? { mode: "none" };
+  const allowedOrigins: AllowedOrigins = options.allowedOrigins ?? "*";
+  const authenticator: Authenticator = createAuthenticator(
+    authConfig,
+    options.serviceToken,
+  );
   const externalHost = options.externalHost ?? options.host ?? "127.0.0.1";
   const externalSecure = options.externalSecure ?? false;
   const factories = new Map<string, HostedServiceFactory>([
@@ -146,7 +163,7 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
     }),
   );
   expressApp.use(express.json());
-  expressApp.use(createServerAuthMiddleware());
+  expressApp.use(authenticator.middleware);
 
   const httpServer = http.createServer(expressApp);
   const webSocketServer = new WebSocketServer({ noServer: true });
@@ -450,37 +467,71 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
         res.sendStatus(400);
         return;
       }
-      res.status(500).json({ error: err.message });
+      // Don't leak internal error details (paths, stack hints) to clients.
+      console.error("[server] Unhandled request error:", err);
+      res.status(500).json({ error: "Internal Server Error" });
     },
   );
 
   const bridgeWsServer = new WebSocketServer({ noServer: true });
-  let bridgeUpgradeHandler: ((ws: WebSocket) => void) | undefined;
+  let bridgeUpgradeHandler:
+    | ((ws: WebSocket, user: AuthenticatedUser) => void)
+    | undefined;
+
+  function rejectUpgrade(
+    socket: Duplex,
+    status: number,
+    reason: string,
+  ): void {
+    socket.write(`HTTP/1.1 ${status} ${reason}\r\n\r\n`);
+    socket.destroy();
+  }
 
   httpServer.on("upgrade", (request, socket, head) => {
     // Protocol is irrelevant — base is only needed to resolve the relative path.
     const url = new URL(request.url ?? "/", `http://${request.headers.host}`);
 
-    if (url.pathname === "/coordinator/bridge") {
-      if (bridgeUpgradeHandler) {
-        bridgeWsServer.handleUpgrade(request, socket, head, bridgeUpgradeHandler);
-      } else {
-        socket.write("HTTP/1.1 503 Service Unavailable\r\n\r\n");
-        socket.destroy();
-      }
+    // Authenticate every upgrade with the same rules as HTTP routes. Browsers
+    // can't set headers on a WS handshake, so the token rides in ?access_token=.
+    // The Origin check blocks cross-site WebSocket hijacking from a page a local
+    // user happens to visit.
+    if (!isOriginAllowed(request.headers.origin, allowedOrigins)) {
+      rejectUpgrade(socket, 403, "Forbidden");
       return;
     }
 
-    const runtimeId = url.pathname.slice(1);
-    if (!runtimeId || !runtimeApp.getRuntime(runtimeId)) {
-      socket.write("HTTP/1.1 404 Not Found\r\n\r\n");
-      socket.destroy();
-      return;
-    }
+    void authenticator
+      .verifyToken(url.searchParams.get("access_token"))
+      .then((user) => {
+        if (!user) {
+          rejectUpgrade(socket, 401, "Unauthorized");
+          return;
+        }
 
-    webSocketServer.handleUpgrade(request, socket, head, (websocket) => {
-      webSocketServer.emit("connection", websocket, request, runtimeId);
-    });
+        if (url.pathname === "/coordinator/bridge") {
+          if (bridgeUpgradeHandler) {
+            bridgeWsServer.handleUpgrade(request, socket, head, (ws) => {
+              bridgeUpgradeHandler!(ws, user);
+            });
+          } else {
+            rejectUpgrade(socket, 503, "Service Unavailable");
+          }
+          return;
+        }
+
+        const runtimeId = url.pathname.slice(1);
+        if (!runtimeId || !runtimeApp.getRuntime(runtimeId)) {
+          rejectUpgrade(socket, 404, "Not Found");
+          return;
+        }
+
+        webSocketServer.handleUpgrade(request, socket, head, (websocket) => {
+          webSocketServer.emit("connection", websocket, request, runtimeId);
+        });
+      })
+      .catch(() => {
+        rejectUpgrade(socket, 401, "Unauthorized");
+      });
   });
 
   webSocketServer.on(
@@ -548,7 +599,9 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
         baseUrl: `http://${host}:${address.port}`,
       };
     },
-    setBridgeUpgradeHandler(handler: (ws: WebSocket) => void) {
+    setBridgeUpgradeHandler(
+      handler: (ws: WebSocket, user: AuthenticatedUser) => void,
+    ) {
       bridgeUpgradeHandler = handler;
     },
     async stop() {

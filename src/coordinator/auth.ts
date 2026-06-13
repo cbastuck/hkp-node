@@ -1,14 +1,11 @@
 import { Request, Response, NextFunction } from "express";
-import { AuthMiddleware, buildJwtMiddleware } from "../auth";
+import { AuthConfig, AuthMiddleware, createAuthenticator } from "../auth";
 
-export function createAuthMiddleware(): AuthMiddleware {
-  const domain = process.env.AUTH0_DOMAIN;
-  const audience = process.env.AUTH0_AUDIENCE;
-
-  if (!domain || !audience) {
-    console.warn(
-      "[coordinator] AUTH0_DOMAIN/AUTH0_AUDIENCE not set — running in trust mode (do not use in production)",
-    );
+export function createAuthMiddleware(config: AuthConfig): AuthMiddleware {
+  if (config.mode === "none") {
+    // Development only: with no real identity available, trust the :username
+    // path param as the authenticated subject. resolveServerAuthConfig() only
+    // ever yields "none" for a local checkout that opted in via ALLOW_NO_AUTH.
     return function trustMiddleware(req, res, next) {
       const username = req.params.username as string | undefined;
       if (!username) {
@@ -20,7 +17,7 @@ export function createAuthMiddleware(): AuthMiddleware {
     };
   }
 
-  return buildJwtMiddleware(domain, audience);
+  return createAuthenticator(config).middleware;
 }
 
 export function requireSelf(

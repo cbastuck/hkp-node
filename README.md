@@ -44,14 +44,57 @@ All options are passed as environment variables.
 | `PORT` | `8080` | HTTP and WebSocket listen port |
 | `HOST` | `0.0.0.0` | Bind address |
 | `EXTERNAL_HOST` | `127.0.0.1` | Hostname written into runtime `outputUrl` (use your machine's LAN/public IP when connecting from other devices) |
-| `ALLOWED_ORIGINS` | `*` | CORS `Access-Control-Allow-Origin` value |
+| `ALLOWED_ORIGINS` | `*` | Comma-separated list of allowed origins for CORS **and** the WebSocket Origin check. Leave as `*` only for local development. |
+| `AUTH0_DOMAIN` | — | Auth0 tenant domain. **Required** (with `AUTH0_AUDIENCE`) to start. |
+| `AUTH0_AUDIENCE` | — | Auth0 API audience the access token must target. **Required** to start. |
+| `ALLOW_NO_AUTH` | — | Set to `true` to run **without authentication**. Only honoured for a local source checkout; the published npm package ignores it. Local development only. |
+| `HKP_SERVICE_TOKEN` | — | Shared machine-to-machine token. When set, it is accepted in place of a user JWT and is presented by the coordinator to the runtimes it provisions. |
 | `NAME` | `hkp-node` | Server name reported to clients |
+
+### Authentication
+
+The server **fails closed** on a public bind: it refuses to start unless `AUTH0_DOMAIN` and
+`AUTH0_AUDIENCE` are set. Every HTTP route and WebSocket upgrade then requires a valid Auth0
+bearer token. Because browsers can't set headers on a WebSocket handshake, the token is passed
+as an `?access_token=` query parameter on the WS URL.
+
+A single instance serves a **single tenant** — any valid token may access any runtime on the
+server. Run one instance per user; do not share an instance between users.
+
+**Loopback bind = no auth required.** When `HOST` is a loopback address (`127.0.0.1`, `::1`,
+`localhost`), the server is reachable only from the local machine, so the loopback bind is
+itself the access-control boundary and no Auth0 config is needed. This is how a local runtime
+runs inside the native Meander app. On any other bind you must either configure Auth0 or — from
+a source checkout only — set `ALLOW_NO_AUTH=true`.
 
 Example:
 
 ```sh
-PORT=3000 EXTERNAL_HOST=192.168.1.10 npx hkp-node
+# Production (public bind → Auth0 required)
+AUTH0_DOMAIN=your.eu.auth0.com AUTH0_AUDIENCE=your-api ALLOWED_ORIGINS=https://app.example npx hkp-node
+
+# Local only (loopback bind → no auth needed)
+HOST=127.0.0.1 npx hkp-node
+
+# No auth on a non-loopback bind (from a checkout only)
+ALLOW_NO_AUTH=true npm run dev
 ```
+
+### Deployment & network exposure
+
+The Docker image runs as the unprivileged `node` user and binds `HOST=0.0.0.0` — this is
+required so that a published port actually reaches the process; binding `127.0.0.1` *inside*
+a container would make it unreachable from `-p` forwarding. Control where the server is
+reachable at the **host** level instead:
+
+```sh
+docker run -p 8080:8080            …   # reachable from anywhere
+docker run -p 127.0.0.1:8080:8080  …   # reachable only from the host (loopback)
+docker run                         …   # no published port: not reachable off-container
+```
+
+Override the in-container bind only when you have a specific reason (e.g. fronting it with a
+reverse proxy in the same network namespace): `docker run -e HOST=127.0.0.1 …`.
 
 ---
 
@@ -108,7 +151,7 @@ The following services are built in and available to any runtime created on this
 
 ### WebSocket
 
-Connect to `ws://<host>:<port>/<runtimeId>` to receive live notifications and results for a runtime. The connection is tied to the runtime's lifecycle — when the last client disconnects, the runtime is destroyed.
+Connect to `ws://<host>:<port>/<runtimeId>?access_token=<jwt>` to receive live notifications and results for a runtime. The upgrade is authenticated (token + Origin) exactly like the HTTP routes. The connection is tied to the runtime's lifecycle — when the last client disconnects, the runtime is destroyed.
 
 ---
 
