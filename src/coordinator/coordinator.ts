@@ -13,10 +13,10 @@ export class BoardCoordinator {
     userJwt?: string,
   ): Promise<BoardSession> {
     const existing = this.sessions.get(userId)?.get(config.boardName);
-    // Lift the browser bridge out of the old session before destroying it so
-    // the browser doesn't see a disconnect when infrastructure changes cause
-    // the session to be replaced (e.g. the user adds a runtime).
-    const existingBridge = existing?.takeBridge() ?? null;
+    // Lift the browser bridges out of the old session before destroying it so
+    // connected browsers don't see a disconnect when infrastructure changes
+    // cause the session to be replaced (e.g. the user adds a runtime).
+    const existingBridges = existing?.takeBridges() ?? [];
     if (existing) {
       await existing.destroy();
     }
@@ -24,8 +24,10 @@ export class BoardCoordinator {
     const session = new BoardSession(config.boardName, userId, config, userJwt);
     await session.start();
 
-    if (existingBridge && existingBridge.ws.readyState === 1 /* OPEN */) {
-      session.registerBrowserSocket(existingBridge.ws, existingBridge.runtimeIds);
+    for (const bridge of existingBridges) {
+      if (bridge.ws.readyState === 1 /* OPEN */) {
+        session.registerBrowserSocket(bridge.ws, bridge.runtimeIds);
+      }
     }
 
     this.userSessions(userId).set(config.boardName, session);

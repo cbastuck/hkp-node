@@ -26,7 +26,10 @@ export class BoardSession {
   private readonly errors: string[] = [];
   private readonly sockets = new Map<string, WebSocket>();
   private readonly provisioned: ProvisionedRuntime[] = [];
-  private bridge: BrowserBridge | null = null;
+  // Every browser currently viewing this board has its own bridge. Multiple
+  // clients (e.g. Meander + a browser tab) can watch the same board at once;
+  // runtime output is fanned out to all of them.
+  private readonly bridges = new Set<BrowserBridge>();
   private readonly pendingBrowserResults = new Map<
     string,
     (data: unknown) => void
@@ -119,41 +122,45 @@ export class BoardSession {
     }
     this.sockets.clear();
 
-    // Bridge is either transferred to the new session or closed here.
-    if (this.bridge) {
+    // Bridges are either transferred to the new session or closed here.
+    for (const bridge of this.bridges) {
       console.log(
         `[bridge-close] Server initiating close: destroy() closing bridge for board "${this.boardName}"`,
       );
-      this.bridge.ws.close();
-      this.bridge = null;
+      bridge.ws.close();
     }
+    this.bridges.clear();
   }
 
   /**
-   * Remove the bridge from this session and return it so the caller can
-   * hand it to the replacement session without the browser seeing a disconnect.
+   * Detach all browser bridges from this session and return them so the caller
+   * can hand them to the replacement session without the browsers seeing a
+   * disconnect.
    */
-  takeBridge(): { ws: WebSocket; runtimeIds: string[] } | null {
-    const bridge = this.bridge;
-    if (!bridge) {
-      return null;
-    }
-    // Detach handlers so the old session no longer processes bridge messages.
-    bridge.ws.removeAllListeners("message");
-    bridge.ws.removeAllListeners("close");
-    this.bridge = null;
-    return { ws: bridge.ws, runtimeIds: [...bridge.runtimeIds] };
+  takeBridges(): { ws: WebSocket; runtimeIds: string[] }[] {
+    const taken = [...this.bridges].map((bridge) => {
+      // Detach handlers so the old session no longer processes bridge messages.
+      bridge.ws.removeAllListeners("message");
+      bridge.ws.removeAllListeners("close");
+      return { ws: bridge.ws, runtimeIds: [...bridge.runtimeIds] };
+    });
+    this.bridges.clear();
+    return taken;
   }
 
   registerBrowserSocket(ws: WebSocket, runtimeIds: string[]): void {
-    if (this.bridge && this.bridge.ws !== ws) {
-      console.log(
-        `[bridge-close] Server initiating close: replacing existing bridge socket for board "${this.boardName}"`,
-      );
-      this.bridge.ws.close();
+    // The same socket re-registering (e.g. its browser runtimes changed) — just
+    // refresh its runtimeIds rather than adding a duplicate or re-attaching
+    // listeners.
+    for (const existing of this.bridges) {
+      if (existing.ws === ws) {
+        existing.runtimeIds = new Set(runtimeIds);
+        return;
+      }
     }
 
-    this.bridge = { ws, runtimeIds: new Set(runtimeIds) };
+    const bridge: BrowserBridge = { ws, runtimeIds: new Set(runtimeIds) };
+    this.bridges.add(bridge);
 
     ws.on("message", (raw) => {
       let message: {
@@ -192,17 +199,19 @@ export class BoardSession {
     });
 
     ws.on("close", () => {
-      if (this.bridge?.ws === ws) {
-        this.bridge = null;
-      }
-      for (const [requestId, resolve] of this.pendingBrowserResults) {
-        this.pendingBrowserResults.delete(requestId);
-        resolve(null);
+      this.bridges.delete(bridge);
+      // Only abandon in-flight browser results once no client remains to answer
+      // them; another connected bridge may still reply.
+      if (this.bridges.size === 0) {
+        for (const [requestId, resolve] of this.pendingBrowserResults) {
+          this.pendingBrowserResults.delete(requestId);
+          resolve(null);
+        }
       }
     });
 
     console.log(
-      `[coordinator] Browser bridge registered for board "${this.boardName}" (runtimeIds: ${runtimeIds.join(", ")})`,
+      `[coordinator] Browser bridge registered for board "${this.boardName}" (runtimeIds: ${runtimeIds.join(", ")}, bridges: ${this.bridges.size})`,
     );
   }
 
@@ -378,7 +387,10 @@ export class BoardSession {
     }
 
     if (isBrowserRuntime(next)) {
-      if (!this.bridge || this.bridge.ws.readyState !== WebSocket.OPEN) {
+      const targets = [...this.bridges].filter(
+        (b) => b.ws.readyState === WebSocket.OPEN,
+      );
+      if (targets.length === 0) {
         console.warn(
           `[coordinator] Browser runtime "${next.id}" has no connected bridge — dropping result`,
         );
@@ -386,16 +398,20 @@ export class BoardSession {
       }
 
       const requestId = randomUUID();
+      // Fan the work out to every connected viewer so each client's UI (e.g. a
+      // Monitor) updates. The first reply resolves the chain; later replies for
+      // the same requestId are no-ops since its pending entry is already gone.
       const result = await new Promise<unknown>((resolve) => {
         this.pendingBrowserResults.set(requestId, resolve);
-        this.bridge!.ws.send(
-          JSON.stringify({
-            type: "processRuntime",
-            runtimeId: next.id,
-            params: data,
-            requestId,
-          }),
-        );
+        const payload = JSON.stringify({
+          type: "processRuntime",
+          runtimeId: next.id,
+          params: data,
+          requestId,
+        });
+        for (const target of targets) {
+          target.ws.send(payload);
+        }
       });
 
       if (result !== null) {
