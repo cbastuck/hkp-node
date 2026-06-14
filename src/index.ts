@@ -8,7 +8,10 @@ import { createCoordinatorRouter } from "./coordinator";
 import { AllowedOrigins, AuthConfig, isLoopbackHost } from "./auth";
 
 async function main() {
-  loadEnv({ path: path.join(__dirname, "..", ".env") });
+  if (!process.env.SKIP_LOADING_ENV) {
+    loadEnv({ path: path.join(__dirname, "..", ".env") });
+  }
+
   const port = readInteger(process.env.PORT, 8080);
   const host = process.env.HOST ?? "0.0.0.0";
   const externalHost = process.env.EXTERNAL_HOST ?? "127.0.0.1";

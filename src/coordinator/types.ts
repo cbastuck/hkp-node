@@ -50,6 +50,9 @@ export type BoardSessionInfo = {
   status: BoardSessionStatus;
   createdAt: string;
   config: CloudBoardConfig;
+  /** Human-readable reasons the session is in "error" (e.g. a runtime that
+   *  failed to provision). Empty when running cleanly. */
+  errors: string[];
 };
 
 export function isRemoteRuntime(rt: CloudRuntimeDescriptor): boolean {

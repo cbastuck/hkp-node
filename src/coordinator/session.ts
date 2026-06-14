@@ -7,6 +7,7 @@ import {
   isRemoteRuntime,
   isBrowserRuntime,
 } from "./types";
+import { assertRuntimeUrlAllowed } from "./urlGuard";
 
 type ProvisionedRuntime = {
   descriptor: CloudRuntimeDescriptor;
@@ -21,6 +22,8 @@ type BrowserBridge = {
 export class BoardSession {
   readonly createdAt: string;
   private status: BoardSessionStatus = "running";
+  // Human-readable reasons for an "error" status, surfaced to the UI.
+  private readonly errors: string[] = [];
   private readonly sockets = new Map<string, WebSocket>();
   private readonly provisioned: ProvisionedRuntime[] = [];
   private bridge: BrowserBridge | null = null;
@@ -64,9 +67,11 @@ export class BoardSession {
         wsUrl = await this.provision(runtime, services);
       } catch (err) {
         this.status = "error";
+        const reason = err instanceof Error ? err.message : String(err);
+        this.errors.push(`Runtime "${runtime.id}": ${reason}`);
         console.error(
           `[coordinator] Failed to provision runtime "${runtime.id}" for board "${this.boardName}":`,
-          err instanceof Error ? err.message : err,
+          reason,
         );
         continue;
       }
@@ -81,6 +86,10 @@ export class BoardSession {
 
   getStatus(): BoardSessionStatus {
     return this.status;
+  }
+
+  getErrors(): string[] {
+    return [...this.errors];
   }
 
   async destroy(): Promise<void> {
@@ -205,6 +214,10 @@ export class BoardSession {
   ): Promise<string> {
     const { url, id } = runtime;
     const baseUrl = url!;
+    // SSRF guard: the board config is untrusted (shared/imported boards), so
+    // refuse to dial blocked targets (cloud metadata, internal hosts) before any
+    // request leaves this process.
+    await assertRuntimeUrlAllowed(baseUrl);
     // Provisioning runs while the user is creating/modifying the board, so it is
     // authenticated with their JWT — the runtime validates it the same way it
     // validates a browser's. The JWT is then exchanged for a session token below.
@@ -253,6 +266,10 @@ export class BoardSession {
     if (!outputUrl) {
       throw new Error("Runtime provisioned but no outputUrl returned");
     }
+
+    // The runtime returns the WS URL it wants us to connect to; re-validate it in
+    // case a (possibly malicious) target tried to redirect us to a blocked host.
+    await assertRuntimeUrlAllowed(outputUrl);
 
     // Exchange the user JWT for a long-lived session token scoped to this runtime.
     await this.mintSessionToken(baseUrl, id);

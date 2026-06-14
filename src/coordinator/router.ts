@@ -52,6 +52,7 @@ export function createCoordinatorRouter(
           boardName: session.boardName,
           status: session.getStatus(),
           createdAt: session.createdAt,
+          errors: session.getErrors(),
         });
       } catch (err) {
         const message =
@@ -75,6 +76,7 @@ export function createCoordinatorRouter(
         status: session.getStatus(),
         createdAt: session.createdAt,
         config: session.config,
+        errors: session.getErrors(),
       });
     },
   );

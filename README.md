@@ -48,6 +48,8 @@ All options are passed as environment variables.
 | `AUTH0_DOMAIN` | — | Auth0 tenant domain. **Required** (with `AUTH0_AUDIENCE`) to start. |
 | `AUTH0_AUDIENCE` | — | Auth0 API audience the access token must target. **Required** to start. |
 | `ALLOW_NO_AUTH` | — | Set to `true` to run **without authentication**. Only honoured for a local source checkout; the published npm package ignores it. Local development only. |
+| `HKP_RUNTIME_URL_ALLOWLIST` | — | Comma-separated `host` or `host:port` list. When set, the coordinator may only dial runtimes whose host is listed (strict allowlist; recommended for shared/exposed coordinators). |
+| `HKP_ALLOW_PRIVATE_RUNTIMES` | — | Set to `true` to let the coordinator dial loopback/private (RFC1918/ULA) runtime URLs. Needed for local or self-hosted internal runtimes. Link-local/metadata stays blocked regardless. |
 | `NAME` | `hkp-node` | Server name reported to clients |
 
 ### Authentication
@@ -70,6 +72,13 @@ WebSocket and teardown calls. Tokens are in-memory only and bound to the runtime
 runtime restarts, the coordinator must re-provision, which needs a live user JWT — so boards
 don't self-heal across a runtime restart while the user is offline (persisting these bindings is
 future work). There is no shared static service secret.
+
+**SSRF guard.** A board config is untrusted input (boards can be shared/imported), and it tells
+the coordinator which `runtime.url` to dial from inside its network. The coordinator validates
+every such URL (resolving the host and checking all addresses): link-local / cloud-metadata
+(`169.254.169.254`) and the unspecified address are always blocked, and loopback/private ranges
+are blocked unless allowed via `HKP_ALLOW_PRIVATE_RUNTIMES` or `HKP_RUNTIME_URL_ALLOWLIST`. For
+local/self-hosted runtimes (including the single-box setup), set `HKP_ALLOW_PRIVATE_RUNTIMES=true`.
 
 **Loopback bind = no auth required.** When `HOST` is a loopback address (`127.0.0.1`, `::1`,
 `localhost`), the server is reachable only from the local machine, so the loopback bind is

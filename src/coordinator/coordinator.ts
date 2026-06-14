@@ -47,6 +47,7 @@ export class BoardCoordinator {
       status: s.getStatus(),
       createdAt: s.createdAt,
       config: s.config,
+      errors: s.getErrors(),
     }));
   }
 
