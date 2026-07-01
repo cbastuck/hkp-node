@@ -14,7 +14,7 @@
     "dev": "tsx src/index.ts",
     "start": "npm run dev",
     "localOnly": "SKIP_LOADING_ENV=true HOST=127.0.0.1 npm run dev",
-    "withCoordinator": "COORDINATOR_ENABLED=true npm run dev",
+    "withCoordinator": "HKP_ALLOW_PRIVATE_RUNTIMES=true COORDINATOR_ENABLED=true npm run dev",
     "test": "vitest run",
     "prepublishOnly": "npm run build",
     "publish:npm": "npm publish --access public"

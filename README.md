@@ -1,6 +1,6 @@
 # hkp-node
 
-Node.js runtime server for the [Hookup](https://hookitapp.com) platform. Implements the REST and WebSocket API consumed by the Hookup frontend so boards can run services on a Node.js host instead of (or alongside) the native C++ runtime.
+Node.js runtime server for the [Readymade](https://hookitapp.com) platform. Implements the REST and WebSocket API consumed by the Readymade application so boards can run services on a Node.js host instead of (or alongside) the native C++ runtime.
 
 - **Website:** [hookitapp.com](https://hookitapp.com)
 - **Documentation:** [hookitapp.com/documentation](https://hookitapp.com/documentation)
@@ -39,18 +39,18 @@ The server starts on port `8080` by default and prints the address on startup.
 
 All options are passed as environment variables.
 
-| Variable | Default | Description |
-|---|---|---|
-| `PORT` | `8080` | HTTP and WebSocket listen port |
-| `HOST` | `0.0.0.0` | Bind address |
-| `EXTERNAL_HOST` | `127.0.0.1` | Hostname written into runtime `outputUrl` (use your machine's LAN/public IP when connecting from other devices) |
-| `ALLOWED_ORIGINS` | `*` | Comma-separated list of allowed origins for CORS **and** the WebSocket Origin check. Leave as `*` only for local development. |
-| `AUTH0_DOMAIN` | — | Auth0 tenant domain. **Required** (with `AUTH0_AUDIENCE`) to start. |
-| `AUTH0_AUDIENCE` | — | Auth0 API audience the access token must target. **Required** to start. |
-| `ALLOW_NO_AUTH` | — | Set to `true` to run **without authentication**. Only honoured for a local source checkout; the published npm package ignores it. Local development only. |
-| `HKP_RUNTIME_URL_ALLOWLIST` | — | Comma-separated `host` or `host:port` list. When set, the coordinator may only dial runtimes whose host is listed (strict allowlist; recommended for shared/exposed coordinators). |
-| `HKP_ALLOW_PRIVATE_RUNTIMES` | — | Set to `true` to let the coordinator dial loopback/private (RFC1918/ULA) runtime URLs. Needed for local or self-hosted internal runtimes. Link-local/metadata stays blocked regardless. |
-| `NAME` | `hkp-node` | Server name reported to clients |
+| Variable                     | Default     | Description                                                                                                                                                                             |
+| ---------------------------- | ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `PORT`                       | `8080`      | HTTP and WebSocket listen port                                                                                                                                                          |
+| `HOST`                       | `0.0.0.0`   | Bind address                                                                                                                                                                            |
+| `EXTERNAL_HOST`              | `127.0.0.1` | Hostname written into runtime `outputUrl` (use your machine's LAN/public IP when connecting from other devices)                                                                         |
+| `ALLOWED_ORIGINS`            | `*`         | Comma-separated list of allowed origins for CORS **and** the WebSocket Origin check. Leave as `*` only for local development.                                                           |
+| `AUTH0_DOMAIN`               | —           | Auth0 tenant domain. **Required** (with `AUTH0_AUDIENCE`) to start.                                                                                                                     |
+| `AUTH0_AUDIENCE`             | —           | Auth0 API audience the access token must target. **Required** to start.                                                                                                                 |
+| `ALLOW_NO_AUTH`              | —           | Set to `true` to run **without authentication**. Only honoured for a local source checkout; the published npm package ignores it. Local development only.                               |
+| `HKP_RUNTIME_URL_ALLOWLIST`  | —           | Comma-separated `host` or `host:port` list. When set, the coordinator may only dial runtimes whose host is listed (strict allowlist; recommended for shared/exposed coordinators).      |
+| `HKP_ALLOW_PRIVATE_RUNTIMES` | —           | Set to `true` to let the coordinator dial loopback/private (RFC1918/ULA) runtime URLs. Needed for local or self-hosted internal runtimes. Link-local/metadata stays blocked regardless. |
+| `NAME`                       | `hkp-node`  | Server name reported to clients                                                                                                                                                         |
 
 ### Authentication
 
@@ -102,7 +102,7 @@ ALLOW_NO_AUTH=true npm run dev
 ### Deployment & network exposure
 
 The Docker image runs as the unprivileged `node` user and binds `HOST=0.0.0.0` — this is
-required so that a published port actually reaches the process; binding `127.0.0.1` *inside*
+required so that a published port actually reaches the process; binding `127.0.0.1` _inside_
 a container would make it unreachable from `-p` forwarding. Control where the server is
 reachable at the **host** level instead:
 
@@ -121,18 +121,18 @@ reverse proxy in the same network namespace): `docker run -e HOST=127.0.0.1 …`
 
 The following services are built in and available to any runtime created on this server.
 
-| Service ID | Name |
-|---|---|
-| `monitor` | Monitor |
-| `map` | Map |
-| `timer` | Timer |
-| `sub-service` | SubService |
+| Service ID                | Name                  |
+| ------------------------- | --------------------- |
+| `monitor`                 | Monitor               |
+| `map`                     | Map                   |
+| `timer`                   | Timer                 |
+| `sub-service`             | SubService            |
 | `http-server-subservices` | HttpServerSubservices |
-| `peer-server` | PeerServer |
-| `imap-email` | IMAP Email |
-| `smtp-email` | SMTP Email |
-| `telegram-listener` | Telegram Listener |
-| `telegram-sender` | Telegram Sender |
+| `peer-server`             | PeerServer            |
+| `imap-email`              | IMAP Email            |
+| `smtp-email`              | SMTP Email            |
+| `telegram-listener`       | Telegram Listener     |
+| `telegram-sender`         | Telegram Sender       |
 
 ---
 
@@ -140,33 +140,33 @@ The following services are built in and available to any runtime created on this
 
 ### Runtimes
 
-| Method | Path | Description |
-|---|---|---|
-| `GET` | `/runtimes` | List all runtimes and the service registry |
-| `POST` | `/runtimes` | Create one or more runtimes |
-| `DELETE` | `/runtimes` | Remove all runtimes |
-| `GET` | `/runtimes/:runtimeId` | Get a single runtime |
-| `DELETE` | `/runtimes/:runtimeId` | Remove a runtime |
-| `POST` | `/runtimes/:runtimeId` | Process input for a runtime |
-| `POST` | `/runtimes/:runtimeId/rearrange` | Reorder services in a runtime |
+| Method   | Path                             | Description                                |
+| -------- | -------------------------------- | ------------------------------------------ |
+| `GET`    | `/runtimes`                      | List all runtimes and the service registry |
+| `POST`   | `/runtimes`                      | Create one or more runtimes                |
+| `DELETE` | `/runtimes`                      | Remove all runtimes                        |
+| `GET`    | `/runtimes/:runtimeId`           | Get a single runtime                       |
+| `DELETE` | `/runtimes/:runtimeId`           | Remove a runtime                           |
+| `POST`   | `/runtimes/:runtimeId`           | Process input for a runtime                |
+| `POST`   | `/runtimes/:runtimeId/rearrange` | Reorder services in a runtime              |
 
 ### Services
 
-| Method | Path | Description |
-|---|---|---|
-| `GET` | `/runtimes/:runtimeId/services` | List services in a runtime |
-| `POST` | `/runtimes/:runtimeId/services` | Add a service |
-| `GET` | `/runtimes/:runtimeId/services/:instanceId` | Get service state |
-| `POST` | `/runtimes/:runtimeId/services/:instanceId` | Configure a service |
-| `DELETE` | `/runtimes/:runtimeId/services/:instanceId` | Remove a service |
-| `GET` | `/runtimes/:runtimeId/services/:instanceId/property/:propertyId` | Get a single service property |
+| Method   | Path                                                             | Description                   |
+| -------- | ---------------------------------------------------------------- | ----------------------------- |
+| `GET`    | `/runtimes/:runtimeId/services`                                  | List services in a runtime    |
+| `POST`   | `/runtimes/:runtimeId/services`                                  | Add a service                 |
+| `GET`    | `/runtimes/:runtimeId/services/:instanceId`                      | Get service state             |
+| `POST`   | `/runtimes/:runtimeId/services/:instanceId`                      | Configure a service           |
+| `DELETE` | `/runtimes/:runtimeId/services/:instanceId`                      | Remove a service              |
+| `GET`    | `/runtimes/:runtimeId/services/:instanceId/property/:propertyId` | Get a single service property |
 
 ### Inputs
 
-| Method | Path | Description |
-|---|---|---|
-| `GET` | `/runtimes/:runtimeId/inputs` | List runtime inputs |
-| `GET` | `/runtimes/:runtimeId/inputs/:inputId` | Get a single input |
+| Method | Path                                   | Description         |
+| ------ | -------------------------------------- | ------------------- |
+| `GET`  | `/runtimes/:runtimeId/inputs`          | List runtime inputs |
+| `GET`  | `/runtimes/:runtimeId/inputs/:inputId` | Get a single input  |
 
 ### WebSocket
 
