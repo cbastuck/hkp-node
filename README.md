@@ -174,6 +174,49 @@ Connect to `ws://<host>:<port>/<runtimeId>?access_token=<jwt>` to receive live n
 
 ---
 
+## How to publish a release
+
+1. **Make sure you're logged in / on the right registry**
+
+   ```sh
+   npm whoami          # confirms you're authenticated
+   ```
+
+   If not: `npm login`.
+
+2. **Clean tree + tests green**
+
+   ```sh
+   git status          # nothing uncommitted you don't want shipped
+   npm test
+   ```
+
+3. **Bump the version** (this also creates a git tag by default)
+
+   ```sh
+   npm version patch   # 1.0.5 → 1.0.6   (use minor/major as appropriate)
+   ```
+
+4. **Publish** — `prepublishOnly` rebuilds `dist/` automatically, and `files` limits the tarball to `dist/src`:
+
+   ```sh
+   npm run publish:npm
+   ```
+
+   Optionally dry-run first to see exactly what ships:
+
+   ```sh
+   npm publish --dry-run
+   ```
+
+5. **Push the version commit + tag**
+
+   ```sh
+   git push && git push --tags
+   ```
+
+---
+
 ## Legal
 
 ### Copyright
