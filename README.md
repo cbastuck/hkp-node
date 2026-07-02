@@ -80,6 +80,52 @@ every such URL (resolving the host and checking all addresses): link-local / clo
 are blocked unless allowed via `HKP_ALLOW_PRIVATE_RUNTIMES` or `HKP_RUNTIME_URL_ALLOWLIST`. For
 local/self-hosted runtimes (including the single-box setup), set `HKP_ALLOW_PRIVATE_RUNTIMES=true`.
 
+#### `HKP_RUNTIME_URL_ALLOWLIST` in detail
+
+**What it guards.** This variable constrains a single, specific outbound path: the URLs the
+**coordinator dials when it provisions runtimes**. Those URLs come from the `runtime.url` fields
+of a board config, which is untrusted (boards are shared and imported). It has nothing to do with
+the clients that _connect to_ the coordinator — browsers and the Meander app register **inbound**
+over a WebSocket bridge, so they are never dialed and never need an allowlist entry. In other
+words, the entries you list are the **runtime backend hosts the coordinator is permitted to reach**,
+resolved from the coordinator's own network vantage point (a `runtime.url` of `127.0.0.1` means the
+_coordinator's_ loopback, not a client's machine).
+
+**Default (variable unset).** The coordinator may dial any **public** host. Link-local and
+cloud-metadata addresses (`169.254.169.254`, `::`, etc.) are **always blocked**. Loopback and
+private ranges (RFC1918 / IPv6 ULA) are blocked unless you also set `HKP_ALLOW_PRIVATE_RUNTIMES=true`.
+
+**When set.** It becomes a **strict allowlist**: the coordinator may dial _only_ the listed hosts —
+even otherwise-public hosts that are not listed are rejected. A listed host is also allowed to
+resolve to a loopback/private address (you, the operator, vouched for it), so listing a host
+implicitly permits it regardless of `HKP_ALLOW_PRIVATE_RUNTIMES`. Link-local/metadata stays blocked
+no matter what.
+
+**Matching rules.**
+
+- Comma-separated; entries are trimmed and compared **case-insensitively**.
+- Each entry is either a bare `host` or a `host:port`.
+- A bare `host` entry matches that host on **any** port.
+- A `host:port` entry matches **only** when the URL carries that **explicit** port. Note that a URL
+  using a scheme default (e.g. `https://node.example.com` with no `:443`) has _no_ explicit port, so
+  a `node.example.com:443` entry would **not** match it — list the bare host in that case.
+- Matching is on the host/port only; scheme and path are not considered (beyond the scheme having to
+  be `http`/`https`/`ws`/`wss`).
+
+**Examples.**
+
+```sh
+# Cloud coordinator: only ever dial our two known runtime backends (any port).
+HKP_RUNTIME_URL_ALLOWLIST=node.example.com,python.example.com
+
+# Permit one specific private runtime by host:port, without opening all of RFC1918.
+# (Listing it also waives the private-range block for that host — no HKP_ALLOW_PRIVATE_RUNTIMES needed.)
+HKP_RUNTIME_URL_ALLOWLIST=10.0.5.12:8080
+
+# Pin a backend to a single non-default port only.
+HKP_RUNTIME_URL_ALLOWLIST=runtime.internal:9443
+```
+
 **Loopback bind = no auth required.** When `HOST` is a loopback address (`127.0.0.1`, `::1`,
 `localhost`), the server is reachable only from the local machine, so the loopback bind is
 itself the access-control boundary and no Auth0 config is needed. This is how a local runtime
