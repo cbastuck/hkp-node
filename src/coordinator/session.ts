@@ -27,7 +27,7 @@ export class BoardSession {
   private readonly sockets = new Map<string, WebSocket>();
   private readonly provisioned: ProvisionedRuntime[] = [];
   // Every browser currently viewing this board has its own bridge. Multiple
-  // clients (e.g. Meander + a browser tab) can watch the same board at once;
+  // clients (e.g. Readymade + a browser tab) can watch the same board at once;
   // runtime output is fanned out to all of them.
   private readonly bridges = new Set<BrowserBridge>();
   private readonly pendingBrowserResults = new Map<

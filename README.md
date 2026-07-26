@@ -86,7 +86,7 @@ local/self-hosted runtimes (including the single-box setup), set `HKP_ALLOW_PRIV
 **What it guards.** This variable constrains a single, specific outbound path: the URLs the
 **coordinator dials when it provisions runtimes**. Those URLs come from the `runtime.url` fields
 of a board config, which is untrusted (boards are shared and imported). It has nothing to do with
-the clients that _connect to_ the coordinator — browsers and the Meander app register **inbound**
+the clients that _connect to_ the coordinator — browsers and the Readymade app register **inbound**
 over a WebSocket bridge, so they are never dialed and never need an allowlist entry. In other
 words, the entries you list are the **runtime backend hosts the coordinator is permitted to reach**,
 resolved from the coordinator's own network vantage point (a `runtime.url` of `127.0.0.1` means the
@@ -130,7 +130,7 @@ HKP_RUNTIME_URL_ALLOWLIST=runtime.internal:9443
 **Loopback bind = no auth required.** When `HOST` is a loopback address (`127.0.0.1`, `::1`,
 `localhost`), the server is reachable only from the local machine, so the loopback bind is
 itself the access-control boundary and no Auth0 config is needed. This is how a local runtime
-runs inside the native Meander app. On any other bind you must either configure Auth0 or — from
+runs inside the native Readymade app. On any other bind you must either configure Auth0 or — from
 a source checkout only — set `ALLOW_NO_AUTH=true`.
 
 Example:
