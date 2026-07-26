@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { createRuntimeServer } from "../src/server";
 import {
   createAuthenticator,
+  isEmailAllowed,
   isLoopbackHost,
   type AuthConfig,
 } from "../src/auth";
@@ -146,6 +147,44 @@ describe("hkp-node authentication", () => {
       .send({ id: "rt-1", name: "Node", services: [] })
       .expect(200);
     expect(await wsOutcome(wsUrl(baseUrl, "/rt-1"))).toBe("open");
+  });
+});
+
+describe("hkp-node email allowlist", () => {
+  const allowed = ["alice@example.com", "bob@example.com"];
+
+  it("passes everyone when no allowlist is configured", () => {
+    expect(isEmailAllowed({}, undefined)).toBe(true);
+    expect(
+      isEmailAllowed({ email: "mallory@evil.example", email_verified: true }, undefined),
+    ).toBe(true);
+  });
+
+  it("accepts a verified, listed email — case- and whitespace-insensitively", () => {
+    expect(
+      isEmailAllowed({ email: "alice@example.com", email_verified: true }, allowed),
+    ).toBe(true);
+    expect(
+      isEmailAllowed({ email: " Alice@Example.COM ", email_verified: true }, allowed),
+    ).toBe(true);
+  });
+
+  it("rejects unlisted emails", () => {
+    expect(
+      isEmailAllowed({ email: "mallory@evil.example", email_verified: true }, allowed),
+    ).toBe(false);
+  });
+
+  it("fails closed on a missing or unverified email claim", () => {
+    // No email claim at all (e.g. an access token without the email scope).
+    expect(isEmailAllowed({}, allowed)).toBe(false);
+    // Self-signup with someone else's address: email present but not verified.
+    expect(
+      isEmailAllowed({ email: "alice@example.com", email_verified: false }, allowed),
+    ).toBe(false);
+    expect(isEmailAllowed({ email: "alice@example.com" }, allowed)).toBe(false);
+    // Non-string junk in the claim.
+    expect(isEmailAllowed({ email: 42, email_verified: true }, allowed)).toBe(false);
   });
 });
 

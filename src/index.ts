@@ -125,6 +125,17 @@ function readInteger(value: string | undefined, fallback: number): number {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
+function parseAllowedEmails(value: string | undefined): string[] | undefined {
+  if (!value) {
+    return undefined;
+  }
+  const emails = value
+    .split(",")
+    .map((email) => email.trim().toLowerCase())
+    .filter(Boolean);
+  return emails.length ? emails : undefined;
+}
+
 function parseAllowedOrigins(value: string | undefined): AllowedOrigins {
   if (!value || value.trim() === "*") {
     return "*";
@@ -152,8 +163,24 @@ function isDevCheckout(): boolean {
 function resolveServerAuthConfig(host: string): AuthConfig {
   const domain = process.env.AUTH0_DOMAIN;
   const audience = process.env.AUTH0_AUDIENCE;
+  const allowedEmails = parseAllowedEmails(process.env.ALLOWED_EMAILS);
   if (domain && audience) {
-    return { mode: "jwt", domain, audience };
+    if (allowedEmails) {
+      console.log(
+        `[hkp-node] Access restricted to ${allowedEmails.length} allowlisted email(s).`,
+      );
+    }
+    return { mode: "jwt", domain, audience, allowedEmails };
+  }
+
+  // An allowlist without JWT auth cannot be enforced; starting anyway would
+  // silently grant access to everyone the operator meant to exclude.
+  if (allowedEmails) {
+    console.error(
+      "[hkp-node] ALLOWED_EMAILS is set but AUTH0_DOMAIN/AUTH0_AUDIENCE are not. " +
+        "The email allowlist can only be enforced with Auth0 configured — refusing to start.",
+    );
+    process.exit(1);
   }
 
   if (isLoopbackHost(host)) {

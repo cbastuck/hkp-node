@@ -11,7 +11,7 @@ declare global {
   }
 }
 
-export type AuthenticatedUser = { sub: string };
+export type AuthenticatedUser = { sub: string; email?: string };
 
 export type AuthMiddleware = (
   req: Request,
@@ -23,12 +23,15 @@ export type AuthMiddleware = (
  * How requests are authenticated.
  *
  * - `jwt`  — verify an Auth0 bearer token against the JWKS for `domain`/`audience`.
+ *   When `allowedEmails` is set, the token must additionally carry a **verified**
+ *   `email` claim that is on the list; any other authenticated user of the
+ *   tenant is rejected.
  * - `none` — accept everything (no identity). Only ever resolved for a local
  *   development checkout that opts in via ALLOW_NO_AUTH; the published npm
  *   package never runs in this mode (see resolveServerAuthConfig in index.ts).
  */
 export type AuthConfig =
-  | { mode: "jwt"; domain: string; audience: string }
+  | { mode: "jwt"; domain: string; audience: string; allowedEmails?: string[] }
   | { mode: "none" };
 
 /**
@@ -61,9 +64,29 @@ export type Authenticator = {
   verifyToken(token: string | undefined | null): Promise<AuthenticatedUser | null>;
 };
 
+/**
+ * Email-allowlist gate applied after signature verification. Fail closed: when
+ * a list is configured, a token without an `email` claim — or with an
+ * unverified one — is rejected, because on tenants that allow self-signup an
+ * attacker could otherwise register an allowlisted address without owning it.
+ */
+export function isEmailAllowed(
+  claims: { [claim: string]: unknown },
+  allowedEmails: string[] | undefined,
+): boolean {
+  if (!allowedEmails) {
+    return true;
+  }
+  if (typeof claims.email !== "string" || claims.email_verified !== true) {
+    return false;
+  }
+  return allowedEmails.includes(claims.email.trim().toLowerCase());
+}
+
 function createJwtVerifier(
   domain: string,
   audience: string,
+  allowedEmails?: string[],
 ): (token: string) => Promise<AuthenticatedUser | null> {
   const client = jwksClient({
     jwksUri: `https://${domain}/.well-known/jwks.json`,
@@ -92,7 +115,13 @@ function createJwtVerifier(
           return;
         }
         const sub = typeof decoded.sub === "string" ? decoded.sub : null;
-        resolve(sub ? { sub } : null);
+        if (!sub || !isEmailAllowed(decoded, allowedEmails)) {
+          resolve(null);
+          return;
+        }
+        const email =
+          typeof decoded.email === "string" ? decoded.email : undefined;
+        resolve({ sub, ...(email ? { email } : {}) });
       });
     });
 }
@@ -110,7 +139,11 @@ export function createAuthenticator(
     };
   }
 
-  const verify = createJwtVerifier(config.domain, config.audience);
+  const verify = createJwtVerifier(
+    config.domain,
+    config.audience,
+    config.allowedEmails,
+  );
 
   const verifyToken = async (
     token: string | undefined | null,

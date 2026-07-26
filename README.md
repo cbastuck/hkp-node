@@ -47,6 +47,7 @@ All options are passed as environment variables.
 | `ALLOWED_ORIGINS`            | `*`         | Comma-separated list of allowed origins for CORS **and** the WebSocket Origin check. Leave as `*` only for local development.                                                           |
 | `AUTH0_DOMAIN`               | —           | Auth0 tenant domain. **Required** (with `AUTH0_AUDIENCE`) to start.                                                                                                                     |
 | `AUTH0_AUDIENCE`             | —           | Auth0 API audience the access token must target. **Required** to start.                                                                                                                 |
+| `ALLOWED_EMAILS`             | —           | Comma-separated email allowlist. When set, only tokens with a **verified** `email` claim on the list are accepted; requires Auth0 config (refuses to start without it).                 |
 | `ALLOW_NO_AUTH`              | —           | Set to `true` to run **without authentication**. Only honoured for a local source checkout; the published npm package ignores it. Local development only.                               |
 | `HKP_RUNTIME_URL_ALLOWLIST`  | —           | Comma-separated `host` or `host:port` list. When set, the coordinator may only dial runtimes whose host is listed (strict allowlist; recommended for shared/exposed coordinators).      |
 | `HKP_ALLOW_PRIVATE_RUNTIMES` | —           | Set to `true` to let the coordinator dial loopback/private (RFC1918/ULA) runtime URLs. Needed for local or self-hosted internal runtimes. Link-local/metadata stays blocked regardless. |
@@ -138,6 +139,10 @@ Example:
 # Production (public bind → Auth0 required)
 AUTH0_DOMAIN=your.eu.auth0.com AUTH0_AUDIENCE=your-api ALLOWED_ORIGINS=https://app.example npx hkp-node
 
+# Same, but restricted to specific users (verified email claim must be on the list)
+AUTH0_DOMAIN=your.eu.auth0.com AUTH0_AUDIENCE=your-api ALLOWED_ORIGINS=https://app.example \
+  ALLOWED_EMAILS=alice@example.com,bob@example.com npx hkp-node
+
 # Local only (loopback bind → no auth needed)
 HOST=127.0.0.1 npx hkp-node
 
@@ -160,6 +165,32 @@ docker run                         …   # no published port: not reachable off-
 
 Override the in-container bind only when you have a specific reason (e.g. fronting it with a
 reverse proxy in the same network namespace): `docker run -e HOST=127.0.0.1 …`.
+
+All configuration from the table above is passed the same way, with `-e` flags. Note that the
+container binds `0.0.0.0` — a non-loopback bind — so Auth0 config is **required** for it to start:
+
+```sh
+docker run -p 8080:8080 \
+  -e AUTH0_DOMAIN=your.eu.auth0.com \
+  -e AUTH0_AUDIENCE=your-api \
+  -e ALLOWED_ORIGINS=https://app.example \
+  -e ALLOWED_EMAILS=alice@example.com,bob@example.com \
+  cbastuck/hkp-node:latest
+```
+
+Or keep the settings in a file and use `--env-file`:
+
+```sh
+# hkp-node.env
+AUTH0_DOMAIN=your.eu.auth0.com
+AUTH0_AUDIENCE=your-api
+ALLOWED_ORIGINS=https://app.example
+ALLOWED_EMAILS=alice@example.com,bob@example.com
+```
+
+```sh
+docker run -p 8080:8080 --env-file hkp-node.env cbastuck/hkp-node:latest
+```
 
 ---
 
