@@ -35,14 +35,17 @@ import {
   SmtpEmailService,
   smtpEmailDescriptor,
 } from "./services/smtp-email";
-import { HostedRuntime, RuntimeApp } from "./runtime";
+import { HostedRuntime, RuntimeApp, TenantRuntimes } from "./runtime";
+import { MountRegistry } from "./mounts";
 import {
   AllowedOrigins,
   AuthConfig,
   AuthenticatedUser,
   Authenticator,
+  AuthenticatorOptions,
   createAuthenticator,
   isOriginAllowed,
+  ownerKeyOf,
 } from "./auth";
 import {
   HostedServiceFactory,
@@ -52,8 +55,28 @@ import {
   ServiceConfiguration,
 } from "./types";
 
+/**
+ * Per-tenant limits. Runtimes, services and timers all consume resources on a
+ * shared host, so without a cap one tenant can degrade the server for everyone.
+ * Unset (or 0) means unlimited, which is the right default for a single-user
+ * instance and for local development.
+ */
+export type Quotas = {
+  maxRuntimesPerUser?: number;
+  maxServicesPerRuntime?: number;
+  minTimerIntervalMs?: number;
+};
+
 type CreateRuntimeServerOptions = {
   auth?: AuthConfig;
+  quotas?: Quotas;
+  /**
+   * Builds the authenticator, defaulting to a JWKS-backed one for `auth`.
+   * Overriding it replaces only how a raw token is verified — the server still
+   * resolves its own session tokens first, by passing the resolver it owns into
+   * whatever this returns.
+   */
+  buildAuthenticator?: (options: AuthenticatorOptions) => Authenticator;
   allowedOrigins?: AllowedOrigins;
   externalHost?: string;
   externalSecure?: boolean;
@@ -67,6 +90,15 @@ type SessionToken = {
   sub: string;
   runtimeId: string;
 };
+
+/**
+ * Runtime ids are unique per tenant, not globally, so anything keyed by runtime
+ * outside a tenant view (socket sets, mounts) must be keyed by both. NUL cannot
+ * occur in either part, so the join is unambiguous.
+ */
+function tenantKey(owner: string, runtimeId: string): string {
+  return `${owner}\u0000${runtimeId}`;
+}
 
 type WsInboundMessage = {
   type?: string;
@@ -85,7 +117,11 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
   // if the runtime dies, the coordinator must re-provision (which needs a live
   // user JWT). That bound is intentional for v1 — see the session-token route.
   const sessionTokens = new Map<string, SessionToken>();
-  const authenticator: Authenticator = createAuthenticator(authConfig, {
+  const buildAuthenticator =
+    options.buildAuthenticator ??
+    ((authOptions: AuthenticatorOptions) =>
+      createAuthenticator(authConfig, authOptions));
+  const authenticator: Authenticator = buildAuthenticator({
     resolveOpaqueToken: (token) => {
       const session = sessionTokens.get(token);
       return session ? { sub: session.sub } : null;
@@ -93,6 +129,17 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
   });
   const externalHost = options.externalHost ?? options.host ?? "127.0.0.1";
   const externalSecure = options.externalSecure ?? false;
+  const quotas = options.quotas ?? {};
+
+  /** True when adding one more to `count` would pass the limit (0/unset = no limit). */
+  function atQuota(count: number, limit: number | undefined): boolean {
+    return !!limit && limit > 0 && count >= limit;
+  }
+
+  /** True when `count` items is already more than the limit allows. */
+  function exceedsQuota(count: number, limit: number | undefined): boolean {
+    return !!limit && limit > 0 && count > limit;
+  }
   const factories = new Map<string, HostedServiceFactory>([
     [
       monitorDescriptor.serviceId,
@@ -128,7 +175,8 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
       timerDescriptor.serviceId,
       {
         descriptor: timerDescriptor,
-        create: (config, _createService) => new TimerService(config),
+        create: (config, _createService) =>
+          new TimerService(config, options.quotas?.minTimerIntervalMs ?? 0),
       },
     ],
     [
@@ -169,7 +217,22 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
     ],
   ]);
 
-  const runtimeApp = new RuntimeApp(factories);
+  // Public service endpoints. Declared before the runtime app because runtimes
+  // hand mounts to their services as they are created.
+  const mounts = new MountRegistry((mountPath) => {
+    const address = httpServer.address();
+    if (!address || typeof address === "string") {
+      return undefined;
+    }
+    return externalSecure
+      ? `https://${externalHost}${mountPath}`
+      : `http://${externalHost}:${address.port}${mountPath}`;
+  });
+
+  const runtimeApp = new RuntimeApp(factories, (owner, runtimeId) => ({
+    mount: (serviceUuid, handlers) =>
+      mounts.register(owner, runtimeId, serviceUuid, handlers),
+  }));
   const expressApp = express();
   expressApp.use(
     cors({
@@ -181,9 +244,24 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
   expressApp.use(express.json());
   expressApp.use(authenticator.middleware);
 
-  const httpServer = http.createServer(expressApp);
+  // Mounts are matched before Express so they bypass CORS and the auth
+  // middleware entirely: they exist to be called by outside parties (webhooks,
+  // uploads, PeerJS clients) that hold no token. Their unguessable mount id is
+  // what gates access.
+  const httpServer = http.createServer((req, res) => {
+    if (mounts.handleRequest(req, res)) {
+      return;
+    }
+    expressApp(req, res);
+  });
   const webSocketServer = new WebSocketServer({ noServer: true });
+  // Keyed by tenantKey(owner, runtimeId), not runtimeId — see tenantKey.
   const runtimeSockets = new Map<string, Set<WebSocket>>();
+
+  /** The caller's runtime namespace. Every route resolves runtimes through it. */
+  function tenantOf(req: Request): TenantRuntimes {
+    return runtimeApp.forOwner(ownerKeyOf(req.authenticatedUser));
+  }
 
   function runtimeOutputUrl(runtimeId: string): string | undefined {
     const address = httpServer.address();
@@ -201,10 +279,10 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
   }
 
   function sendJsonNotification(
-    runtimeId: string,
+    socketKey: string,
     notification: RuntimeNotification,
   ) {
-    const sockets = runtimeSockets.get(runtimeId);
+    const sockets = runtimeSockets.get(socketKey);
     if (!sockets || sockets.size === 0) {
       return;
     }
@@ -229,11 +307,17 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
     socket.send(JSON.stringify({ type: "result", data: result }));
   }
 
+  /**
+   * Resolve a runtime inside the caller's namespace. A runtime owned by another
+   * tenant is reported as 404 rather than 403, so runtime ids belonging to other
+   * users cannot be probed for existence.
+   */
   function getRuntimeOr404(
+    req: Request,
     res: Response,
     runtimeId: string,
   ): HostedRuntime | null {
-    const runtime = runtimeApp.getRuntime(runtimeId);
+    const runtime = tenantOf(req).getRuntime(runtimeId);
     if (!runtime) {
       res.sendStatus(404);
       return null;
@@ -243,27 +327,35 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
 
   // Tear a runtime down and drop any session tokens it issued, so a dead
   // runtime's tokens can't linger as valid credentials.
-  function removeRuntimeAndSessions(runtimeId: string): void {
-    runtimeApp.removeRuntime(runtimeId);
+  function removeRuntimeAndSessions(owner: string, runtimeId: string): void {
+    runtimeApp.removeRuntime(owner, runtimeId);
+    mounts.releaseRuntime(owner, runtimeId);
     for (const [token, info] of sessionTokens) {
-      if (info.runtimeId === runtimeId) {
+      if (info.sub === owner && info.runtimeId === runtimeId) {
         sessionTokens.delete(token);
       }
     }
   }
 
-  expressApp.get("/runtimes", (_req, res) => {
+  expressApp.get("/runtimes", (req, res) => {
     res.json({
-      runtimes: runtimeApp
+      runtimes: tenantOf(req)
         .getRuntimes()
         .map((runtime) => serializeRuntime(runtime)),
+      // The service registry is a property of the build, not of a tenant.
       registry: runtimeApp.getRegistry(),
     });
   });
 
-  expressApp.delete("/runtimes", (_req, res) => {
-    runtimeApp.removeAllRuntimes();
-    sessionTokens.clear();
+  expressApp.delete("/runtimes", (req, res) => {
+    const owner = ownerKeyOf(req.authenticatedUser);
+    runtimeApp.removeAllRuntimes(owner);
+    mounts.releaseOwner(owner);
+    for (const [token, info] of sessionTokens) {
+      if (info.sub === owner) {
+        sessionTokens.delete(token);
+      }
+    }
     res.sendStatus(200);
   });
 
@@ -276,6 +368,8 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
       return;
     }
 
+    const owner = ownerKeyOf(req.authenticatedUser);
+    const tenant = tenantOf(req);
     const payloads = Array.isArray(req.body) ? req.body : [req.body];
     const runtimes: ReturnType<typeof serializeRuntime>[] = [];
 
@@ -289,18 +383,39 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
       // Reuse an existing runtime with the same ID rather than destroying it.
       // This lets a browser reconnect to a coordinator-managed board without
       // killing services (e.g. a running timer) that the coordinator started.
-      const existing = runtimeApp.getRuntime(config.id);
+      // The lookup is tenant-scoped, so two users loading the same board (which
+      // ships a stable runtime id) each get their own runtime instead of one
+      // silently attaching to the other's.
+      const existing = tenant.getRuntime(config.id);
       if (existing) {
         runtimes.push(serializeRuntime(existing));
         continue;
       }
 
-      const runtime = runtimeApp.createRuntime(config);
+      // Quotas apply only to genuinely new runtimes — reconnecting to one that
+      // already exists must never be refused for being over the limit.
+      if (atQuota(tenant.getRuntimes().length, quotas.maxRuntimesPerUser)) {
+        res.status(429).json({
+          error: `Runtime limit reached (${quotas.maxRuntimesPerUser})`,
+        });
+        return;
+      }
+      if (
+        exceedsQuota(config.services.length, quotas.maxServicesPerRuntime)
+      ) {
+        res.status(429).json({
+          error: `Service limit reached (${quotas.maxServicesPerRuntime})`,
+        });
+        return;
+      }
+
+      const runtime = tenant.createRuntime(config);
+      const socketKey = tenantKey(owner, runtime.id);
       runtime.registerNotificationTarget((notification) => {
-        sendJsonNotification(runtime.id, notification);
+        sendJsonNotification(socketKey, notification);
       });
       runtime.registerResultTarget((result) => {
-        const sockets = runtimeSockets.get(runtime.id);
+        const sockets = runtimeSockets.get(socketKey);
         if (!sockets) return;
         for (const socket of sockets) {
           sendJsonResult(socket, result);
@@ -313,7 +428,7 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
   });
 
   expressApp.get("/runtimes/:runtimeId", (req, res) => {
-    const runtime = getRuntimeOr404(res, req.params.runtimeId);
+    const runtime = getRuntimeOr404(req, res, req.params.runtimeId);
     if (!runtime) {
       return;
     }
@@ -323,7 +438,13 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
   expressApp.delete("/runtimes/:runtimeId", (req, res) => {
     // Always return success — if the runtime was already destroyed (e.g. by a
     // WebSocket disconnect) the desired state is the same as an explicit delete.
-    removeRuntimeAndSessions(req.params.runtimeId);
+    // Scoped to the caller, so this can only ever remove their own runtime; an
+    // id owned by another tenant is a no-op that still reports success, matching
+    // the already-destroyed case.
+    removeRuntimeAndSessions(
+      ownerKeyOf(req.authenticatedUser),
+      req.params.runtimeId,
+    );
     res.json({ id: req.params.runtimeId });
   });
 
@@ -338,18 +459,18 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
   // live user JWT. Boards therefore don't self-heal across a runtime restart
   // while the user is offline; persisting these bindings is future work.
   expressApp.post("/runtimes/:runtimeId/session-token", (req, res) => {
-    const runtime = getRuntimeOr404(res, req.params.runtimeId);
+    const runtime = getRuntimeOr404(req, res, req.params.runtimeId);
     if (!runtime) {
       return;
     }
-    const sub = req.authenticatedUser?.sub ?? "anonymous";
+    const sub = ownerKeyOf(req.authenticatedUser);
     const token = randomBytes(32).toString("hex");
     sessionTokens.set(token, { sub, runtimeId: req.params.runtimeId });
     res.json({ token });
   });
 
   expressApp.post("/runtimes/:runtimeId/rearrange", (req, res) => {
-    const runtime = getRuntimeOr404(res, req.params.runtimeId);
+    const runtime = getRuntimeOr404(req, res, req.params.runtimeId);
     if (!runtime) {
       return;
     }
@@ -368,7 +489,7 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
   });
 
   expressApp.post("/runtimes/:runtimeId", (req, res) => {
-    const runtime = getRuntimeOr404(res, req.params.runtimeId);
+    const runtime = getRuntimeOr404(req, res, req.params.runtimeId);
     if (!runtime) {
       return;
     }
@@ -384,7 +505,7 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
   });
 
   expressApp.get("/runtimes/:runtimeId/inputs", (req, res) => {
-    const runtime = getRuntimeOr404(res, req.params.runtimeId);
+    const runtime = getRuntimeOr404(req, res, req.params.runtimeId);
     if (!runtime) {
       return;
     }
@@ -392,7 +513,7 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
   });
 
   expressApp.get("/runtimes/:runtimeId/inputs/:inputId", (req, res) => {
-    const runtime = getRuntimeOr404(res, req.params.runtimeId);
+    const runtime = getRuntimeOr404(req, res, req.params.runtimeId);
     if (!runtime) {
       return;
     }
@@ -407,7 +528,7 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
   });
 
   expressApp.get("/runtimes/:runtimeId/services", (req, res) => {
-    const runtime = getRuntimeOr404(res, req.params.runtimeId);
+    const runtime = getRuntimeOr404(req, res, req.params.runtimeId);
     if (!runtime) {
       return;
     }
@@ -415,13 +536,19 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
   });
 
   expressApp.post("/runtimes/:runtimeId/services", (req, res) => {
-    const runtime = getRuntimeOr404(res, req.params.runtimeId);
+    const runtime = getRuntimeOr404(req, res, req.params.runtimeId);
     if (!runtime) {
       return;
     }
     const config = validateServiceConfiguration(req.body);
     if (!config) {
       res.sendStatus(400);
+      return;
+    }
+    if (atQuota(runtime.listServices().length, quotas.maxServicesPerRuntime)) {
+      res.status(429).json({
+        error: `Service limit reached (${quotas.maxServicesPerRuntime})`,
+      });
       return;
     }
 
@@ -434,7 +561,7 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
   });
 
   expressApp.delete("/runtimes/:runtimeId/services/:instanceId", (req, res) => {
-    const runtime = getRuntimeOr404(res, req.params.runtimeId);
+    const runtime = getRuntimeOr404(req, res, req.params.runtimeId);
     if (!runtime) {
       return;
     }
@@ -448,7 +575,7 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
   expressApp.post(
     "/runtimes/:runtimeId/services/:instanceId",
     async (req, res) => {
-      const runtime = getRuntimeOr404(res, req.params.runtimeId);
+      const runtime = getRuntimeOr404(req, res, req.params.runtimeId);
       if (!runtime) {
         return;
       }
@@ -475,7 +602,7 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
   );
 
   expressApp.get("/runtimes/:runtimeId/services/:instanceId", (req, res) => {
-    const runtime = getRuntimeOr404(res, req.params.runtimeId);
+    const runtime = getRuntimeOr404(req, res, req.params.runtimeId);
     if (!runtime) {
       return;
     }
@@ -490,7 +617,7 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
   expressApp.get(
     "/runtimes/:runtimeId/services/:instanceId/property/:propertyId",
     (req, res) => {
-      const runtime = getRuntimeOr404(res, req.params.runtimeId);
+      const runtime = getRuntimeOr404(req, res, req.params.runtimeId);
       if (!runtime) {
         return;
       }
@@ -537,6 +664,12 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
   }
 
   httpServer.on("upgrade", (request, socket, head) => {
+    // Mounts are matched first and are not token-authenticated, for the same
+    // reason their HTTP requests are not: the callers are outside parties.
+    if (mounts.handleUpgrade(request, socket, head)) {
+      return;
+    }
+
     // Protocol is irrelevant — base is only needed to resolve the relative path.
     const url = new URL(request.url ?? "/", `http://${request.headers.host}`);
 
@@ -577,14 +710,21 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
           return;
         }
 
+        // The runtime is resolved in the authenticated user's namespace, so a
+        // token cannot open a socket onto another tenant's runtime; an id owned
+        // by someone else is indistinguishable from one that does not exist.
+        const owner = ownerKeyOf(user);
         const runtimeId = url.pathname.slice(1);
-        if (!runtimeId || !runtimeApp.getRuntime(runtimeId)) {
+        if (!runtimeId || !runtimeApp.getRuntime(owner, runtimeId)) {
           rejectUpgrade(socket, 404, "Not Found");
           return;
         }
 
         webSocketServer.handleUpgrade(request, socket, head, (websocket) => {
-          webSocketServer.emit("connection", websocket, request, runtimeId);
+          webSocketServer.emit("connection", websocket, request, {
+            owner,
+            runtimeId,
+          });
         });
       })
       .catch(() => {
@@ -594,20 +734,25 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
 
   webSocketServer.on(
     "connection",
-    (socket: WebSocket, _request: http.IncomingMessage, runtimeId: string) => {
-      const sockets = runtimeSockets.get(runtimeId) ?? new Set<WebSocket>();
+    (
+      socket: WebSocket,
+      _request: http.IncomingMessage,
+      { owner, runtimeId }: { owner: string; runtimeId: string },
+    ) => {
+      const socketKey = tenantKey(owner, runtimeId);
+      const sockets = runtimeSockets.get(socketKey) ?? new Set<WebSocket>();
       sockets.add(socket);
-      runtimeSockets.set(runtimeId, sockets);
+      runtimeSockets.set(socketKey, sockets);
 
       socket.on("close", () => {
-        const current = runtimeSockets.get(runtimeId);
+        const current = runtimeSockets.get(socketKey);
         current?.delete(socket);
         if (current && current.size === 0) {
-          runtimeSockets.delete(runtimeId);
+          runtimeSockets.delete(socketKey);
           // Last client disconnected — destroy the runtime immediately so its
           // resources (ports, file handles, etc.) are released. If the board is
           // saved and the page reloads, POST /runtimes will recreate it cleanly.
-          removeRuntimeAndSessions(runtimeId);
+          removeRuntimeAndSessions(owner, runtimeId);
         }
       });
 
@@ -624,7 +769,7 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
         }
 
         if (message.type === "processRuntime" && message.params !== undefined) {
-          const runtime = runtimeApp.getRuntime(runtimeId);
+          const runtime = runtimeApp.getRuntime(owner, runtimeId);
           if (!runtime) {
             return;
           }

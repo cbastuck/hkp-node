@@ -27,6 +27,14 @@ async function main() {
     externalSecure,
     host,
     name: process.env.NAME ?? "hkp-node",
+    quotas: {
+      maxRuntimesPerUser: readInteger(process.env.HKP_MAX_RUNTIMES_PER_USER, 0),
+      maxServicesPerRuntime: readInteger(
+        process.env.HKP_MAX_SERVICES_PER_RUNTIME,
+        0,
+      ),
+      minTimerIntervalMs: readInteger(process.env.HKP_MIN_TIMER_INTERVAL_MS, 0),
+    },
   });
 
   if (coordinatorEnabled) {

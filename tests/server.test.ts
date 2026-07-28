@@ -378,7 +378,6 @@ describe("hkp-node runtime server", () => {
         state: {
           bypass: false,
           mode: "process_on_session",
-          port: 0,
           pipeline: [
             {
               serviceId: mapDescriptor.serviceId,
@@ -406,9 +405,11 @@ describe("hkp-node runtime server", () => {
       .send({ bypass: false })
       .expect(200);
 
-    const port = configureResponse.body.port;
-    expect(typeof port).toBe("number");
-    expect(port).toBeGreaterThan(0);
+    // The endpoint is served by the shared runtime server at an assigned path,
+    // so the service publishes a URL rather than a port it bound itself.
+    const endpoint = configureResponse.body.url;
+    expect(typeof endpoint).toBe("string");
+    expect(endpoint).toMatch(/\/hosted\/[0-9a-f]+$/);
 
     const curlLifecycleSeen = new Promise<void>((resolve, reject) => {
       const socket = new WebSocket(
@@ -462,7 +463,7 @@ describe("hkp-node runtime server", () => {
 
       socket.on("open", async () => {
         try {
-          const response = await fetch(`http://127.0.0.1:${port}/hello`);
+          const response = await fetch(`${endpoint}/hello`);
           expect(response.status).toBe(200);
         } catch (error) {
           clearTimeout(timeout);
@@ -479,7 +480,7 @@ describe("hkp-node runtime server", () => {
 
     await expect(curlLifecycleSeen).resolves.toBeUndefined();
 
-    const innerResponse = await fetch(`http://127.0.0.1:${port}/hello`);
+    const innerResponse = await fetch(`${endpoint}/hello`);
     expect(innerResponse.status).toBe(200);
     const payload = await innerResponse.json();
     expect(payload).toEqual({ source: "http", path: "/hello", method: "GET" });

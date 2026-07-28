@@ -52,6 +52,9 @@ All options are passed as environment variables.
 | `HKP_RUNTIME_URL_ALLOWLIST`  | —           | Comma-separated `host` or `host:port` list. When set, the coordinator may only dial runtimes whose host is listed (strict allowlist; recommended for shared/exposed coordinators).      |
 | `HKP_ALLOW_PRIVATE_RUNTIMES` | —           | Set to `true` to let the coordinator dial loopback/private (RFC1918/ULA) runtime URLs. Needed for local or self-hosted internal runtimes. Link-local/metadata stays blocked regardless. |
 | `NAME`                       | `hkp-node`  | Server name reported to clients                                                                                                                                                         |
+| `HKP_MAX_RUNTIMES_PER_USER`  | —           | Maximum runtimes one tenant may hold. Unset or `0` means unlimited. Reconnecting to a runtime that already exists is never refused.                                                      |
+| `HKP_MAX_SERVICES_PER_RUNTIME` | —         | Maximum services per runtime. Unset or `0` means unlimited.                                                                                                                             |
+| `HKP_MIN_TIMER_INTERVAL_MS`  | —           | Lower bound on the Timer service's periodic interval; shorter periods are clamped to it. Unset or `0` means no floor.                                                                    |
 
 ### Authentication
 
@@ -60,8 +63,48 @@ The server **fails closed** on a public bind: it refuses to start unless `AUTH0_
 bearer token. Because browsers can't set headers on a WebSocket handshake, the token is passed
 as an `?access_token=` query parameter on the WS URL.
 
-A single instance serves a **single tenant** — any valid token may access any runtime on the
-server. Run one instance per user; do not share an instance between users.
+**Multi-tenancy.** Runtimes are namespaced by the authenticated user, taken from the token's
+`sub` claim — the same identifier the coordinator uses as its `userId`. Every route resolves
+runtime ids inside the caller's own namespace, so one instance can serve many users:
+
+- `GET /runtimes` lists only your runtimes; `DELETE /runtimes` clears only yours.
+- A runtime id owned by another user answers **404**, not 403 — ids cannot be probed.
+- Two users may hold the same runtime id at once. This is the normal case, since boards ship
+  stable, human-readable ids (`node`, `chat-node`), and each user gets their own runtime.
+
+Routes are unchanged: identity comes from the `Authorization` header, never from the path.
+
+When authentication is disabled (a loopback bind, or `ALLOW_NO_AUTH=true` from a checkout),
+every request collapses into a single `anonymous` tenant — identical to the pre-tenancy
+behaviour, which is what local development wants.
+
+Note that a user signing in through two different identity providers (say Google and
+email/password) receives two Auth0 `sub`s, and therefore two separate namespaces. Consolidating
+those is an Auth0-side concern and is not handled here.
+
+### Service endpoints (mounts)
+
+Services that must be reachable from outside — `http-server-subservices`, `peer-server` — do
+not bind a port. The runtime assigns each one an opaque path on this same server and publishes
+the resulting address in the service's state:
+
+```
+http://<EXTERNAL_HOST>:<PORT>/hosted/<mountId>
+```
+
+Ports are a single machine-wide namespace, so on a shared host a service asking for a specific
+port is a land grab: the second claimant fails and whoever wins receives traffic the other
+expected. An assigned id avoids that, and because runtime ids are only unique per tenant they
+could not have appeared in a globally-routable path anyway.
+
+These endpoints are deliberately **unauthenticated** — they exist to be called by outside
+parties (webhooks, uploads, PeerJS clients) that hold no token — so the unguessable `mountId`
+is what gates access. It carries no user identifier. A mount is released when its service is
+bypassed or its runtime goes away.
+
+The address is not knowable at board-design time, so a board reads it from the service's state
+rather than hard-coding it. `port` and `path` are still accepted on these services and ignored,
+so existing boards load; they simply no longer control anything.
 
 **Coordinator → runtime (delegated session tokens).** The coordinator reaches runtimes as a
 machine client over long-lived connections, so it can't use a user JWT (those expire and the
@@ -137,7 +180,7 @@ Example:
 
 ```sh
 # Production (public bind → Auth0 required)
-AUTH0_DOMAIN=your.eu.auth0.com AUTH0_AUDIENCE=your-api ALLOWED_ORIGINS=https://app.example npx hkp-node
+AUTH0_DOMAIN=hookitapp.eu.auth0.com AUTH0_AUDIENCE=gpk8IFPKfaOTQUzpDRO7vBajOnB72rkM ALLOWED_ORIGINS=https://node.readymadeit.com npx hkp-node
 
 # Same, but restricted to specific users (verified email claim must be on the list)
 AUTH0_DOMAIN=your.eu.auth0.com AUTH0_AUDIENCE=your-api ALLOWED_ORIGINS=https://app.example \

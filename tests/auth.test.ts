@@ -8,6 +8,8 @@ import {
   isEmailAllowed,
   isLoopbackHost,
   type AuthConfig,
+  type Authenticator,
+  type AuthenticatorOptions,
 } from "../src/auth";
 
 // A non-resolvable domain keeps these tests offline: every code path we exercise
@@ -185,6 +187,349 @@ describe("hkp-node email allowlist", () => {
     expect(isEmailAllowed({ email: "alice@example.com" }, allowed)).toBe(false);
     // Non-string junk in the claim.
     expect(isEmailAllowed({ email: 42, email_verified: true }, allowed)).toBe(false);
+  });
+});
+
+const ALICE = "auth0|alice";
+const BOB = "auth0|bob";
+
+/**
+ * Stands in for JWKS verification so tenancy can be exercised offline with two
+ * distinct principals: a bearer token is simply the sub it authenticates as.
+ * Session tokens are still resolved first through the resolver the server owns,
+ * so the delegation path stays under test rather than being stubbed out.
+ */
+function twoPrincipalAuth(options: AuthenticatorOptions): Authenticator {
+  const known = new Set([ALICE, BOB]);
+  const verifyToken = async (token: string | undefined | null) => {
+    if (!token) {
+      return null;
+    }
+    const opaque = options.resolveOpaqueToken?.(token);
+    if (opaque) {
+      return opaque;
+    }
+    return known.has(token) ? { sub: token } : null;
+  };
+
+  return {
+    middleware: (req, res, next) => {
+      const header = req.headers.authorization;
+      if (!header?.startsWith("Bearer ")) {
+        res.sendStatus(401);
+        return;
+      }
+      void verifyToken(header.slice(7)).then((user) => {
+        if (!user) {
+          res.sendStatus(401);
+          return;
+        }
+        req.authenticatedUser = user;
+        next();
+      });
+    },
+    verifyToken,
+  };
+}
+
+async function startTenantServer() {
+  return startServer({ buildAuthenticator: twoPrincipalAuth });
+}
+
+/** Create a runtime named `id` owned by `sub`, carrying one monitor service. */
+async function createRuntimeAs(
+  baseUrl: string,
+  sub: string,
+  id: string,
+  serviceUuid: string,
+) {
+  await request(baseUrl)
+    .post("/runtimes")
+    .set("Authorization", `Bearer ${sub}`)
+    .send({
+      id,
+      name: "Node",
+      services: [{ serviceId: "monitor", uuid: serviceUuid }],
+    })
+    .expect(200);
+}
+
+describe("hkp-node multi-tenancy", () => {
+  it("gives two users their own runtime for the same runtime id", async () => {
+    const { baseUrl } = await startTenantServer();
+    // Boards ship stable, human-readable runtime ids, so this collision is the
+    // normal case whenever two users load the same board — not an edge case.
+    await createRuntimeAs(baseUrl, ALICE, "node", "alice-monitor");
+    await createRuntimeAs(baseUrl, BOB, "node", "bob-monitor");
+
+    await request(baseUrl)
+      .get("/runtimes/node/services")
+      .set("Authorization", `Bearer ${ALICE}`)
+      .expect(200)
+      .expect(({ body }) => {
+        expect(body.map((s: { uuid: string }) => s.uuid)).toEqual([
+          "alice-monitor",
+        ]);
+      });
+
+    await request(baseUrl)
+      .get("/runtimes/node/services")
+      .set("Authorization", `Bearer ${BOB}`)
+      .expect(200)
+      .expect(({ body }) => {
+        expect(body.map((s: { uuid: string }) => s.uuid)).toEqual([
+          "bob-monitor",
+        ]);
+      });
+  });
+
+  it("lists only the caller's runtimes", async () => {
+    const { baseUrl } = await startTenantServer();
+    await createRuntimeAs(baseUrl, ALICE, "alice-rt", "m1");
+    await createRuntimeAs(baseUrl, BOB, "bob-rt", "m2");
+
+    await request(baseUrl)
+      .get("/runtimes")
+      .set("Authorization", `Bearer ${ALICE}`)
+      .expect(200)
+      .expect(({ body }) => {
+        expect(body.runtimes.map((r: { id: string }) => r.id)).toEqual([
+          "alice-rt",
+        ]);
+        // The registry describes the build, not the tenant.
+        expect(body.registry.length).toBeGreaterThan(0);
+      });
+  });
+
+  it("reports another tenant's runtime as 404 on every per-runtime route", async () => {
+    const { baseUrl } = await startTenantServer();
+    await createRuntimeAs(baseUrl, ALICE, "alice-rt", "m1");
+    const asBob = (path: string) =>
+      request(baseUrl).get(path).set("Authorization", `Bearer ${BOB}`);
+
+    // 404 rather than 403 — Bob must not be able to probe which runtime ids exist.
+    await asBob("/runtimes/alice-rt").expect(404);
+    await asBob("/runtimes/alice-rt/services").expect(404);
+    await asBob("/runtimes/alice-rt/services/m1").expect(404);
+    await asBob("/runtimes/alice-rt/inputs").expect(404);
+    await asBob("/runtimes/alice-rt/services/m1/property/bypass").expect(404);
+
+    await request(baseUrl)
+      .post("/runtimes/alice-rt")
+      .set("Authorization", `Bearer ${BOB}`)
+      .send({ hello: "world" })
+      .expect(404);
+    await request(baseUrl)
+      .post("/runtimes/alice-rt/services/m1")
+      .set("Authorization", `Bearer ${BOB}`)
+      .send({ bypass: true })
+      .expect(404);
+    await request(baseUrl)
+      .post("/runtimes/alice-rt/rearrange")
+      .set("Authorization", `Bearer ${BOB}`)
+      .send(["m1"])
+      .expect(404);
+    await request(baseUrl)
+      .post("/runtimes/alice-rt/session-token")
+      .set("Authorization", `Bearer ${BOB}`)
+      .expect(404);
+    await request(baseUrl)
+      .delete("/runtimes/alice-rt/services/m1")
+      .set("Authorization", `Bearer ${BOB}`)
+      .expect(404);
+
+    // Alice's runtime and its service survived all of that.
+    await request(baseUrl)
+      .get("/runtimes/alice-rt/services/m1")
+      .set("Authorization", `Bearer ${ALICE}`)
+      .expect(200);
+  });
+
+  it("keeps DELETE /runtimes inside the caller's namespace", async () => {
+    const { baseUrl } = await startTenantServer();
+    await createRuntimeAs(baseUrl, ALICE, "alice-rt", "m1");
+    await createRuntimeAs(baseUrl, BOB, "bob-rt", "m2");
+
+    await request(baseUrl)
+      .delete("/runtimes")
+      .set("Authorization", `Bearer ${BOB}`)
+      .expect(200);
+
+    await request(baseUrl)
+      .get("/runtimes/alice-rt")
+      .set("Authorization", `Bearer ${ALICE}`)
+      .expect(200);
+    await request(baseUrl)
+      .get("/runtimes/bob-rt")
+      .set("Authorization", `Bearer ${BOB}`)
+      .expect(404);
+  });
+
+  it("cannot delete another tenant's runtime by id", async () => {
+    const { baseUrl } = await startTenantServer();
+    await createRuntimeAs(baseUrl, ALICE, "alice-rt", "m1");
+
+    // DELETE is idempotent and always reports success, so the check is that
+    // Alice's runtime is still there afterwards.
+    await request(baseUrl)
+      .delete("/runtimes/alice-rt")
+      .set("Authorization", `Bearer ${BOB}`)
+      .expect(200);
+
+    await request(baseUrl)
+      .get("/runtimes/alice-rt")
+      .set("Authorization", `Bearer ${ALICE}`)
+      .expect(200);
+  });
+
+  it("rejects a WebSocket upgrade onto another tenant's runtime", async () => {
+    const { baseUrl } = await startTenantServer();
+    await createRuntimeAs(baseUrl, ALICE, "alice-rt", "m1");
+
+    expect(
+      await wsOutcome(wsUrl(baseUrl, "/alice-rt"), {
+        Authorization: `Bearer ${BOB}`,
+      }),
+    ).toBe("rejected");
+    expect(
+      await wsOutcome(wsUrl(baseUrl, "/alice-rt"), {
+        Authorization: `Bearer ${ALICE}`,
+      }),
+    ).toBe("open");
+  });
+
+  it("resolves a session token into the namespace of the user who minted it", async () => {
+    const { baseUrl } = await startTenantServer();
+    await createRuntimeAs(baseUrl, ALICE, "alice-rt", "m1");
+
+    const { body } = await request(baseUrl)
+      .post("/runtimes/alice-rt/session-token")
+      .set("Authorization", `Bearer ${ALICE}`)
+      .expect(200);
+
+    // This is the coordinator's machine path: the token stands in for Alice.
+    expect(
+      await wsOutcome(wsUrl(baseUrl, "/alice-rt"), {
+        Authorization: `Bearer ${body.token}`,
+      }),
+    ).toBe("open");
+    await request(baseUrl)
+      .get("/runtimes")
+      .set("Authorization", `Bearer ${body.token}`)
+      .expect(200)
+      .expect(({ body }) => {
+        expect(body.runtimes.map((r: { id: string }) => r.id)).toEqual([
+          "alice-rt",
+        ]);
+      });
+  });
+
+  it("collapses to a single namespace when auth is off", async () => {
+    // The dev/loopback path must keep behaving exactly as it did before tenancy.
+    const { baseUrl } = await startServer({ auth: { mode: "none" } });
+    await request(baseUrl)
+      .post("/runtimes")
+      .send({ id: "rt-1", name: "Node", services: [] })
+      .expect(200);
+    await request(baseUrl)
+      .get("/runtimes")
+      .expect(200)
+      .expect(({ body }) => {
+        expect(body.runtimes.map((r: { id: string }) => r.id)).toEqual(["rt-1"]);
+      });
+    await request(baseUrl).get("/runtimes/rt-1").expect(200);
+  });
+});
+
+describe("hkp-node per-tenant quotas", () => {
+  it("caps runtimes per tenant without affecting another tenant", async () => {
+    const { baseUrl } = await startServer({
+      buildAuthenticator: twoPrincipalAuth,
+      quotas: { maxRuntimesPerUser: 1 },
+    });
+
+    await createRuntimeAs(baseUrl, ALICE, "rt-1", "m1");
+    await request(baseUrl)
+      .post("/runtimes")
+      .set("Authorization", `Bearer ${ALICE}`)
+      .send({ id: "rt-2", name: "Node", services: [] })
+      .expect(429);
+
+    // Bob has his own allowance; Alice exhausting hers must not spend it.
+    await createRuntimeAs(baseUrl, BOB, "rt-1", "m2");
+  });
+
+  it("lets a tenant reconnect to an existing runtime while at the cap", async () => {
+    const { baseUrl } = await startServer({
+      buildAuthenticator: twoPrincipalAuth,
+      quotas: { maxRuntimesPerUser: 1 },
+    });
+    await createRuntimeAs(baseUrl, ALICE, "rt-1", "m1");
+
+    // Re-POSTing an existing id is how a browser reattaches after a reload; the
+    // cap must not turn that into a failure.
+    await request(baseUrl)
+      .post("/runtimes")
+      .set("Authorization", `Bearer ${ALICE}`)
+      .send({ id: "rt-1", name: "Node", services: [] })
+      .expect(200);
+  });
+
+  it("caps services per runtime on create and on add", async () => {
+    const { baseUrl } = await startServer({
+      buildAuthenticator: twoPrincipalAuth,
+      quotas: { maxServicesPerRuntime: 2 },
+    });
+
+    await request(baseUrl)
+      .post("/runtimes")
+      .set("Authorization", `Bearer ${ALICE}`)
+      .send({
+        id: "rt-big",
+        name: "Node",
+        services: [
+          { serviceId: "monitor", uuid: "m1" },
+          { serviceId: "monitor", uuid: "m2" },
+          { serviceId: "monitor", uuid: "m3" },
+        ],
+      })
+      .expect(429);
+
+    await request(baseUrl)
+      .post("/runtimes")
+      .set("Authorization", `Bearer ${ALICE}`)
+      .send({
+        id: "rt-1",
+        name: "Node",
+        services: [
+          { serviceId: "monitor", uuid: "m1" },
+          { serviceId: "monitor", uuid: "m2" },
+        ],
+      })
+      .expect(200);
+
+    await request(baseUrl)
+      .post("/runtimes/rt-1/services")
+      .set("Authorization", `Bearer ${ALICE}`)
+      .send({ serviceId: "monitor", uuid: "m3" })
+      .expect(429);
+  });
+
+  it("places no limits by default", async () => {
+    const { baseUrl } = await startServer({ auth: { mode: "none" } });
+    for (const id of ["rt-1", "rt-2", "rt-3"]) {
+      await request(baseUrl)
+        .post("/runtimes")
+        .send({
+          id,
+          name: "Node",
+          services: [
+            { serviceId: "monitor", uuid: `${id}-a` },
+            { serviceId: "monitor", uuid: `${id}-b` },
+          ],
+        })
+        .expect(200);
+    }
   });
 });
 

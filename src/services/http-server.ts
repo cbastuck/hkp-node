@@ -4,16 +4,17 @@
  * Service Name: HttpServerSubservices
  * Runtime: hkp-node
  * Modes: session pipeline hosting
- * Key Config: host/port/routes/subservices
+ * Key Config: bypass/mode/pipeline (the endpoint is assigned, not configured)
  * IO: in=request envelope -> out=response envelope
  * Arrays: not primary
  * Binary: depends on endpoint + nested services
  * MixedData: not native in runtime
  */
-import http, { IncomingMessage, ServerResponse } from "node:http";
+import { IncomingMessage, ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
 
 import { HostedRuntime } from "../runtime";
+import { MountContext, MountHandle } from "../mounts";
 import {
   HostedService,
   JsonRecord,
@@ -34,7 +35,8 @@ type HttpServerMode = "process_on_session" | "process_on_data";
 type HttpServerSubservicesState = JsonRecord & {
   bypass: boolean;
   mode: HttpServerMode;
-  port: number;
+  /** Public endpoint assigned by the runtime; empty while bypassed. */
+  url: string;
   pipeline: Array<{
     serviceId: string;
     instanceId: string;
@@ -50,10 +52,9 @@ export class HttpServerSubservicesService implements HostedService {
 
   private bypass = true;
   private mode: HttpServerMode = "process_on_session";
-  private port = 0;
   private latestData: unknown = null;
 
-  private server: http.Server | null = null;
+  private mount: MountHandle | null = null;
   private pipelineConfig: ServiceConfiguration[] = [];
   private pipeline: HostedRuntime | null = null;
   private readonly createService: ServiceCreator;
@@ -71,18 +72,10 @@ export class HttpServerSubservicesService implements HostedService {
   configure(config: JsonRecord): JsonRecord {
     const previousBypass = this.bypass;
 
-    if (typeof config.port === "number" && Number.isInteger(config.port)) {
-      if (
-        config.port >= 0 &&
-        config.port <= 65535 &&
-        this.port !== config.port
-      ) {
-        this.port = config.port;
-        if (this.server) {
-          this.restartServer();
-        }
-      }
-    }
+    // `port` is accepted and ignored: the endpoint is served by the shared
+    // runtime server under an assigned path, so a service no longer picks a
+    // port. Older boards still carry the field, and rejecting it would fail
+    // them on load for a setting that no longer means anything.
 
     if (
       config.mode === "process_on_session" ||
@@ -127,14 +120,14 @@ export class HttpServerSubservicesService implements HostedService {
     if (typeof config.bypass === "boolean" && config.bypass !== this.bypass) {
       this.bypass = config.bypass;
       if (this.bypass) {
-        this.stopServer();
+        this.releaseMount();
       } else {
-        this.startServer();
+        this.claimMount();
       }
     }
 
-    if (previousBypass && !this.bypass && !this.server) {
-      this.startServer();
+    if (previousBypass && !this.bypass && !this.mount) {
+      this.claimMount();
     }
 
     return this.getState();
@@ -144,7 +137,7 @@ export class HttpServerSubservicesService implements HostedService {
     const state: HttpServerSubservicesState = {
       bypass: this.bypass,
       mode: this.mode,
-      port: this.port,
+      url: this.mount?.url ?? "",
       pipeline: this.getPipelineState(),
     };
     return state;
@@ -152,6 +145,12 @@ export class HttpServerSubservicesService implements HostedService {
 
   setHost(host: RuntimeHost): void {
     this.host = host;
+    // State is applied in the constructor, before the host exists, so a service
+    // configured as already-active has nothing to claim its mount from until
+    // now. Claiming here is what makes a board load into a live endpoint.
+    if (!this.bypass && !this.mount) {
+      this.claimMount();
+    }
   }
 
   process(
@@ -166,57 +165,36 @@ export class HttpServerSubservicesService implements HostedService {
   }
 
   destroy(): void {
-    this.stopServer();
+    this.releaseMount();
     this.pipeline = null;
     this.pipelineConfig = [];
   }
 
-  private restartServer(): void {
-    this.stopServer();
-    if (!this.bypass) {
-      this.startServer();
-    }
-  }
-
-  private startServer(): void {
-    if (this.server) {
+  private claimMount(): void {
+    if (this.mount || !this.host?.mount) {
       return;
     }
 
-    this.server = http.createServer((req, res) => {
-      void this.handleRequest(req, res);
+    this.mount = this.host.mount(this.uuid, {
+      request: (req, res, context) => {
+        void this.handleRequest(req, res, context);
+      },
     });
 
-    this.server.on("error", (error) => {
-      console.error("http-server-subservices error", error);
-    });
-
-    this.server.listen(this.port, () => {
-      const address = this.server?.address();
-      if (address && typeof address !== "string") {
-        this.port = address.port;
-        this.notify({ port: this.port }, this.uuid);
-      }
-    });
+    // A board reads the assigned endpoint from here (or from state), since it
+    // is not knowable at design time.
+    this.notify({ url: this.mount?.url ?? "" }, this.uuid);
   }
 
-  private stopServer(): void {
-    const server = this.server;
-    this.server = null;
-    if (!server) {
-      return;
-    }
-
-    server.close((error) => {
-      if (error) {
-        console.error("http-server-subservices close error", error);
-      }
-    });
+  private releaseMount(): void {
+    this.mount?.release();
+    this.mount = null;
   }
 
   private async handleRequest(
     req: IncomingMessage,
     res: ServerResponse,
+    context: MountContext,
   ): Promise<void> {
     if (this.bypass) {
       res.statusCode = 503;
@@ -231,7 +209,9 @@ export class HttpServerSubservicesService implements HostedService {
       processInput = this.latestData;
       output = processInput;
     } else {
-      const url = new URL(req.url ?? "/", "http://localhost");
+      // The mount prefix is transport addressing, not part of the route the
+      // pipeline matches on, so the pipeline sees the path below the mount.
+      const url = new URL(context.subPath, "http://localhost");
       processInput = {
         path: url.pathname,
         method: req.method ?? "GET",
