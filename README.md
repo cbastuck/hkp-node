@@ -55,6 +55,7 @@ All options are passed as environment variables.
 | `HKP_MAX_RUNTIMES_PER_USER`  | —           | Maximum runtimes one tenant may hold. Unset or `0` means unlimited. Reconnecting to a runtime that already exists is never refused.                                                      |
 | `HKP_MAX_SERVICES_PER_RUNTIME` | —         | Maximum services per runtime. Unset or `0` means unlimited.                                                                                                                             |
 | `HKP_MIN_TIMER_INTERVAL_MS`  | —           | Lower bound on the Timer service's periodic interval; shorter periods are clamped to it. Unset or `0` means no floor.                                                                    |
+| `HKP_MAX_REQUEST_BODY_BYTES` | `26214400`  | Largest request body accepted on a service endpoint (25 MB). Oversized requests get `413`. Set `0` to disable — unwise, since these endpoints take no token.                             |
 
 ### Authentication
 
@@ -105,6 +106,53 @@ bypassed or its runtime goes away.
 The address is not knowable at board-design time, so a board reads it from the service's state
 rather than hard-coding it. `port` and `path` are still accepted on these services and ignored,
 so existing boards load; they simply no longer control anything.
+
+#### What a request looks like to the pipeline
+
+`http-server-subservices` hands each request to its pipeline as **MixedData** — JSON metadata
+plus the raw body — matching the shape hkp-rt's body-carrying HTTP service already produces:
+
+```jsonc
+{
+  "meta": {
+    "method": "POST",
+    "path": "/upload",              // path below the mount, not the mount prefix
+    "query": { "a": "1" },
+    "contentType": "application/json",  // present when the request carried one
+    "filename": "notes.txt"             // from content-disposition, when present
+  },
+  "body": { "hello": "world" }          // decoded, when the type allows it
+}
+```
+
+The body arrives in **exactly one** form, never both — carrying the raw bytes next to a
+decoded value would only restate it at twice the size:
+
+| Content type                        | Field    | Value                |
+| ----------------------------------- | -------- | -------------------- |
+| `application/json`, `*+json`        | `body`   | parsed JSON value    |
+| `application/x-www-form-urlencoded` | `body`   | parsed fields object |
+| `text/*`                            | `body`   | string               |
+| anything else                       | `binary` | raw bytes            |
+| no request body (e.g. GET)          | —        | neither field        |
+
+So a JSON webhook is reachable as `params.body.hello`, while an upload stays raw for a
+filesystem service to write.
+
+Charset parameters are ignored when matching. Malformed input falls back to `binary` rather
+than failing the request: the endpoint is public and takes whatever it is given, so the raw
+bytes remain available to inspect.
+
+Because JS has no JSON form for a byte array, a Monitor renders `binary` as
+`{"0":123,"1":34,…}` — that is the display, not the data; services in the pipeline receive a
+real `Uint8Array`.
+
+**This replaced the previous flat `{ path, method }`.** A pipeline that matched on `params.path`
+now needs `params.meta.path`. No board shipped in `hkp-frontend/boards` used this service on
+hkp-node, so nothing in-tree broke, but your own boards may need the same edit.
+
+Note hkp-rt's `http-server-subservices` still emits the flat shape — the two runtimes are
+temporarily out of step until that side is updated.
 
 **Coordinator → runtime (delegated session tokens).** The coordinator reaches runtimes as a
 machine client over long-lived connections, so it can't use a user JWT (those expire and the

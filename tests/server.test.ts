@@ -386,8 +386,8 @@ describe("hkp-node runtime server", () => {
                 mode: "replace",
                 template: {
                   source: "http",
-                  "path=": "params.path",
-                  "method=": "params.method",
+                  "path=": "params.meta.path",
+                  "method=": "params.meta.method",
                 },
               },
             },

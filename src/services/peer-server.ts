@@ -118,13 +118,11 @@ export class PeerServerService implements HostedService {
     const peerId = client.getId();
     this.connectedPeers = [...this.connectedPeers, peerId];
     this.host?.notify({ connectedPeers: this.connectedPeers }, this.uuid);
-    if (this.emitEvents) {
-      this.host?.processFrom(
-        this.uuid,
-        { event: "peer-connected", peerId, connectedPeers: this.connectedPeers },
-        (_n: RuntimeNotification) => {},
-      );
-    }
+    this.emitEvent({
+      event: "peer-connected",
+      peerId,
+      connectedPeers: this.connectedPeers,
+    });
   };
 
   private onPeerDisconnected = (client: IClient): void => {
@@ -132,14 +130,36 @@ export class PeerServerService implements HostedService {
     const peerId = client.getId();
     this.connectedPeers = this.connectedPeers.filter((id) => id !== peerId);
     this.host?.notify({ connectedPeers: this.connectedPeers }, this.uuid);
-    if (this.emitEvents) {
-      this.host?.processFrom(
-        this.uuid,
-        { event: "peer-disconnected", peerId, connectedPeers: this.connectedPeers },
-        (_n: RuntimeNotification) => {},
-      );
-    }
+    this.emitEvent({
+      event: "peer-disconnected",
+      peerId,
+      connectedPeers: this.connectedPeers,
+    });
   };
+
+  /**
+   * Push a peer event through the rest of this runtime and on to the next one.
+   *
+   * A service that produces data without being asked has to emit the runtime's
+   * result itself; nothing else will. Running the remaining services alone only
+   * updates this runtime, which looks right in a Monitor sitting behind the
+   * service but leaves the chain dead from there on.
+   */
+  private emitEvent(payload: JsonRecord): void {
+    if (!this.emitEvents || !this.host) {
+      return;
+    }
+    const output = this.host.processFrom(
+      this.uuid,
+      payload,
+      (_n: RuntimeNotification) => {},
+    );
+    // A downstream service returning null means "stop" — honour it rather than
+    // forwarding a dead result to the next runtime.
+    if (output !== null && output !== undefined) {
+      this.host.emitResult(output);
+    }
+  }
 
   private claimMount(): void {
     if (this.mount || !this.host?.mount) {

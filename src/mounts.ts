@@ -8,7 +8,10 @@ import { randomBytes } from "node:crypto";
 export type MountContext = {
   /** Public path prefix this mount owns, e.g. `/hosted/ab12…`. */
   mountPath: string;
-  /** Request path with `mountPath` removed; always starts with `/`. */
+  /**
+   * Request target with `mountPath` removed; always starts with `/` and keeps
+   * any query string, so a handler can parse it as a URL and see both.
+   */
   subPath: string;
 };
 
@@ -179,8 +182,8 @@ export class MountRegistry {
     if (!rawUrl) {
       return null;
     }
-    // Only the path matters here; the base is a placeholder for parsing.
-    const { pathname } = new URL(rawUrl, "http://localhost");
+    // The base is a placeholder for parsing; only the path and query matter.
+    const { pathname, search } = new URL(rawUrl, "http://localhost");
     if (!pathname.startsWith(`${MOUNT_PREFIX}/`)) {
       return null;
     }
@@ -193,7 +196,7 @@ export class MountRegistry {
       return null;
     }
 
-    const subPath = slash === -1 ? "/" : remainder.slice(slash);
+    const subPath = (slash === -1 ? "/" : remainder.slice(slash)) + search;
     return {
       record,
       context: { mountPath: `${MOUNT_PREFIX}/${mountId}`, subPath },

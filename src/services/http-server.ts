@@ -32,6 +32,96 @@ export const httpServerSubservicesDescriptor: ServiceRegistryEntry = {
 
 type HttpServerMode = "process_on_session" | "process_on_data";
 
+/**
+ * An incoming request as MixedData: JSON metadata plus the raw body. Mirrors
+ * hkp-rt's body-carrying HTTP service so the same pipeline works on either.
+ */
+type MixedRequest = {
+  meta: JsonRecord;
+  /**
+   * The raw body, for content whose type does not say what the bytes mean.
+   * Absent once the body has been decoded into `body` — keeping both would
+   * double the payload to restate what the decoded value already carries — and
+   * absent entirely when the request had no body.
+   */
+  binary?: Uint8Array;
+  /**
+   * The body decoded according to its content type. Present for the cases a
+   * board can act on directly — a JSON webhook, a form post — instead of
+   * needing bytes decoded by hand. Absent when the type is not textual, when
+   * there is no body, or when it did not parse.
+   */
+  body?: unknown;
+};
+
+/** Content type with any parameters (`; charset=…`) stripped, lower-cased. */
+function mediaType(contentType: string | undefined): string {
+  return (contentType ?? "").split(";")[0].trim().toLowerCase();
+}
+
+/**
+ * Decode a body for the content types where a board would otherwise be stuck
+ * with raw bytes. Returns undefined when there is nothing sensible to produce,
+ * which includes malformed input: a public endpoint receives whatever it is
+ * given, and a parse failure should leave the raw bytes to inspect rather than
+ * fail the request.
+ */
+function decodeBody(
+  binary: Uint8Array,
+  contentType: string | undefined,
+): unknown {
+  if (binary.length === 0) {
+    return undefined;
+  }
+
+  const type = mediaType(contentType);
+  const asText = () => Buffer.from(binary).toString("utf8");
+
+  if (type === "application/json" || type.endsWith("+json")) {
+    try {
+      return JSON.parse(asText());
+    } catch {
+      return undefined;
+    }
+  }
+
+  if (type === "application/x-www-form-urlencoded") {
+    const fields: JsonRecord = {};
+    for (const [key, value] of new URLSearchParams(asText())) {
+      fields[key] = value;
+    }
+    return fields;
+  }
+
+  if (type.startsWith("text/")) {
+    return asText();
+  }
+
+  return undefined;
+}
+
+class RequestTooLargeError extends Error {
+  constructor() {
+    super("Request body too large");
+  }
+}
+
+function header(req: IncomingMessage, name: string): string | undefined {
+  const value = req.headers[name];
+  return Array.isArray(value) ? value[0] : value;
+}
+
+/** Extracts `filename="…"` from a content-disposition header, if present. */
+function filenameFromDisposition(
+  disposition: string | undefined,
+): string | undefined {
+  if (!disposition) {
+    return undefined;
+  }
+  const match = disposition.match(/filename\*?=(?:UTF-8'')?"?([^";]+)"?/i);
+  return match ? decodeURIComponent(match[1]) : undefined;
+}
+
 type HttpServerSubservicesState = JsonRecord & {
   bypass: boolean;
   mode: HttpServerMode;
@@ -60,7 +150,13 @@ export class HttpServerSubservicesService implements HostedService {
   private readonly createService: ServiceCreator;
   private host: RuntimeHost | null = null;
 
-  constructor(config: ServiceConfiguration, createService: ServiceCreator) {
+  constructor(
+    config: ServiceConfiguration,
+    createService: ServiceCreator,
+    // Upper bound on a request body, in bytes; 0 disables the limit. Supplied by
+    // the server because the endpoint is public and shared.
+    private readonly maxBodyBytes = 0,
+  ) {
     this.uuid = config.uuid;
     this.createService = createService;
 
@@ -191,6 +287,99 @@ export class HttpServerSubservicesService implements HostedService {
     this.mount = null;
   }
 
+  /**
+   * Build the MixedData an incoming request becomes: JSON `meta` describing it,
+   * plus the body in whichever single form is useful — decoded as `body` when
+   * the content type says what the bytes mean, raw as `binary` otherwise. The
+   * meta/binary pair is the shape hkp-rt's body-carrying HTTP service produces,
+   * so pipelines handling uploads can be written once against it.
+   *
+   * `meta.path` stays the URL path this service has always reported. A filename
+   * from content-disposition is surfaced separately as `meta.filename` rather
+   * than overloading `path`, which would silently change what existing
+   * pipelines match on.
+   */
+  private async readRequest(
+    req: IncomingMessage,
+    context: MountContext,
+  ): Promise<MixedRequest> {
+    // The mount prefix is transport addressing, not part of the route the
+    // pipeline matches on, so the pipeline sees the path below the mount.
+    const url = new URL(context.subPath, "http://localhost");
+    const query: JsonRecord = {};
+    for (const [key, value] of url.searchParams) {
+      query[key] = value;
+    }
+
+    const contentType = header(req, "content-type");
+    const meta: JsonRecord = {
+      method: req.method ?? "GET",
+      path: url.pathname,
+      query,
+    };
+    if (contentType) {
+      meta.contentType = contentType;
+    }
+    const filename = filenameFromDisposition(header(req, "content-disposition"));
+    if (filename) {
+      meta.filename = filename;
+    }
+
+    const binary = await this.readBody(req);
+
+    // Exactly one representation of the body, or neither when there was none.
+    const body = decodeBody(binary, contentType);
+    if (body !== undefined) {
+      return { meta, body };
+    }
+    return binary.length > 0 ? { meta, binary } : { meta };
+  }
+
+  /**
+   * Read the request body, refusing anything past the configured cap.
+   *
+   * A mount is reachable without a token by design, so an unbounded read is a
+   * way for anyone holding the URL to exhaust the host — which on a shared
+   * instance is everyone else's problem too. The cap is enforced while reading
+   * rather than from content-length, which a client controls.
+   */
+  private readBody(req: IncomingMessage): Promise<Uint8Array> {
+    return new Promise((resolve, reject) => {
+      const chunks: Buffer[] = [];
+      let total = 0;
+      let rejected = false;
+
+      req.on("data", (chunk: Buffer) => {
+        if (rejected) {
+          // Keep draining but stop accumulating: memory is what the limit
+          // protects, and tearing the socket down here would lose the 413 the
+          // caller is about to write.
+          return;
+        }
+        total += chunk.length;
+        if (this.maxBodyBytes > 0 && total > this.maxBodyBytes) {
+          rejected = true;
+          chunks.length = 0;
+          reject(new RequestTooLargeError());
+          return;
+        }
+        chunks.push(chunk);
+      });
+
+      req.on("end", () => {
+        if (!rejected) {
+          resolve(new Uint8Array(Buffer.concat(chunks)));
+        }
+      });
+
+      req.on("error", (err) => {
+        if (!rejected) {
+          reject(err);
+        }
+      });
+    });
+  }
+
   private async handleRequest(
     req: IncomingMessage,
     res: ServerResponse,
@@ -209,13 +398,19 @@ export class HttpServerSubservicesService implements HostedService {
       processInput = this.latestData;
       output = processInput;
     } else {
-      // The mount prefix is transport addressing, not part of the route the
-      // pipeline matches on, so the pipeline sees the path below the mount.
-      const url = new URL(context.subPath, "http://localhost");
-      processInput = {
-        path: url.pathname,
-        method: req.method ?? "GET",
-      };
+      let request: MixedRequest;
+      try {
+        request = await this.readRequest(req, context);
+      } catch (error) {
+        if (error instanceof RequestTooLargeError) {
+          res.statusCode = 413;
+          res.setHeader("content-type", "application/json");
+          res.end(JSON.stringify({ error: "Request body too large" }));
+          return;
+        }
+        throw error;
+      }
+      processInput = request;
       output = this.processSessionInput(processInput);
     }
 

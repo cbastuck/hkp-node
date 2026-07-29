@@ -65,7 +65,17 @@ export type Quotas = {
   maxRuntimesPerUser?: number;
   maxServicesPerRuntime?: number;
   minTimerIntervalMs?: number;
+  /** Largest accepted request body on a public service endpoint; 0 disables. */
+  maxRequestBodyBytes?: number;
 };
+
+/**
+ * Service endpoints are reachable without a token, so an unbounded body read is
+ * available to anyone holding the URL. Unlike the other quotas this one defaults
+ * to a real value rather than "unlimited": leaving it off would make the
+ * dangerous choice the automatic one.
+ */
+const DEFAULT_MAX_REQUEST_BODY_BYTES = 25 * 1024 * 1024;
 
 type CreateRuntimeServerOptions = {
   auth?: AuthConfig;
@@ -168,7 +178,11 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
       {
         descriptor: httpServerSubservicesDescriptor,
         create: (config, createService) =>
-          new HttpServerSubservicesService(config, createService),
+          new HttpServerSubservicesService(
+            config,
+            createService,
+            options.quotas?.maxRequestBodyBytes ?? DEFAULT_MAX_REQUEST_BODY_BYTES,
+          ),
       },
     ],
     [
