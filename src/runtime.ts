@@ -183,6 +183,26 @@ export class HostedRuntime implements RuntimeHost {
     onNotification: (notification: RuntimeNotification) => void,
   ): unknown {
     const startIndex = this.serviceOrder.indexOf(startAfterUuid) + 1;
+
+    // A service pushing from itself (a Timer tick, an inbound message, a peer
+    // event) was never called by the loop below, so the loop never reported it.
+    // Report it here, or the UI shows a service producing nothing while the
+    // service after it plainly receives data.
+    this.emitNotification(
+      {
+        instanceId: startAfterUuid,
+        payload: { __internal: { state: "call-process", data: null } },
+      },
+      onNotification,
+    );
+    this.emitNotification(
+      {
+        instanceId: startAfterUuid,
+        payload: { __internal: { state: "call-process-finished", data: input } },
+      },
+      onNotification,
+    );
+
     return this.processFromIndex(startIndex, input, onNotification);
   }
 

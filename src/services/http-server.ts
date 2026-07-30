@@ -414,32 +414,16 @@ export class HttpServerSubservicesService implements HostedService {
       output = this.processSessionInput(processInput);
     }
 
-    this.notify(
-      {
-        __internal: {
-          state: "call-process",
-          data: processInput,
-        },
-      },
-      this.uuid,
-    );
-
+    // processFrom reports this service's own call-process pair, so there is no
+    // manual pair here — emitting one too would double every request in the UI.
+    // It also reports the right value: what this service emitted, rather than
+    // what the whole downstream chain finally returned.
     if (this.host) {
-      output = this.host.processFrom(this.uuid, output, (notification) => {
-        this.notify(notification.payload, notification.instanceId);
-      });
+      // No-op: the runtime already fans these out to its notification targets.
+      // Re-notifying through the host would deliver every one twice.
+      output = this.host.processFrom(this.uuid, output, () => {});
       this.host.emitResult(output);
     }
-
-    this.notify(
-      {
-        __internal: {
-          state: "call-process-finished",
-          data: output,
-        },
-      },
-      this.uuid,
-    );
 
     res.statusCode = 200;
     res.setHeader("content-type", "application/json");

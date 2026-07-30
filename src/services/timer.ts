@@ -227,8 +227,9 @@ export class TimerService {
       const result = this._host.processFrom(
         this.uuid,
         { triggerCount },
-        (n: RuntimeNotification) =>
-          this._notify(n.payload as JsonRecord, n.instanceId),
+        // No-op: the runtime already fans these out to its notification
+        // targets. Re-notifying through the host would deliver every one twice.
+        (_n: RuntimeNotification) => {},
       );
       this._host.emitResult(result);
     }
@@ -245,8 +246,9 @@ export class TimerService {
       const result = this._host.processFrom(
         this.uuid,
         merged,
-        (n: RuntimeNotification) =>
-          this._notify(n.payload as JsonRecord, n.instanceId),
+        // No-op: the runtime already fans these out to its notification
+        // targets. Re-notifying through the host would deliver every one twice.
+        (_n: RuntimeNotification) => {},
       );
       this._host.emitResult(result);
     }
