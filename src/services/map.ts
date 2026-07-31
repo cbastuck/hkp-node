@@ -4,18 +4,26 @@
  * Service Name: Map
  * Runtime: hkp-node
  * Modes: replace | add | overwrite | sensingMode
- * Key Config: template, mode, sensingMode
+ * Key Config: template, mode, arrayMode, sensingMode
  * IO: in=object|array|scalar -> out=mapped payload
- * Arrays: maps each element
+ * Arrays: maps each element (arrayMode "single" maps the array as a whole)
  * Binary: not intended for raw binary
  * MixedData: not native in runtime
+ *
+ * The template dialect matches the browser runtime's Map so both share one UI:
+ * a key ending in "=" is a dynamic term whose value is an expression evaluated
+ * against `params`, a plain key is a static value, a dot in a key nests the
+ * result, and a lone "=" key produces a scalar instead of an object. Templates
+ * that nest objects or arrays keep their shape and are evaluated recursively.
  */
 import {
   HostedService,
   JsonRecord,
+  RuntimeHost,
   ServiceConfiguration,
   ServiceRegistryEntry,
 } from "../types";
+import { CompiledExpression, compileExpression } from "./expression";
 
 export const mapDescriptor: ServiceRegistryEntry = {
   serviceId: "map",
@@ -25,12 +33,25 @@ export const mapDescriptor: ServiceRegistryEntry = {
 };
 
 type MapMode = "replace" | "add" | "overwrite";
+type ArrayMode = "array" | "single";
 
-type MapState = JsonRecord & {
+type MapState = {
   mode: MapMode;
-  template: JsonRecord;
+  arrayMode: ArrayMode;
+  template: unknown;
   sensingMode: boolean;
 };
+
+// A template that nests objects or arrays is kept in its authored shape and
+// evaluated node by node, rather than being flattened into dotted keys.
+type TemplateNode =
+  | { type: "value"; value: unknown }
+  | { type: "expression"; expression: CompiledExpression }
+  | { type: "array"; items: TemplateNode[] }
+  | {
+      type: "object";
+      entries: Array<{ key: string; dynamic: boolean; node: TemplateNode }>;
+    };
 
 export class MapService implements HostedService {
   readonly serviceId = mapDescriptor.serviceId;
@@ -40,13 +61,16 @@ export class MapService implements HostedService {
   readonly uuid: string;
 
   private state: MapState;
-  private terms: Record<string, unknown> = {};
+  private terms: Record<string, CompiledExpression> = {};
   private properties: Record<string, unknown> = {};
+  private structuredTemplate: TemplateNode | undefined;
+  private host: RuntimeHost | undefined;
 
   constructor(config: ServiceConfiguration) {
     this.uuid = config.uuid;
     this.state = {
       mode: "replace",
+      arrayMode: "array",
       template: {},
       sensingMode: false,
     };
@@ -56,8 +80,12 @@ export class MapService implements HostedService {
     }
   }
 
+  setHost(host: RuntimeHost): void {
+    this.host = host;
+  }
+
   configure(config: JsonRecord): JsonRecord {
-    if (isJsonRecord(config.template)) {
+    if (isJsonRecord(config.template) || Array.isArray(config.template)) {
       this.updateTemplate(config.template);
     }
 
@@ -67,10 +95,20 @@ export class MapService implements HostedService {
       config.mode === "overwrite"
     ) {
       this.state.mode = config.mode;
+      this.notify({ mode: config.mode });
+    }
+
+    if (config.arrayMode === "array" || config.arrayMode === "single") {
+      this.state.arrayMode = config.arrayMode;
+      this.notify({ arrayMode: config.arrayMode });
     }
 
     if (typeof config.sensingMode === "boolean") {
-      this.state.sensingMode = config.sensingMode;
+      this.updateSensingMode(config.sensingMode);
+    }
+
+    if (isJsonRecord(config.command)) {
+      this.runCommand(config.command);
     }
 
     return this.getState();
@@ -79,27 +117,29 @@ export class MapService implements HostedService {
   getState(): JsonRecord {
     return {
       mode: this.state.mode,
-      template: { ...this.state.template },
+      arrayMode: this.state.arrayMode,
+      template: deepCopy(this.state.template),
       sensingMode: this.state.sensingMode,
     };
   }
 
   process(input: unknown, _notify: (payload: unknown) => void): unknown {
     if (this.state.sensingMode) {
-      if (isJsonRecord(input)) {
-        this.updateTemplate(input);
-      } else {
-        this.updateTemplate({ value: input });
-      }
-      this.state.sensingMode = false;
+      this.updateTemplate(
+        isJsonRecord(input) || Array.isArray(input)
+          ? flatten(input)
+          : { value: input },
+      );
+      this.updateSensingMode(false);
       return null;
     }
 
-    if (Array.isArray(input)) {
+    if (this.state.arrayMode !== "single" && Array.isArray(input)) {
       return input.map((entry) => this.mapper(entry));
     }
 
     if (
+      !this.structuredTemplate &&
       !Object.keys(this.terms).length &&
       !Object.keys(this.properties).length
     ) {
@@ -109,11 +149,21 @@ export class MapService implements HostedService {
     return this.mapper(input);
   }
 
+  // ── Private ────────────────────────────────────────────────────────────────
+
   private mapper(input: unknown): unknown {
     try {
+      if (this.structuredTemplate) {
+        return this.mergeWithInput(
+          this.evaluateNode(this.structuredTemplate, input),
+          input,
+        );
+      }
+
       const termKeys = Object.keys(this.terms);
+      // A lone "=" key maps to a scalar rather than to an object.
       if (termKeys.length === 1 && termKeys[0] === "") {
-        return evaluateExpression(this.terms[termKeys[0]], input);
+        return this.terms[termKeys[0]](input);
       }
 
       const inputRecord = isJsonRecord(input) ? input : {};
@@ -125,8 +175,7 @@ export class MapService implements HostedService {
             : { ...deepCopy(this.properties), ...inputRecord };
 
       return termKeys.reduce<Record<string, unknown>>((acc, key) => {
-        const expression = this.terms[key];
-        const value = evaluateExpression(expression, input);
+        const value = this.terms[key](input);
 
         if (key.includes(".")) {
           return mergeAtPath(acc, value, key);
@@ -145,30 +194,118 @@ export class MapService implements HostedService {
       console.error(
         "MapService.process error",
         error,
-        JSON.stringify(this.state.template || {}),
+        JSON.stringify(this.state.template ?? {}),
       );
       return input;
     }
   }
 
-  private updateTemplate(template: Record<string, unknown>): void {
-    this.state.template = flattenObject(template);
+  // Merging only applies when both sides are plain objects; a template that
+  // produced an array or a scalar replaces the input whatever the mode.
+  private mergeWithInput(mapped: unknown, input: unknown): unknown {
+    if (
+      this.state.mode === "replace" ||
+      !isJsonRecord(mapped) ||
+      !isJsonRecord(input)
+    ) {
+      return mapped;
+    }
 
-    this.properties = {};
+    return this.state.mode === "overwrite"
+      ? { ...input, ...mapped }
+      : { ...mapped, ...input };
+  }
+
+  private evaluateNode(node: TemplateNode, params: unknown): unknown {
+    if (node.type === "value") {
+      return deepCopy(node.value);
+    }
+
+    if (node.type === "expression") {
+      return node.expression(params);
+    }
+
+    if (node.type === "array") {
+      return node.items.map((item) => this.evaluateNode(item, params));
+    }
+
+    const entries = node.entries;
+    if (
+      entries.length === 1 &&
+      entries[0].dynamic &&
+      entries[0].key === "" &&
+      entries[0].node.type === "expression"
+    ) {
+      return this.evaluateNode(entries[0].node, params);
+    }
+
+    const out: Record<string, unknown> = {};
+    for (const entry of entries) {
+      const value = this.evaluateNode(entry.node, params);
+      if (entry.key.includes(".")) {
+        mergeAtPath(out, value, entry.key);
+      } else {
+        out[entry.key] = value;
+      }
+    }
+    return out;
+  }
+
+  private updateTemplate(template: unknown): void {
+    this.structuredTemplate = undefined;
     this.terms = {};
+    this.properties = {};
 
-    for (const [key, value] of Object.entries(template)) {
+    if (isStructuredTemplate(template)) {
+      this.state.template = deepCopy(template);
+      this.structuredTemplate = compileTemplate(template);
+      this.notify({ template: deepCopy(this.state.template) });
+      return;
+    }
+
+    const flat = isJsonRecord(template) ? template : {};
+    this.state.template = flatten(flat); // stored flat for persistence
+
+    for (const [key, value] of Object.entries(flat)) {
       if (key.endsWith("=")) {
-        this.terms[key.slice(0, -1)] = value;
+        this.terms[key.slice(0, -1)] = compileExpression(value);
         continue;
       }
 
       if (key.includes(".")) {
-        this.properties = mergeAtPath(this.properties, value, key);
+        mergeAtPath(this.properties, value, key);
       } else {
         this.properties[key] = value;
       }
     }
+
+    this.notify({ template: deepCopy(this.state.template) });
+  }
+
+  private updateSensingMode(isActive: boolean): void {
+    this.state.sensingMode = isActive;
+    this.notify({ sensingMode: isActive });
+  }
+
+  private runCommand(command: JsonRecord): void {
+    if (command.action !== "inject") {
+      return;
+    }
+
+    const output = this.process(command.params, () => {});
+    if (output === null || output === undefined || !this.host) {
+      return;
+    }
+
+    // Push the injected result through the rest of the pipeline, the way an
+    // autonomously emitting service does — the runtime fans the notifications
+    // out to its own targets, so none are re-sent here.
+    const result = this.host.processFrom(this.uuid, output, () => {});
+    this.host.emitResult(result);
+  }
+
+  private notify(payload: JsonRecord): void {
+    this.host?.notify(payload, this.uuid);
   }
 }
 
@@ -176,32 +313,71 @@ function isJsonRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function flattenObject(
-  value: Record<string, unknown>,
+// An array, or an object with an object/array somewhere in it, keeps its shape;
+// anything else is a flat key/value template.
+function isStructuredTemplate(template: unknown): boolean {
+  if (Array.isArray(template)) {
+    return true;
+  }
+
+  if (!isJsonRecord(template)) {
+    return false;
+  }
+
+  return Object.values(template).some(
+    (value) => value !== null && typeof value === "object",
+  );
+}
+
+function compileTemplate(template: unknown): TemplateNode {
+  if (Array.isArray(template)) {
+    return {
+      type: "array",
+      items: template.map((item) => compileTemplate(item)),
+    };
+  }
+
+  if (isJsonRecord(template)) {
+    return {
+      type: "object",
+      entries: Object.keys(template).map((key) => {
+        const value = template[key];
+        const dynamic = key.endsWith("=");
+        return {
+          key: dynamic ? key.slice(0, -1) : key,
+          dynamic,
+          node: dynamic
+            ? { type: "expression" as const, expression: compileExpression(value) }
+            : compileTemplate(value),
+        };
+      }),
+    };
+  }
+
+  return { type: "value", value: template };
+}
+
+function flatten(
+  value: unknown,
   prefix = "",
   target: Record<string, unknown> = {},
 ): Record<string, unknown> {
-  for (const [key, entry] of Object.entries(value)) {
+  const entries = Array.isArray(value)
+    ? value.map((entry, index) => [String(index), entry] as const)
+    : Object.entries(value as Record<string, unknown>);
+
+  for (const [key, entry] of entries) {
     const path = prefix ? `${prefix}.${key}` : key;
-    if (isJsonRecord(entry) && Object.keys(entry).length > 0) {
-      flattenObject(entry, path, target);
+    const isBranch =
+      (isJsonRecord(entry) || Array.isArray(entry)) &&
+      Object.keys(entry).length > 0;
+    if (isBranch) {
+      flatten(entry, path, target);
     } else {
       target[path] = entry;
     }
   }
   return target;
-}
-
-function evaluateExpression(expression: unknown, params: unknown): unknown {
-  if (typeof expression !== "string") {
-    return expression;
-  }
-
-  const evaluator = new Function(
-    "params",
-    `"use strict"; return (${expression});`,
-  ) as (params: unknown) => unknown;
-  return evaluator(params);
 }
 
 function deepCopy<T>(value: T): T {
