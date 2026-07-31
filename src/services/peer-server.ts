@@ -91,10 +91,10 @@ export class PeerServerService implements HostedService {
   getState(): JsonRecord {
     return {
       bypass: this.bypass,
-      // Public signalling endpoint, assigned by the runtime. A PeerJS client is
-      // configured from `path` (with the runtime's own host and port).
-      url: this.mount?.url ?? "",
-      path: this.mount?.path ?? "",
+      // Public signalling endpoint, assigned by the runtime. Reserved name: a
+      // client points at this service and resolves the address from here (see
+      // the frontend's runtime/board/mount).
+      __hkpMount: this.mount?.url ?? "",
       emitEvents: this.emitEvents,
       connectedPeers: this.connectedPeers,
     };
@@ -217,7 +217,7 @@ export class PeerServerService implements HostedService {
     this.peerServer = peerServer;
     this.app = app;
 
-    this.host?.notify({ url: mount.url, path: mount.path }, this.uuid);
+    this.host?.notify({ __hkpMount: mount.url }, this.uuid);
   }
 
   private releaseMount(): void {

@@ -125,8 +125,10 @@ function filenameFromDisposition(
 type HttpServerSubservicesState = JsonRecord & {
   bypass: boolean;
   mode: HttpServerMode;
-  /** Public endpoint assigned by the runtime; empty while bypassed. */
-  url: string;
+  /** Public endpoint assigned by the runtime; empty while bypassed. Reserved
+   *  name: generic board machinery reads and rewrites it (see the frontend's
+   *  runtime/board/mount). */
+  __hkpMount: string;
   pipeline: Array<{
     serviceId: string;
     instanceId: string;
@@ -233,7 +235,7 @@ export class HttpServerSubservicesService implements HostedService {
     const state: HttpServerSubservicesState = {
       bypass: this.bypass,
       mode: this.mode,
-      url: this.mount?.url ?? "",
+      __hkpMount: this.mount?.url ?? "",
       pipeline: this.getPipelineState(),
     };
     return state;
@@ -279,7 +281,7 @@ export class HttpServerSubservicesService implements HostedService {
 
     // A board reads the assigned endpoint from here (or from state), since it
     // is not knowable at design time.
-    this.notify({ url: this.mount?.url ?? "" }, this.uuid);
+    this.notify({ __hkpMount: this.mount?.url ?? "" }, this.uuid);
   }
 
   private releaseMount(): void {

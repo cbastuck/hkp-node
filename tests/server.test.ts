@@ -407,7 +407,7 @@ describe("hkp-node runtime server", () => {
 
     // The endpoint is served by the shared runtime server at an assigned path,
     // so the service publishes a URL rather than a port it bound itself.
-    const endpoint = configureResponse.body.url;
+    const endpoint = configureResponse.body.__hkpMount;
     expect(typeof endpoint).toBe("string");
     expect(endpoint).toMatch(/\/hosted\/[0-9a-f]+$/);
 

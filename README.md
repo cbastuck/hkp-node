@@ -87,11 +87,16 @@ those is an Auth0-side concern and is not handled here.
 
 Services that must be reachable from outside — `http-server-subservices`, `peer-server` — do
 not bind a port. The runtime assigns each one an opaque path on this same server and publishes
-the resulting address in the service's state:
+the resulting address in the service's state, as `__hkpMount`:
 
 ```
 http://<EXTERNAL_HOST>:<PORT>/hosted/<mountId>
 ```
+
+The `__hkp` prefix marks a reserved property: its meaning is defined outside the service
+holding it, so that generic board machinery can read and rewrite it. A board pointing a
+client at one of these endpoints puts a `hkp-mount://<runtimeId>/<serviceUuid>` reference in
+the same field on the consuming service, since the address is not knowable at design time.
 
 Ports are a single machine-wide namespace, so on a shared host a service asking for a specific
 port is a land grab: the second claimant fails and whoever wins receives traffic the other

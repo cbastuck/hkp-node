@@ -95,12 +95,12 @@ describe("hkp-node service mounts", () => {
       .get("/runtimes/rt-1/services/http-1")
       .expect(200);
 
-    expect(body.url).toMatch(
+    expect(body.__hkpMount).toMatch(
       new RegExp(`^${baseUrl}/hosted/[0-9a-f]{32}$`),
     );
 
     // Mounts exist to be called by outside parties, so no Authorization header.
-    const res = await fetch(`${body.url}/hello?a=1`);
+    const res = await fetch(`${body.__hkpMount}/hello?a=1`);
     expect(res.status).toBe(200);
     // A request reaches the pipeline as MixedData: JSON meta plus the body.
     const received = await res.json();
@@ -135,7 +135,7 @@ describe("hkp-node service mounts", () => {
       .get("/runtimes/rt-1/services/http-1")
       .expect(200);
 
-    const res = await fetch(`${body.url}/upload`, {
+    const res = await fetch(`${body.__hkpMount}/upload`, {
       method: "POST",
       headers: {
         "content-type": "application/json",
@@ -182,7 +182,7 @@ describe("hkp-node service mounts", () => {
       .expect(200);
 
     const post = async (contentType: string, payload: string) => {
-      const res = await fetch(`${state.url}/x`, {
+      const res = await fetch(`${state.__hkpMount}/x`, {
         method: "POST",
         headers: { "content-type": contentType },
         body: payload,
@@ -246,7 +246,7 @@ describe("hkp-node service mounts", () => {
 
     // The endpoint takes no token, so an unbounded read would be available to
     // anyone holding the URL.
-    const res = await fetch(`${body.url}/upload`, {
+    const res = await fetch(`${body.__hkpMount}/upload`, {
       method: "POST",
       body: "x".repeat(1024),
     });
@@ -282,7 +282,7 @@ describe("hkp-node service mounts", () => {
         .get("/runtimes/node/services/http-1")
         .set("Authorization", `Bearer ${sub}`)
         .expect(200);
-      return body.url as string;
+      return body.__hkpMount as string;
     };
 
     const aliceUrl = await urlFor(ALICE);
@@ -315,12 +315,12 @@ describe("hkp-node service mounts", () => {
     const { body } = await request(server.httpServer)
       .get("/runtimes/rt-1/services/http-1")
       .expect(200);
-    expect((await fetch(`${body.url}/hello`)).status).toBe(200);
+    expect((await fetch(`${body.__hkpMount}/hello`)).status).toBe(200);
 
     await request(server.httpServer).delete("/runtimes/rt-1").expect(200);
 
     // The endpoint must not outlive the runtime that published it.
-    expect((await fetch(`${body.url}/hello`)).status).toBe(404);
+    expect((await fetch(`${body.__hkpMount}/hello`)).status).toBe(404);
   });
 
   it("serves PeerJS signalling over HTTP and WebSocket on a mount", async () => {
@@ -343,16 +343,19 @@ describe("hkp-node service mounts", () => {
     const { body } = await request(server.httpServer)
       .get("/runtimes/rt-1/services/peer-1")
       .expect(200);
-    expect(body.path).toMatch(/^\/hosted\/[0-9a-f]{32}$/);
+    // The path a WebSocket client dials comes out of the published address;
+    // the service publishes that one field and nothing else.
+    const mountPath = new URL(body.__hkpMount).pathname;
+    expect(mountPath).toMatch(/^\/hosted\/[0-9a-f]{32}$/);
 
     // PeerJS's own id endpoint, proving the Express sub-app is mounted.
-    const idRes = await fetch(`${body.url}/peerjs/id`);
+    const idRes = await fetch(`${body.__hkpMount}/peerjs/id`);
     expect(idRes.status).toBe(200);
     expect((await idRes.text()).length).toBeGreaterThan(0);
 
     // The signalling socket: PeerJS requires id, token and key on the query.
     const wsBase = baseUrl.replace("http", "ws");
-    const peerWs = `${wsBase}${body.path}/peerjs?key=peerjs&id=peer-a&token=tok-a`;
+    const peerWs = `${wsBase}${mountPath}/peerjs?key=peerjs&id=peer-a&token=tok-a`;
     expect(await wsOutcome(peerWs)).toBe("open");
   });
 
@@ -427,7 +430,7 @@ describe("hkp-node service mounts", () => {
 
     // Joining the signalling server is what makes the peer-server emit.
     const peer = new WebSocket(
-      `${wsBase}${body.path}/peerjs?key=peerjs&id=peer-a&token=tok-a`,
+      `${wsBase}${new URL(body.__hkpMount).pathname}/peerjs?key=peerjs&id=peer-a&token=tok-a`,
     );
     await new Promise((resolve) => peer.once("open", resolve));
 
@@ -460,21 +463,21 @@ describe("hkp-node service mounts", () => {
     const { body } = await request(server.httpServer)
       .get("/runtimes/rt-1/services/peer-1")
       .expect(200);
-    expect((await fetch(`${body.url}/peerjs/id`)).status).toBe(200);
+    expect((await fetch(`${body.__hkpMount}/peerjs/id`)).status).toBe(200);
 
     await request(server.httpServer)
       .post("/runtimes/rt-1/services/peer-1")
       .send({ bypass: true })
       .expect(200)
       .expect(({ body: state }) => {
-        expect(state.url).toBe("");
+        expect(state.__hkpMount).toBe("");
       });
 
-    expect((await fetch(`${body.url}/peerjs/id`)).status).toBe(404);
+    expect((await fetch(`${body.__hkpMount}/peerjs/id`)).status).toBe(404);
     const wsBase = baseUrl.replace("http", "ws");
     expect(
       await wsOutcome(
-        `${wsBase}${body.path}/peerjs?key=peerjs&id=peer-a&token=tok-a`,
+        `${wsBase}${new URL(body.__hkpMount).pathname}/peerjs?key=peerjs&id=peer-a&token=tok-a`,
       ),
     ).toBe("rejected");
   });
