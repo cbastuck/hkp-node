@@ -56,7 +56,13 @@ export class TimerService {
   private _timer: ReturnType<typeof setInterval> | undefined;
   private _host: RuntimeHost | undefined;
 
-  constructor(config: ServiceConfiguration) {
+  constructor(
+    config: ServiceConfiguration,
+    // Lower bound on the periodic interval. On a shared host a very short
+    // period is a way for one tenant to spend everyone's CPU, so the server
+    // supplies a floor and ticks are clamped to it.
+    private readonly minIntervalMs = 0,
+  ) {
     this.uuid = config.uuid;
     if (config.state) {
       this.configure(config.state);
@@ -164,7 +170,10 @@ export class TimerService {
     if (doStart) {
       if (this._periodic) {
         this._clearTimer();
-        const ms = durationMs(this._periodicValue, this._periodicUnit);
+        const ms = Math.max(
+          durationMs(this._periodicValue, this._periodicUnit),
+          this.minIntervalMs,
+        );
         this._timer = setInterval(() => this._tick(), ms);
         if (immediate) {
           setTimeout(() => this._tick(), 1);
@@ -218,8 +227,9 @@ export class TimerService {
       const result = this._host.processFrom(
         this.uuid,
         { triggerCount },
-        (n: RuntimeNotification) =>
-          this._notify(n.payload as JsonRecord, n.instanceId),
+        // No-op: the runtime already fans these out to its notification
+        // targets. Re-notifying through the host would deliver every one twice.
+        (_n: RuntimeNotification) => {},
       );
       this._host.emitResult(result);
     }
@@ -236,8 +246,9 @@ export class TimerService {
       const result = this._host.processFrom(
         this.uuid,
         merged,
-        (n: RuntimeNotification) =>
-          this._notify(n.payload as JsonRecord, n.instanceId),
+        // No-op: the runtime already fans these out to its notification
+        // targets. Re-notifying through the host would deliver every one twice.
+        (_n: RuntimeNotification) => {},
       );
       this._host.emitResult(result);
     }

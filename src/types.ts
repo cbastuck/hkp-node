@@ -1,3 +1,5 @@
+import { MountHandle, MountHandlers } from "./mounts";
+
 export type JsonRecord = Record<string, unknown>;
 
 export type ServiceRegistryEntry = {
@@ -80,4 +82,13 @@ export interface RuntimeHost {
   ): unknown;
   notify(payload: unknown, instanceId: string): void;
   emitResult(output: unknown): void;
+  /**
+   * Claim a publicly reachable endpoint served by the shared server, for a
+   * service that needs to be called from outside (an HTTP endpoint, a
+   * signalling server). Returns null when the host cannot serve mounts — an
+   * inner sub-service pipeline, or a server that is not listening yet — in
+   * which case the service has no public endpoint and should say so in its
+   * state rather than falling back to a port of its own.
+   */
+  mount?(serviceUuid: string, handlers: MountHandlers): MountHandle | null;
 }

@@ -13,6 +13,20 @@ declare global {
 
 export type AuthenticatedUser = { sub: string; email?: string };
 
+/**
+ * Owner key used when authentication is disabled. Every request collapses into
+ * this single tenant, which is exactly the pre-multi-tenancy behaviour.
+ */
+export const ANONYMOUS_SUB = "anonymous";
+
+/**
+ * The tenant a request belongs to. Runtimes are namespaced by this key, so a
+ * runtime id is only ever resolved within the caller's own namespace.
+ */
+export function ownerKeyOf(user: AuthenticatedUser | undefined): string {
+  return user?.sub ?? ANONYMOUS_SUB;
+}
+
 export type AuthMiddleware = (
   req: Request,
   res: Response,
@@ -132,10 +146,14 @@ export function createAuthenticator(
 ): Authenticator {
   if (config.mode === "none") {
     return {
-      middleware: (_req, _res, next) => next(),
-      // Identity is irrelevant in no-auth mode; hand back a stable principal so
-      // downstream code that reads `sub` still works.
-      verifyToken: async () => ({ sub: "anonymous" }),
+      // Identity is irrelevant in no-auth mode, but tenant resolution still
+      // needs a principal, so set the same stable one both entry points use.
+      // Everything then lands in a single "anonymous" namespace.
+      middleware: (req, _res, next) => {
+        req.authenticatedUser = { sub: ANONYMOUS_SUB };
+        next();
+      },
+      verifyToken: async () => ({ sub: ANONYMOUS_SUB }),
     };
   }
 

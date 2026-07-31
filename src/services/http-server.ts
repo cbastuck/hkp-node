@@ -4,16 +4,17 @@
  * Service Name: HttpServerSubservices
  * Runtime: hkp-node
  * Modes: session pipeline hosting
- * Key Config: host/port/routes/subservices
+ * Key Config: bypass/mode/pipeline (the endpoint is assigned, not configured)
  * IO: in=request envelope -> out=response envelope
  * Arrays: not primary
  * Binary: depends on endpoint + nested services
  * MixedData: not native in runtime
  */
-import http, { IncomingMessage, ServerResponse } from "node:http";
+import { IncomingMessage, ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
 
 import { HostedRuntime } from "../runtime";
+import { MountContext, MountHandle } from "../mounts";
 import {
   HostedService,
   JsonRecord,
@@ -31,10 +32,101 @@ export const httpServerSubservicesDescriptor: ServiceRegistryEntry = {
 
 type HttpServerMode = "process_on_session" | "process_on_data";
 
+/**
+ * An incoming request as MixedData: JSON metadata plus the raw body. Mirrors
+ * hkp-rt's body-carrying HTTP service so the same pipeline works on either.
+ */
+type MixedRequest = {
+  meta: JsonRecord;
+  /**
+   * The raw body, for content whose type does not say what the bytes mean.
+   * Absent once the body has been decoded into `body` — keeping both would
+   * double the payload to restate what the decoded value already carries — and
+   * absent entirely when the request had no body.
+   */
+  binary?: Uint8Array;
+  /**
+   * The body decoded according to its content type. Present for the cases a
+   * board can act on directly — a JSON webhook, a form post — instead of
+   * needing bytes decoded by hand. Absent when the type is not textual, when
+   * there is no body, or when it did not parse.
+   */
+  body?: unknown;
+};
+
+/** Content type with any parameters (`; charset=…`) stripped, lower-cased. */
+function mediaType(contentType: string | undefined): string {
+  return (contentType ?? "").split(";")[0].trim().toLowerCase();
+}
+
+/**
+ * Decode a body for the content types where a board would otherwise be stuck
+ * with raw bytes. Returns undefined when there is nothing sensible to produce,
+ * which includes malformed input: a public endpoint receives whatever it is
+ * given, and a parse failure should leave the raw bytes to inspect rather than
+ * fail the request.
+ */
+function decodeBody(
+  binary: Uint8Array,
+  contentType: string | undefined,
+): unknown {
+  if (binary.length === 0) {
+    return undefined;
+  }
+
+  const type = mediaType(contentType);
+  const asText = () => Buffer.from(binary).toString("utf8");
+
+  if (type === "application/json" || type.endsWith("+json")) {
+    try {
+      return JSON.parse(asText());
+    } catch {
+      return undefined;
+    }
+  }
+
+  if (type === "application/x-www-form-urlencoded") {
+    const fields: JsonRecord = {};
+    for (const [key, value] of new URLSearchParams(asText())) {
+      fields[key] = value;
+    }
+    return fields;
+  }
+
+  if (type.startsWith("text/")) {
+    return asText();
+  }
+
+  return undefined;
+}
+
+class RequestTooLargeError extends Error {
+  constructor() {
+    super("Request body too large");
+  }
+}
+
+function header(req: IncomingMessage, name: string): string | undefined {
+  const value = req.headers[name];
+  return Array.isArray(value) ? value[0] : value;
+}
+
+/** Extracts `filename="…"` from a content-disposition header, if present. */
+function filenameFromDisposition(
+  disposition: string | undefined,
+): string | undefined {
+  if (!disposition) {
+    return undefined;
+  }
+  const match = disposition.match(/filename\*?=(?:UTF-8'')?"?([^";]+)"?/i);
+  return match ? decodeURIComponent(match[1]) : undefined;
+}
+
 type HttpServerSubservicesState = JsonRecord & {
   bypass: boolean;
   mode: HttpServerMode;
-  port: number;
+  /** Public endpoint assigned by the runtime; empty while bypassed. */
+  url: string;
   pipeline: Array<{
     serviceId: string;
     instanceId: string;
@@ -50,16 +142,21 @@ export class HttpServerSubservicesService implements HostedService {
 
   private bypass = true;
   private mode: HttpServerMode = "process_on_session";
-  private port = 0;
   private latestData: unknown = null;
 
-  private server: http.Server | null = null;
+  private mount: MountHandle | null = null;
   private pipelineConfig: ServiceConfiguration[] = [];
   private pipeline: HostedRuntime | null = null;
   private readonly createService: ServiceCreator;
   private host: RuntimeHost | null = null;
 
-  constructor(config: ServiceConfiguration, createService: ServiceCreator) {
+  constructor(
+    config: ServiceConfiguration,
+    createService: ServiceCreator,
+    // Upper bound on a request body, in bytes; 0 disables the limit. Supplied by
+    // the server because the endpoint is public and shared.
+    private readonly maxBodyBytes = 0,
+  ) {
     this.uuid = config.uuid;
     this.createService = createService;
 
@@ -71,18 +168,10 @@ export class HttpServerSubservicesService implements HostedService {
   configure(config: JsonRecord): JsonRecord {
     const previousBypass = this.bypass;
 
-    if (typeof config.port === "number" && Number.isInteger(config.port)) {
-      if (
-        config.port >= 0 &&
-        config.port <= 65535 &&
-        this.port !== config.port
-      ) {
-        this.port = config.port;
-        if (this.server) {
-          this.restartServer();
-        }
-      }
-    }
+    // `port` is accepted and ignored: the endpoint is served by the shared
+    // runtime server under an assigned path, so a service no longer picks a
+    // port. Older boards still carry the field, and rejecting it would fail
+    // them on load for a setting that no longer means anything.
 
     if (
       config.mode === "process_on_session" ||
@@ -127,14 +216,14 @@ export class HttpServerSubservicesService implements HostedService {
     if (typeof config.bypass === "boolean" && config.bypass !== this.bypass) {
       this.bypass = config.bypass;
       if (this.bypass) {
-        this.stopServer();
+        this.releaseMount();
       } else {
-        this.startServer();
+        this.claimMount();
       }
     }
 
-    if (previousBypass && !this.bypass && !this.server) {
-      this.startServer();
+    if (previousBypass && !this.bypass && !this.mount) {
+      this.claimMount();
     }
 
     return this.getState();
@@ -144,7 +233,7 @@ export class HttpServerSubservicesService implements HostedService {
     const state: HttpServerSubservicesState = {
       bypass: this.bypass,
       mode: this.mode,
-      port: this.port,
+      url: this.mount?.url ?? "",
       pipeline: this.getPipelineState(),
     };
     return state;
@@ -152,6 +241,12 @@ export class HttpServerSubservicesService implements HostedService {
 
   setHost(host: RuntimeHost): void {
     this.host = host;
+    // State is applied in the constructor, before the host exists, so a service
+    // configured as already-active has nothing to claim its mount from until
+    // now. Claiming here is what makes a board load into a live endpoint.
+    if (!this.bypass && !this.mount) {
+      this.claimMount();
+    }
   }
 
   process(
@@ -166,57 +261,129 @@ export class HttpServerSubservicesService implements HostedService {
   }
 
   destroy(): void {
-    this.stopServer();
+    this.releaseMount();
     this.pipeline = null;
     this.pipelineConfig = [];
   }
 
-  private restartServer(): void {
-    this.stopServer();
-    if (!this.bypass) {
-      this.startServer();
-    }
-  }
-
-  private startServer(): void {
-    if (this.server) {
+  private claimMount(): void {
+    if (this.mount || !this.host?.mount) {
       return;
     }
 
-    this.server = http.createServer((req, res) => {
-      void this.handleRequest(req, res);
+    this.mount = this.host.mount(this.uuid, {
+      request: (req, res, context) => {
+        void this.handleRequest(req, res, context);
+      },
     });
 
-    this.server.on("error", (error) => {
-      console.error("http-server-subservices error", error);
-    });
-
-    this.server.listen(this.port, () => {
-      const address = this.server?.address();
-      if (address && typeof address !== "string") {
-        this.port = address.port;
-        this.notify({ port: this.port }, this.uuid);
-      }
-    });
+    // A board reads the assigned endpoint from here (or from state), since it
+    // is not knowable at design time.
+    this.notify({ url: this.mount?.url ?? "" }, this.uuid);
   }
 
-  private stopServer(): void {
-    const server = this.server;
-    this.server = null;
-    if (!server) {
-      return;
+  private releaseMount(): void {
+    this.mount?.release();
+    this.mount = null;
+  }
+
+  /**
+   * Build the MixedData an incoming request becomes: JSON `meta` describing it,
+   * plus the body in whichever single form is useful — decoded as `body` when
+   * the content type says what the bytes mean, raw as `binary` otherwise. The
+   * meta/binary pair is the shape hkp-rt's body-carrying HTTP service produces,
+   * so pipelines handling uploads can be written once against it.
+   *
+   * `meta.path` stays the URL path this service has always reported. A filename
+   * from content-disposition is surfaced separately as `meta.filename` rather
+   * than overloading `path`, which would silently change what existing
+   * pipelines match on.
+   */
+  private async readRequest(
+    req: IncomingMessage,
+    context: MountContext,
+  ): Promise<MixedRequest> {
+    // The mount prefix is transport addressing, not part of the route the
+    // pipeline matches on, so the pipeline sees the path below the mount.
+    const url = new URL(context.subPath, "http://localhost");
+    const query: JsonRecord = {};
+    for (const [key, value] of url.searchParams) {
+      query[key] = value;
     }
 
-    server.close((error) => {
-      if (error) {
-        console.error("http-server-subservices close error", error);
-      }
+    const contentType = header(req, "content-type");
+    const meta: JsonRecord = {
+      method: req.method ?? "GET",
+      path: url.pathname,
+      query,
+    };
+    if (contentType) {
+      meta.contentType = contentType;
+    }
+    const filename = filenameFromDisposition(header(req, "content-disposition"));
+    if (filename) {
+      meta.filename = filename;
+    }
+
+    const binary = await this.readBody(req);
+
+    // Exactly one representation of the body, or neither when there was none.
+    const body = decodeBody(binary, contentType);
+    if (body !== undefined) {
+      return { meta, body };
+    }
+    return binary.length > 0 ? { meta, binary } : { meta };
+  }
+
+  /**
+   * Read the request body, refusing anything past the configured cap.
+   *
+   * A mount is reachable without a token by design, so an unbounded read is a
+   * way for anyone holding the URL to exhaust the host — which on a shared
+   * instance is everyone else's problem too. The cap is enforced while reading
+   * rather than from content-length, which a client controls.
+   */
+  private readBody(req: IncomingMessage): Promise<Uint8Array> {
+    return new Promise((resolve, reject) => {
+      const chunks: Buffer[] = [];
+      let total = 0;
+      let rejected = false;
+
+      req.on("data", (chunk: Buffer) => {
+        if (rejected) {
+          // Keep draining but stop accumulating: memory is what the limit
+          // protects, and tearing the socket down here would lose the 413 the
+          // caller is about to write.
+          return;
+        }
+        total += chunk.length;
+        if (this.maxBodyBytes > 0 && total > this.maxBodyBytes) {
+          rejected = true;
+          chunks.length = 0;
+          reject(new RequestTooLargeError());
+          return;
+        }
+        chunks.push(chunk);
+      });
+
+      req.on("end", () => {
+        if (!rejected) {
+          resolve(new Uint8Array(Buffer.concat(chunks)));
+        }
+      });
+
+      req.on("error", (err) => {
+        if (!rejected) {
+          reject(err);
+        }
+      });
     });
   }
 
   private async handleRequest(
     req: IncomingMessage,
     res: ServerResponse,
+    context: MountContext,
   ): Promise<void> {
     if (this.bypass) {
       res.statusCode = 503;
@@ -231,40 +398,32 @@ export class HttpServerSubservicesService implements HostedService {
       processInput = this.latestData;
       output = processInput;
     } else {
-      const url = new URL(req.url ?? "/", "http://localhost");
-      processInput = {
-        path: url.pathname,
-        method: req.method ?? "GET",
-      };
+      let request: MixedRequest;
+      try {
+        request = await this.readRequest(req, context);
+      } catch (error) {
+        if (error instanceof RequestTooLargeError) {
+          res.statusCode = 413;
+          res.setHeader("content-type", "application/json");
+          res.end(JSON.stringify({ error: "Request body too large" }));
+          return;
+        }
+        throw error;
+      }
+      processInput = request;
       output = this.processSessionInput(processInput);
     }
 
-    this.notify(
-      {
-        __internal: {
-          state: "call-process",
-          data: processInput,
-        },
-      },
-      this.uuid,
-    );
-
+    // processFrom reports this service's own call-process pair, so there is no
+    // manual pair here — emitting one too would double every request in the UI.
+    // It also reports the right value: what this service emitted, rather than
+    // what the whole downstream chain finally returned.
     if (this.host) {
-      output = this.host.processFrom(this.uuid, output, (notification) => {
-        this.notify(notification.payload, notification.instanceId);
-      });
+      // No-op: the runtime already fans these out to its notification targets.
+      // Re-notifying through the host would deliver every one twice.
+      output = this.host.processFrom(this.uuid, output, () => {});
       this.host.emitResult(output);
     }
-
-    this.notify(
-      {
-        __internal: {
-          state: "call-process-finished",
-          data: output,
-        },
-      },
-      this.uuid,
-    );
 
     res.statusCode = 200;
     res.setHeader("content-type", "application/json");

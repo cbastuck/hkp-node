@@ -10,6 +10,16 @@ import {
   ServiceConfiguration,
   ServiceDescriptor,
 } from "./types";
+import { MountHandle, MountHandlers } from "./mounts";
+
+/**
+ * Grants a runtime's services public endpoints. Supplied by the server, which
+ * owns the listening socket; absent for inner sub-service pipelines, which are
+ * not addressable from outside.
+ */
+export type RuntimeMounts = {
+  mount(serviceUuid: string, handlers: MountHandlers): MountHandle | null;
+};
 
 export class HostedRuntime implements RuntimeHost {
   readonly id: string;
@@ -23,15 +33,18 @@ export class HostedRuntime implements RuntimeHost {
   >();
   private readonly resultTargets = new Set<(result: unknown) => void>();
   private readonly createService: ServiceCreator;
+  private readonly mounts?: RuntimeMounts;
 
   constructor(
     config: RuntimeConfiguration,
     createService: (config: ServiceConfiguration) => HostedService,
+    mounts?: RuntimeMounts,
   ) {
     this.id = config.id;
     this.name = config.name;
     this.boardName = config.boardName ?? "";
     this.createService = createService;
+    this.mounts = mounts;
 
     for (const serviceConfig of config.services) {
       this.addService(serviceConfig);
@@ -170,11 +183,35 @@ export class HostedRuntime implements RuntimeHost {
     onNotification: (notification: RuntimeNotification) => void,
   ): unknown {
     const startIndex = this.serviceOrder.indexOf(startAfterUuid) + 1;
+
+    // A service pushing from itself (a Timer tick, an inbound message, a peer
+    // event) was never called by the loop below, so the loop never reported it.
+    // Report it here, or the UI shows a service producing nothing while the
+    // service after it plainly receives data.
+    this.emitNotification(
+      {
+        instanceId: startAfterUuid,
+        payload: { __internal: { state: "call-process", data: null } },
+      },
+      onNotification,
+    );
+    this.emitNotification(
+      {
+        instanceId: startAfterUuid,
+        payload: { __internal: { state: "call-process-finished", data: input } },
+      },
+      onNotification,
+    );
+
     return this.processFromIndex(startIndex, input, onNotification);
   }
 
   notify(payload: unknown, instanceId: string): void {
     this.emitNotification({ instanceId, payload }, () => {});
+  }
+
+  mount(serviceUuid: string, handlers: MountHandlers): MountHandle | null {
+    return this.mounts?.mount(serviceUuid, handlers) ?? null;
   }
 
   // ──────────────────────────────────────────────────────────────────────────
@@ -244,45 +281,120 @@ export class HostedRuntime implements RuntimeHost {
   }
 }
 
-export class RuntimeApp {
-  private readonly runtimes = new Map<string, HostedRuntime>();
-
-  constructor(private readonly registry: Map<string, HostedServiceFactory>) {}
+/**
+ * A single tenant's view of the runtime app. Runtime ids are only unique within
+ * an owner — boards ship stable, human-readable ids (`node`, `chat-node`), so
+ * two users loading the same board must each get their own runtime rather than
+ * sharing one. Every route resolves runtimes through one of these views, so a
+ * handler cannot reach another tenant's runtime even by id.
+ */
+export class TenantRuntimes {
+  constructor(
+    readonly owner: string,
+    private readonly app: RuntimeApp,
+  ) {}
 
   createRuntime(config: RuntimeConfiguration): HostedRuntime {
-    const existing = this.runtimes.get(config.id);
-    existing?.destroy();
-
-    const runtime = new HostedRuntime(config, (serviceConfig) =>
-      this.createService(serviceConfig),
-    );
-    this.runtimes.set(runtime.id, runtime);
-    return runtime;
+    return this.app.createRuntime(this.owner, config);
   }
 
   getRuntime(runtimeId: string): HostedRuntime | undefined {
-    return this.runtimes.get(runtimeId);
+    return this.app.getRuntime(this.owner, runtimeId);
   }
 
   getRuntimes(): HostedRuntime[] {
-    return [...this.runtimes.values()];
+    return this.app.getRuntimes(this.owner);
   }
 
   removeRuntime(runtimeId: string): boolean {
-    const runtime = this.runtimes.get(runtimeId);
-    runtime?.destroy();
-    return this.runtimes.delete(runtimeId);
+    return this.app.removeRuntime(this.owner, runtimeId);
   }
 
   removeAllRuntimes(): void {
-    for (const runtime of this.runtimes.values()) {
+    this.app.removeAllRuntimes(this.owner);
+  }
+}
+
+export class RuntimeApp {
+  // ownerKey → runtimeId → runtime. The owner key is the authenticated `sub`
+  // (or "anonymous" when auth is off, collapsing to a single bucket).
+  private readonly runtimes = new Map<string, Map<string, HostedRuntime>>();
+
+  constructor(
+    private readonly registry: Map<string, HostedServiceFactory>,
+    // Supplied by the server, which owns the listening socket. Absent in tests
+    // and anywhere runtimes need no public endpoints.
+    private readonly mountsFor?: (
+      owner: string,
+      runtimeId: string,
+    ) => RuntimeMounts,
+  ) {}
+
+  /** A tenant-scoped view; the only way route handlers reach runtimes. */
+  forOwner(owner: string): TenantRuntimes {
+    return new TenantRuntimes(owner, this);
+  }
+
+  createRuntime(owner: string, config: RuntimeConfiguration): HostedRuntime {
+    const owned = this.ownerRuntimes(owner);
+    const existing = owned.get(config.id);
+    existing?.destroy();
+
+    const runtime = new HostedRuntime(
+      config,
+      (serviceConfig) => this.createService(serviceConfig),
+      this.mountsFor?.(owner, config.id),
+    );
+    owned.set(runtime.id, runtime);
+    return runtime;
+  }
+
+  getRuntime(owner: string, runtimeId: string): HostedRuntime | undefined {
+    return this.runtimes.get(owner)?.get(runtimeId);
+  }
+
+  getRuntimes(owner: string): HostedRuntime[] {
+    const owned = this.runtimes.get(owner);
+    return owned ? [...owned.values()] : [];
+  }
+
+  removeRuntime(owner: string, runtimeId: string): boolean {
+    const owned = this.runtimes.get(owner);
+    if (!owned) {
+      return false;
+    }
+    const runtime = owned.get(runtimeId);
+    runtime?.destroy();
+    const deleted = owned.delete(runtimeId);
+    if (owned.size === 0) {
+      this.runtimes.delete(owner);
+    }
+    return deleted;
+  }
+
+  removeAllRuntimes(owner: string): void {
+    const owned = this.runtimes.get(owner);
+    if (!owned) {
+      return;
+    }
+    for (const runtime of owned.values()) {
       runtime.destroy();
     }
-    this.runtimes.clear();
+    this.runtimes.delete(owner);
   }
 
   getRegistry() {
     return [...this.registry.values()].map((entry) => entry.descriptor);
+  }
+
+  private ownerRuntimes(owner: string): Map<string, HostedRuntime> {
+    const existing = this.runtimes.get(owner);
+    if (existing) {
+      return existing;
+    }
+    const created = new Map<string, HostedRuntime>();
+    this.runtimes.set(owner, created);
+    return created;
   }
 
   createService(config: ServiceConfiguration): HostedService {
