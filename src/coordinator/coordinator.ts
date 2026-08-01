@@ -4,8 +4,44 @@ import { BoardSession } from "./session";
 export class BoardCoordinator {
   // userId → boardName → BoardSession
   private readonly sessions = new Map<string, Map<string, BoardSession>>();
+  // In-flight registrations, keyed by user and board, so a second one waits for
+  // the first rather than tearing down what it is building.
+  private readonly registrations = new Map<string, Promise<BoardSession>>();
 
+  /**
+   * Registers a board, one registration at a time per board.
+   *
+   * Registering *replaces* a board's session, and replacing it destroys the old
+   * one — which hands back the runtimes it had provisioned. Two registrations
+   * running at once therefore delete each other's work: the second one's
+   * teardown removes the runtime the first has just created, and the first then
+   * fails on the next call it makes against it. Boards are registered whenever
+   * a board changes, so overlapping calls are ordinary, not exotic.
+   *
+   * Serialising them per board keeps each replacement whole: destroy, then
+   * provision, then the next caller starts from a settled state.
+   */
   async registerBoard(
+    userId: string,
+    config: CloudBoardConfig,
+    userJwt?: string,
+  ): Promise<BoardSession> {
+    const key = `${userId}\u0000${config.boardName}`;
+    const queued = (this.registrations.get(key) ?? Promise.resolve())
+      // A failed registration must not stop the next one from being attempted.
+      .catch(() => undefined)
+      .then(() => this.replaceSession(userId, config, userJwt));
+    this.registrations.set(key, queued);
+    try {
+      return await queued;
+    } finally {
+      if (this.registrations.get(key) === queued) {
+        this.registrations.delete(key);
+      }
+    }
+  }
+
+  private async replaceSession(
     userId: string,
     config: CloudBoardConfig,
     // The caller's JWT, forwarded so the session can provision runtimes and mint

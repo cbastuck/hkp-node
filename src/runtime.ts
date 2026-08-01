@@ -25,6 +25,8 @@ export class HostedRuntime implements RuntimeHost {
   readonly id: string;
   readonly name: string;
   readonly boardName: string;
+  /** See RuntimeConfiguration.garbageCollected. Absent means persist. */
+  readonly garbageCollected: boolean;
 
   private readonly services = new Map<string, HostedService>();
   private serviceOrder: string[] = [];
@@ -43,6 +45,7 @@ export class HostedRuntime implements RuntimeHost {
     this.id = config.id;
     this.name = config.name;
     this.boardName = config.boardName ?? "";
+    this.garbageCollected = config.garbageCollected === true;
     this.createService = createService;
     this.mounts = mounts;
 
@@ -55,6 +58,7 @@ export class HostedRuntime implements RuntimeHost {
     const descriptor: RuntimeDescriptor = {
       id: this.id,
       name: this.name,
+      garbageCollected: this.garbageCollected,
       boardName: this.boardName,
       services: this.listServices(),
       inputs: [],

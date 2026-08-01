@@ -42,7 +42,13 @@ export type CloudBoardConfig = {
   facade?: unknown;
 };
 
-export type BoardSessionStatus = "running" | "error";
+/**
+ * "stopped" is a board the coordinator still owns but is not running: what a
+ * board is while someone edits it. Editing takes the board over — exactly one
+ * party owns its runtimes at a time — and a stopped board keeps its place and
+ * its config so that taking it over cannot lose it.
+ */
+export type BoardSessionStatus = "running" | "stopped" | "error";
 
 export type BoardSessionInfo = {
   boardName: string;

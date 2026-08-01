@@ -21,6 +21,20 @@ export type RuntimeConfiguration = {
   id: string;
   name: string;
   boardName?: string;
+  /**
+   * Whether this runtime should be torn down once the last client that was
+   * connected to it disconnects.
+   *
+   * Declared by whoever creates it, because only they know: a browser
+   * provisioning a board it is running says `true` — it is the controller, and
+   * its runtimes should not outlive it — while a coordinator, a config file or
+   * a script says nothing and gets a runtime that lives until it is deleted.
+   *
+   * Absent means persist. Cleanup is opted into, so nothing that exists today
+   * starts disappearing, and a runtime is never reaped because of who happened
+   * to connect to it.
+   */
+  garbageCollected?: boolean;
   services: ServiceConfiguration[];
   inputs?: Array<Record<string, unknown>>;
 };
@@ -28,6 +42,9 @@ export type RuntimeConfiguration = {
 export type RuntimeDescriptor = {
   id: string;
   name: string;
+  /** How this runtime is cleaned up; see RuntimeConfiguration. Reported so a
+   *  client can see whether it outlives them. */
+  garbageCollected?: boolean;
   boardName: string;
   services: ServiceDescriptor[];
   inputs: Array<Record<string, unknown>>;

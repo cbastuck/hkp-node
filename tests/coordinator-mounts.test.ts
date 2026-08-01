@@ -1,7 +1,3 @@
-import http from "node:http";
-import { AddressInfo } from "node:net";
-
-import { WebSocketServer } from "ws";
 import { afterEach, describe, expect, it } from "vitest";
 
 // The runtimes in these tests are on loopback, which the SSRF guard blocks by
@@ -12,6 +8,7 @@ import { createRuntimeServer } from "../src/server";
 import { BoardSession } from "../src/coordinator/session";
 import { peerServerDescriptor } from "../src/services/peer-server";
 import { monitorDescriptor } from "../src/services/monitor";
+import { startStubRuntime } from "./stubRuntime";
 import {
   collectMountRefs,
   formatMountRef,
@@ -71,80 +68,6 @@ describe("mount vocabulary", () => {
     ]).toEqual(["hkp-mount://node/peer-1"]);
   });
 });
-
-/**
- * A runtime that records what the coordinator configures on it. Stands in for a
- * runtime whose services consume a mount — hkp-node has no such service yet, so
- * the consumer side is observed at the HTTP boundary rather than in a service.
- */
-type StubRuntime = {
-  url: string;
-  configured: Array<{ serviceUuid: string; state: Record<string, unknown> }>;
-  close: () => Promise<void>;
-};
-
-async function startStubRuntime(runtimeId: string): Promise<StubRuntime> {
-  const configured: StubRuntime["configured"] = [];
-  let created = false;
-
-  const server = http.createServer((req, res) => {
-    const url = req.url ?? "";
-    const send = (status: number, body: unknown) => {
-      res.writeHead(status, { "content-type": "application/json" });
-      res.end(JSON.stringify(body));
-    };
-
-    if (req.method === "GET" && url === `/runtimes/${runtimeId}`) {
-      if (!created) {
-        send(404, { error: "not found" });
-        return;
-      }
-      // This runtime's services own no mounts, so nothing to publish back.
-      send(200, { id: runtimeId, services: [] });
-      return;
-    }
-
-    if (req.method === "POST" && url === "/runtimes") {
-      created = true;
-      const { port } = server.address() as AddressInfo;
-      send(200, {
-        runtimes: [{ id: runtimeId, outputUrl: `ws://127.0.0.1:${port}/${runtimeId}` }],
-        registry: [],
-      });
-      return;
-    }
-
-    const configurePrefix = `/runtimes/${runtimeId}/services/`;
-    if (req.method === "POST" && url.startsWith(configurePrefix)) {
-      let body = "";
-      req.on("data", (chunk) => (body += chunk));
-      req.on("end", () => {
-        configured.push({
-          serviceUuid: decodeURIComponent(url.slice(configurePrefix.length)),
-          state: JSON.parse(body || "{}"),
-        });
-        send(200, {});
-      });
-      return;
-    }
-
-    send(404, { error: "unexpected request" });
-  });
-
-  const sockets = new WebSocketServer({ server });
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-  const { port } = server.address() as AddressInfo;
-
-  return {
-    url: `http://127.0.0.1:${port}`,
-    configured,
-    close: () =>
-      new Promise<void>((resolve) => {
-        sockets.close();
-        server.close(() => resolve());
-      }),
-  };
-}
 
 describe("coordinator mount resolution", () => {
   const cleanups: Array<() => Promise<void>> = [];
