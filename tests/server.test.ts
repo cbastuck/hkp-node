@@ -10,6 +10,7 @@ import { subServiceDescriptor } from "../src/services/sub-service";
 import { timerDescriptor } from "../src/services/timer";
 import { peerServerDescriptor } from "../src/services/peer-server";
 import { httpClientDescriptor } from "../src/services/http-client";
+import { stopperDescriptor } from "../src/services/stopper";
 import { imapEmailDescriptor } from "../src/services/imap-email";
 import { telegramListenerDescriptor } from "../src/services/telegram-listener";
 import { telegramSenderDescriptor } from "../src/services/telegram-sender";
@@ -51,6 +52,7 @@ describe("hkp-node runtime server", () => {
       timerDescriptor,
       peerServerDescriptor,
       httpClientDescriptor,
+      stopperDescriptor,
       imapEmailDescriptor,
       telegramListenerDescriptor,
       telegramSenderDescriptor,
