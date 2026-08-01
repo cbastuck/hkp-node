@@ -14,6 +14,12 @@ import {
   parseMountRef,
   substituteMounts,
 } from "./mount";
+import {
+  BridgeMessage,
+  RuntimeSnapshot,
+  ServiceStates,
+  isBridgeMessage,
+} from "./bridgeProtocol";
 
 type ProvisionedRuntime = {
   descriptor: CloudRuntimeDescriptor;
@@ -51,6 +57,14 @@ export class BoardSession {
   // What was last handed to each consumer, keyed the same way. Guards against
   // re-configuring a service with a state it already has.
   private readonly pushedStates = new Map<string, string>();
+  // What each remote runtime's services last reported, and what that runtime
+  // says it can run. This is the board as the coordinator knows it, and what an
+  // attached browser renders from — it owns none of it itself.
+  private readonly serviceStates = new Map<string, ServiceStates>();
+  private readonly registries = new Map<string, unknown[]>();
+  // Ordering for snapshots and the increments that follow, so a browser can
+  // tell it missed one and ask for a fresh snapshot rather than drift.
+  private seq = 0;
 
   constructor(
     readonly boardName: string,
@@ -116,7 +130,31 @@ export class BoardSession {
     return [...this.errors];
   }
 
-  async destroy(): Promise<void> {
+  /**
+   * Hands the board's runtimes back without giving up the board.
+   *
+   * This is what editing does: the browser takes the runtimes over and
+   * provisions them itself, so the coordinator must not still hold them — but
+   * the board keeps its place in the coordinator's list and keeps its config,
+   * because a board being edited must not be a board that can be lost.
+   * Attached browsers stay attached and are told the board is now empty.
+   */
+  async stop(): Promise<void> {
+    await this.teardownRuntimes();
+    for (const socket of this.sockets.values()) {
+      socket.close();
+    }
+    this.sockets.clear();
+    this.provisioned.length = 0;
+    this.mountAddresses.clear();
+    this.pushedStates.clear();
+    this.serviceStates.clear();
+    this.registries.clear();
+    this.status = "stopped";
+    this.broadcast(this.snapshot());
+  }
+
+  private async teardownRuntimes(): Promise<void> {
     await Promise.all(
       this.provisioned
         .filter(({ descriptor }) => !!descriptor.url)
@@ -137,6 +175,10 @@ export class BoardSession {
           }),
         ),
     );
+  }
+
+  async destroy(): Promise<void> {
+    await this.teardownRuntimes();
 
     for (const socket of this.sockets.values()) {
       socket.close();
@@ -184,19 +226,30 @@ export class BoardSession {
     this.bridges.add(bridge);
 
     ws.on("message", (raw) => {
-      let message: {
-        type?: string;
-        requestId?: string;
-        runtimeId?: string;
-        data?: unknown;
-      };
+      let message: BridgeMessage;
       try {
-        message = JSON.parse(raw.toString());
+        const parsed: unknown = JSON.parse(raw.toString());
+        if (!isBridgeMessage(parsed)) {
+          return;
+        }
+        message = parsed;
       } catch (err) {
         console.error(
           `[coordinator] Failed to parse bridge message for board "${this.boardName}":`,
           err instanceof Error ? err.message : err,
         );
+        return;
+      }
+
+      // A browser that reconnected, or noticed a gap in the sequence, asking to
+      // be told the board again rather than carrying on from a stale view.
+      if (message.type === "resync") {
+        this.send(ws, this.snapshot());
+        return;
+      }
+
+      if (message.type === "configureService") {
+        void this.serveBrowserRequest(ws, message);
         return;
       }
 
@@ -231,6 +284,10 @@ export class BoardSession {
       }
     });
 
+    // Attaching is a read: the browser renders what the board currently is,
+    // rather than provisioning anything itself.
+    this.send(ws, this.snapshot());
+
     console.log(
       `[coordinator] Browser bridge registered for board "${this.boardName}" (runtimeIds: ${runtimeIds.join(", ")}, bridges: ${this.bridges.size})`,
     );
@@ -253,22 +310,22 @@ export class BoardSession {
     // validates a browser's. The JWT is then exchanged for a session token below.
     const userAuth = this.bearer(this.userJwt);
 
+    // Registering a board is a deploy: the board is being handed to this
+    // coordinator, so its runtimes are provisioned — created, replacing
+    // anything under those ids. Attaching to runtimes that are already running
+    // is the other intent, and belongs to resuming a board rather than
+    // deploying one; nothing resumes yet, so it is not built.
     let outputUrl: string | undefined;
 
-    const existing = await fetch(
-      `${baseUrl}/runtimes/${encodeURIComponent(id)}`,
-      { headers: userAuth },
-    );
-    if (existing.ok) {
-      const descriptor = (await existing.json()) as { outputUrl?: string };
-      outputUrl = descriptor.outputUrl;
-    }
-
-    if (!outputUrl) {
+    {
       const payload = {
         id,
         name: runtime.name,
         boardName: this.boardName,
+        // Ours until we delete it: a deployed board keeps running with no
+        // browser attached, and our own sockets come and go as sessions are
+        // replaced.
+        garbageCollected: false,
         services: services.map((svc) => ({
           uuid: svc.uuid,
           serviceId: svc.serviceId,
@@ -289,8 +346,12 @@ export class BoardSession {
 
       const body = (await response.json()) as {
         runtimes?: Array<{ outputUrl?: string }>;
+        registry?: unknown[];
       };
       outputUrl = body.runtimes?.[0]?.outputUrl;
+      if (Array.isArray(body.registry)) {
+        this.registries.set(id, body.registry);
+      }
     }
 
     if (!outputUrl) {
@@ -319,12 +380,16 @@ export class BoardSession {
     if (!this.userJwt) {
       return;
     }
-    const res = await fetch(
-      `${baseUrl}/runtimes/${encodeURIComponent(runtimeId)}/session-token`,
-      { method: "POST", headers: this.bearer(this.userJwt) },
-    );
+    const url = `${baseUrl}/runtimes/${encodeURIComponent(runtimeId)}/session-token`;
+    const res = await fetch(url, {
+      method: "POST",
+      headers: this.bearer(this.userJwt),
+    });
     if (!res.ok) {
-      throw new Error(`Failed to mint session token (${res.status})`);
+      // Name the runtime server that was asked: a 404 means the runtime this
+      // session just provisioned does not exist for this user, which is worth
+      // being able to point at.
+      throw new Error(`Failed to mint session token (${res.status}) at ${url}`);
     }
     const body = (await res.json()) as { token?: string };
     if (body.token) {
@@ -368,7 +433,11 @@ export class BoardSession {
       // notification — when it is unbypassed at runtime, say, long after the
       // board loaded. Whoever is waiting on that address learns of it here.
       if (message.type === "notification" && message.instanceId) {
-        this.onRuntimeNotification(runtime.id, message.instanceId, message.value);
+        this.onRuntimeNotification(
+          runtime.id,
+          message.instanceId,
+          message.value,
+        );
         return;
       }
 
@@ -413,16 +482,155 @@ export class BoardSession {
     if (!payload || typeof payload !== "object") {
       return;
     }
+
+    // Pass it on as what it is. A service's notifications are its output, not
+    // its state — a Monitor's message never appears in its getState — so a
+    // browser reaching this runtime through us must receive the same
+    // notifications it would have received from the runtime directly.
+    this.broadcast({
+      type: "notification",
+      runtimeId,
+      serviceUuid,
+      payload,
+    });
+
     const published = (payload as Record<string, unknown>)[MOUNT_FIELD];
     if (typeof published !== "string" || !published) {
       return;
     }
+
+    // A published address *is* state, and the one piece of it a browser cannot
+    // work out for itself, so keep the board's view of it current.
+    const states = this.serviceStates.get(runtimeId) ?? {};
+    const previous = states[serviceUuid];
+    states[serviceUuid] =
+      previous && typeof previous === "object"
+        ? { ...(previous as Record<string, unknown>), [MOUNT_FIELD]: published }
+        : { [MOUNT_FIELD]: published };
+    this.serviceStates.set(runtimeId, states);
+    this.broadcast({
+      type: "serviceState",
+      seq: ++this.seq,
+      runtimeId,
+      serviceUuid,
+      state: states[serviceUuid],
+    });
+
     if (this.recordMountAddress(runtimeId, serviceUuid, published)) {
       void this.publishMountAddresses().catch((err) => {
         console.error(
           `[coordinator] Failed to publish mount addresses for board "${this.boardName}":`,
           err instanceof Error ? err.message : err,
         );
+      });
+    }
+  }
+
+  /** Sends a message to every browser watching this board. */
+  private broadcast(message: BridgeMessage): void {
+    const payload = JSON.stringify(message);
+    for (const bridge of this.bridges) {
+      if (bridge.ws.readyState === WebSocket.OPEN) {
+        bridge.ws.send(payload);
+      }
+    }
+  }
+
+  private send(ws: WebSocket, message: BridgeMessage): void {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify(message));
+    }
+  }
+
+  /**
+   * The board as this coordinator knows it: every remote runtime's registry and
+   * the state its services last reported.
+   *
+   * Sent when a browser attaches, and again on request. It carries the live
+   * state rather than the saved board because that is the part a browser cannot
+   * work out for itself — a mount's address is assigned when the runtime is
+   * provisioned and appears in no saved board.
+   */
+  private snapshot(): BridgeMessage {
+    const runtimes: RuntimeSnapshot[] = this.provisioned.map(
+      ({ descriptor }) => ({
+        runtimeId: descriptor.id,
+        registry: this.registries.get(descriptor.id) ?? [],
+        services: this.serviceStates.get(descriptor.id) ?? {},
+      }),
+    );
+    return {
+      type: "snapshot",
+      seq: ++this.seq,
+      boardName: this.boardName,
+      status: this.status,
+      config: this.config,
+      runtimes,
+    };
+  }
+
+  /**
+   * Acts on a remote service for a browser that cannot reach it.
+   *
+   * The browser is a viewer: it renders this board and asks for changes, but the
+   * runtimes are the coordinator's to talk to. The reply carries whatever the
+   * runtime returned, so a panel can reconcile its optimistic state with what
+   * actually took effect.
+   */
+  private async serveBrowserRequest(
+    ws: WebSocket,
+    message: Extract<BridgeMessage, { type: "configureService" }>,
+  ): Promise<void> {
+    const runtime = this.provisioned.find(
+      ({ descriptor }) => descriptor.id === message.runtimeId,
+    )?.descriptor;
+    if (!runtime?.url) {
+      this.send(ws, {
+        type: "response",
+        requestId: message.requestId,
+        error: `Unknown runtime "${message.runtimeId}"`,
+      });
+      return;
+    }
+
+    const path = `/runtimes/${encodeURIComponent(runtime.id)}/services/${encodeURIComponent(message.serviceUuid)}`;
+
+    try {
+      const res = await fetch(`${runtime.url}${path}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...this.bearer(this.sessionTokens.get(runtime.id)),
+        },
+        body: JSON.stringify(message.config ?? {}),
+      });
+      if (!res.ok) {
+        this.send(ws, {
+          type: "response",
+          requestId: message.requestId,
+          error: `Runtime "${runtime.id}" answered ${res.status}`,
+        });
+        return;
+      }
+      // Configuring returns the service's whole state; record it so a browser
+      // attaching later sees the same thing this one just did.
+      const data = await res.json().catch(() => null);
+      const states = this.serviceStates.get(runtime.id) ?? {};
+      states[message.serviceUuid] = data;
+      this.serviceStates.set(runtime.id, states);
+      this.broadcast({
+        type: "serviceState",
+        seq: ++this.seq,
+        runtimeId: runtime.id,
+        serviceUuid: message.serviceUuid,
+        state: data,
+      });
+      this.send(ws, { type: "response", requestId: message.requestId, data });
+    } catch (err) {
+      this.send(ws, {
+        type: "response",
+        requestId: message.requestId,
+        error: err instanceof Error ? err.message : String(err),
       });
     }
   }
@@ -464,14 +672,23 @@ export class BoardSession {
             return;
           }
           const body = (await res.json()) as {
-            services?: Array<{ uuid?: string; state?: Record<string, unknown> }>;
+            services?: Array<{
+              uuid?: string;
+              state?: Record<string, unknown>;
+            }>;
           };
+          const states: ServiceStates = {};
           for (const svc of body.services ?? []) {
+            if (!svc.uuid) {
+              continue;
+            }
+            states[svc.uuid] = svc.state;
             const published = svc.state?.[MOUNT_FIELD];
-            if (svc.uuid && typeof published === "string" && published) {
+            if (typeof published === "string" && published) {
               this.recordMountAddress(descriptor.id, svc.uuid, published);
             }
           }
+          this.serviceStates.set(descriptor.id, states);
         } catch (err) {
           console.error(
             `[coordinator] Failed to read services of runtime "${descriptor.id}":`,

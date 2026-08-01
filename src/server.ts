@@ -413,21 +413,20 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
         return;
       }
 
-      // Reuse an existing runtime with the same ID rather than destroying it.
-      // This lets a browser reconnect to a coordinator-managed board without
-      // killing services (e.g. a running timer) that the coordinator started.
-      // The lookup is tenant-scoped, so two users loading the same board (which
-      // ships a stable runtime id) each get their own runtime instead of one
-      // silently attaching to the other's.
-      const existing = tenant.getRuntime(config.id);
-      if (existing) {
-        runtimes.push(serializeRuntime(existing));
-        continue;
-      }
+      // POST provisions: it creates the runtime, replacing anything under that
+      // id. Attaching to a runtime that is already running is a different
+      // intent and has its own verb — GET /runtimes/:id, which a client uses
+      // before posting when it means "take back over" rather than "build this".
+      //
+      // Replacing rather than reusing matters most for the flag the payload
+      // carries: reusing would keep the *old* runtime's lifecycle, so a board
+      // deployed to a coordinator could inherit a browser's "clean me up when I
+      // disconnect" and vanish when that browser closed.
+      const replacing = tenant.getRuntime(config.id);
 
-      // Quotas apply only to genuinely new runtimes — reconnecting to one that
+      // Quotas apply only to genuinely new runtimes — replacing one that
       // already exists must never be refused for being over the limit.
-      if (atQuota(tenant.getRuntimes().length, quotas.maxRuntimesPerUser)) {
+      if (!replacing && atQuota(tenant.getRuntimes().length, quotas.maxRuntimesPerUser)) {
         res.status(429).json({
           error: `Runtime limit reached (${quotas.maxRuntimesPerUser})`,
         });
@@ -782,9 +781,16 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
         current?.delete(socket);
         if (current && current.size === 0) {
           runtimeSockets.delete(socketKey);
-          // Last client disconnected — destroy the runtime immediately so its
-          // resources (ports, file handles, etc.) are released. If the board is
-          // saved and the page reloads, POST /runtimes will recreate it cleanly.
+          if (!runtimeApp.forOwner(owner).getRuntime(runtimeId)?.garbageCollected) {
+            // Nobody asked for this one to be cleaned up, so it outlives the
+            // clients that happened to be watching it. A coordinator's board
+            // keeps running with no browser attached; a runtime from a config
+            // file or a script was never anyone's to reap.
+            return;
+          }
+          // Its creator said it should not outlive them — a browser running the
+          // board is the controller, and this was the last one connected. Free
+          // the resources now; provisioning again recreates it cleanly.
           removeRuntimeAndSessions(owner, runtimeId);
         }
       });
@@ -892,6 +898,8 @@ function validateRuntimeConfiguration(
     name: value.name,
     boardName:
       typeof value.boardName === "string" ? value.boardName : undefined,
+    // Absent means persist; see RuntimeConfiguration.garbageCollected.
+    garbageCollected: value.garbageCollected === true,
     services,
   };
 }
