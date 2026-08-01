@@ -9,6 +9,23 @@
  * Arrays: not primary
  * Binary: depends on endpoint + nested services
  * MixedData: not native in runtime
+ *
+ * Who answers a request depends on whether a nested pipeline is configured:
+ *
+ * - **With subservices** the nested pipeline is the handler: what it returns is
+ *   what the caller gets. The outer runtime still runs, and its result still
+ *   drives the next runtime, but it runs *after the answer is decided* — it is
+ *   where a board puts the side effects of having served a request (logging it,
+ *   forwarding it, notifying something) rather than where the answer is shaped.
+ *
+ * - **Without subservices** the rest of the board is the handler: the request
+ *   flows into the services after this one and whatever they return is the
+ *   answer. This is the inversion of control the service is built around, and
+ *   it is what makes a board able to answer an endpoint at all.
+ *
+ * Keeping those apart is what makes a nested pipeline worth configuring: having
+ * declared a handler, a board author can add services behind this one without
+ * silently rewriting an HTTP contract from a distance.
  */
 import { IncomingMessage, ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
@@ -396,6 +413,7 @@ export class HttpServerSubservicesService implements HostedService {
 
     let output: unknown;
     let processInput: unknown;
+    let answeredBySubservices = false;
     if (this.mode === "process_on_data") {
       processInput = this.latestData;
       output = processInput;
@@ -413,8 +431,12 @@ export class HttpServerSubservicesService implements HostedService {
         throw error;
       }
       processInput = request;
+      answeredBySubservices = this.hasSubservices();
       output = this.processSessionInput(processInput);
     }
+
+    // What the nested pipeline produced, before the outer runtime sees it.
+    const answer = output;
 
     // processFrom reports this service's own call-process pair, so there is no
     // manual pair here — emitting one too would double every request in the UI.
@@ -429,8 +451,13 @@ export class HttpServerSubservicesService implements HostedService {
 
     res.statusCode = 200;
     res.setHeader("content-type", "application/json");
-    const json = JSON.stringify(output ?? null);
+    const json = JSON.stringify((answeredBySubservices ? answer : output) ?? null);
     res.end(json);
+  }
+
+  /** Whether a nested pipeline is configured to handle requests. */
+  private hasSubservices(): boolean {
+    return !!this.pipeline && this.pipeline.listServices().length > 0;
   }
 
   private processSessionInput(input: unknown): unknown {
