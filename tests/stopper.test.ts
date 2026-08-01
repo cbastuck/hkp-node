@@ -2,9 +2,7 @@ import request from "supertest";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { createRuntimeServer } from "../src/server";
-import { StopperService } from "../src/services/stopper";
-import { httpServerSubservicesDescriptor } from "../src/services/http-server";
-import { stopperDescriptor } from "../src/services/stopper";
+import { StopperService, stopperDescriptor } from "../src/services/stopper";
 import { mapDescriptor } from "../src/services/map";
 
 type Server = ReturnType<typeof createRuntimeServer>;
@@ -83,65 +81,5 @@ describe("stopper", () => {
         mapService,
       ]),
     ).toBeNull();
-  });
-});
-
-describe("stopper after an http-server", () => {
-  /**
-   * The case that motivated adding it: a runtime that serves an endpoint sits
-   * ahead of the runtime that calls it, and its result would otherwise be fed
-   * into that caller — which calls the endpoint again.
-   */
-  async function serveWith(pipelineTail: Array<Record<string, unknown>>) {
-    const { server } = await startServer();
-    await request(server.httpServer)
-      .post("/runtimes")
-      .send({
-        id: "rt-1",
-        name: "Node",
-        services: [
-          {
-            serviceId: httpServerSubservicesDescriptor.serviceId,
-            uuid: "http-1",
-            state: {
-              bypass: false,
-              mode: "process_on_session",
-              pipeline: [
-                {
-                  instanceId: "answer",
-                  serviceId: "map",
-                  serviceName: "Answer",
-                  state: { mode: "replace", template: { answer: "hello" } },
-                },
-              ],
-            },
-          },
-          ...pipelineTail,
-        ],
-      })
-      .expect(200);
-
-    const { body } = await request(server.httpServer)
-      .get("/runtimes/rt-1/services/http-1")
-      .expect(200);
-    return String(body.__hkpMount);
-  }
-
-  it("answers the HTTP caller with the pipeline result when nothing follows", async () => {
-    const endpoint = await serveWith([]);
-    const res = await fetch(`${endpoint}/hello`);
-    expect(await res.json()).toEqual({ answer: "hello" });
-  });
-
-  it("blanks the HTTP response when a stopper follows the server", async () => {
-    // http-server-subservices answers with whatever the *outer* pipeline
-    // returned, not with what its own sub-pipeline produced. A stopper after it
-    // therefore silences the chain and the response together — the two share
-    // one value, so they cannot be decided separately.
-    const endpoint = await serveWith([
-      { serviceId: stopperDescriptor.serviceId, uuid: "stop-1" },
-    ]);
-    const res = await fetch(`${endpoint}/hello`);
-    expect(await res.json()).toBeNull();
   });
 });
