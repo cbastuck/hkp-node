@@ -14,6 +14,10 @@ import {
   HttpServerSubservicesService,
   httpServerSubservicesDescriptor,
 } from "./services/http-server";
+import {
+  HttpClientService,
+  httpClientDescriptor,
+} from "./services/http-client";
 import { TimerService, timerDescriptor } from "./services/timer";
 import {
   PeerServerService,
@@ -198,6 +202,13 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
       {
         descriptor: peerServerDescriptor,
         create: (config, _createService) => new PeerServerService(config),
+      },
+    ],
+    [
+      httpClientDescriptor.serviceId,
+      {
+        descriptor: httpClientDescriptor,
+        create: (config, _createService) => new HttpClientService(config),
       },
     ],
     [

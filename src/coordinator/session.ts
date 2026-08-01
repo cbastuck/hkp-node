@@ -8,6 +8,12 @@ import {
   isBrowserRuntime,
 } from "./types";
 import { assertRuntimeUrlAllowed } from "./urlGuard";
+import {
+  MOUNT_FIELD,
+  formatMountRef,
+  parseMountRef,
+  substituteMounts,
+} from "./mount";
 
 type ProvisionedRuntime = {
   descriptor: CloudRuntimeDescriptor;
@@ -37,6 +43,14 @@ export class BoardSession {
   // Per-runtime session tokens this session minted (runtimeId → token). Used for
   // the long-lived machine calls (result WS, teardown) that outlive the user's JWT.
   private readonly sessionTokens = new Map<string, string>();
+  // Addresses services published for the mounts they own, keyed
+  // "runtimeId/serviceUuid". This session coordinates the board, so it is what
+  // turns a reference into the address it names — no runtime can see far enough
+  // to do it for itself.
+  private readonly mountAddresses = new Map<string, string>();
+  // What was last handed to each consumer, keyed the same way. Guards against
+  // re-configuring a service with a state it already has.
+  private readonly pushedStates = new Map<string, string>();
 
   constructor(
     readonly boardName: string,
@@ -85,6 +99,13 @@ export class BoardSession {
     for (const entry of this.provisioned) {
       this.connect(entry);
     }
+
+    // Provisioning runs runtime by runtime, so a service pointed at a mount on
+    // a runtime provisioned later cannot have been resolved as it was created.
+    // Collect what everything published, then hand out the addresses once the
+    // whole board exists.
+    await this.collectMountAddresses();
+    await this.publishMountAddresses();
   }
 
   getStatus(): BoardSessionStatus {
@@ -327,7 +348,12 @@ export class BoardSession {
     });
 
     socket.on("message", (raw) => {
-      let message: { type?: string; data?: unknown };
+      let message: {
+        type?: string;
+        data?: unknown;
+        instanceId?: string;
+        value?: string;
+      };
       try {
         message = JSON.parse(raw.toString());
       } catch (err) {
@@ -335,6 +361,14 @@ export class BoardSession {
           `[coordinator] Failed to parse message from runtime "${runtime.id}":`,
           err instanceof Error ? err.message : err,
         );
+        return;
+      }
+
+      // A service publishes the address of a mount it owns through a
+      // notification — when it is unbypassed at runtime, say, long after the
+      // board loaded. Whoever is waiting on that address learns of it here.
+      if (message.type === "notification" && message.instanceId) {
+        this.onRuntimeNotification(runtime.id, message.instanceId, message.value);
         return;
       }
 
@@ -363,6 +397,175 @@ export class BoardSession {
         err.message,
       );
     });
+  }
+
+  private onRuntimeNotification(
+    runtimeId: string,
+    serviceUuid: string,
+    value: string | undefined,
+  ): void {
+    let payload: unknown;
+    try {
+      payload = value === undefined ? undefined : JSON.parse(value);
+    } catch {
+      return;
+    }
+    if (!payload || typeof payload !== "object") {
+      return;
+    }
+    const published = (payload as Record<string, unknown>)[MOUNT_FIELD];
+    if (typeof published !== "string" || !published) {
+      return;
+    }
+    if (this.recordMountAddress(runtimeId, serviceUuid, published)) {
+      void this.publishMountAddresses().catch((err) => {
+        console.error(
+          `[coordinator] Failed to publish mount addresses for board "${this.boardName}":`,
+          err instanceof Error ? err.message : err,
+        );
+      });
+    }
+  }
+
+  /** Records a published address. Returns whether it changed anything. */
+  private recordMountAddress(
+    runtimeId: string,
+    serviceUuid: string,
+    url: string,
+  ): boolean {
+    const key = formatMountRef({ runtimeId, serviceUuid });
+    if (this.mountAddresses.get(key) === url) {
+      return false;
+    }
+    this.mountAddresses.set(key, url);
+    return true;
+  }
+
+  /**
+   * Reads back what every provisioned runtime's services currently report.
+   *
+   * Addresses are assigned while a runtime is provisioned, which happens before
+   * this session subscribes to it — so the notifications announcing them are
+   * already gone by the time anyone is listening. Asking is how the coordinator
+   * catches up.
+   */
+  private async collectMountAddresses(): Promise<void> {
+    await Promise.all(
+      this.provisioned.map(async ({ descriptor }) => {
+        if (!descriptor.url) {
+          return;
+        }
+        try {
+          const res = await fetch(
+            `${descriptor.url}/runtimes/${encodeURIComponent(descriptor.id)}`,
+            { headers: this.bearer(this.sessionTokens.get(descriptor.id)) },
+          );
+          if (!res.ok) {
+            return;
+          }
+          const body = (await res.json()) as {
+            services?: Array<{ uuid?: string; state?: Record<string, unknown> }>;
+          };
+          for (const svc of body.services ?? []) {
+            const published = svc.state?.[MOUNT_FIELD];
+            if (svc.uuid && typeof published === "string" && published) {
+              this.recordMountAddress(descriptor.id, svc.uuid, published);
+            }
+          }
+        } catch (err) {
+          console.error(
+            `[coordinator] Failed to read services of runtime "${descriptor.id}":`,
+            err instanceof Error ? err.message : err,
+          );
+        }
+      }),
+    );
+  }
+
+  /**
+   * Hands every service holding a mount reference the address it names.
+   *
+   * A runtime cannot do this for itself: it sees its own services and nothing
+   * else, while a reference names a service on another runtime, possibly on
+   * another machine. So the coordinator resolves against the board it owns and
+   * configures the consumer with a plain address, which is the same value the
+   * consumer would have been given had the board been exported.
+   *
+   * Services on browser runtimes are not reachable from here — the bridge only
+   * carries processing — so those still resolve in the browser, which
+   * coordinates its own board state.
+   */
+  private async publishMountAddresses(): Promise<void> {
+    if (this.mountAddresses.size === 0) {
+      return;
+    }
+
+    const resolve = (ref: string): string | null =>
+      this.mountAddresses.get(ref) ?? null;
+
+    await Promise.all(
+      this.provisioned.map(async ({ descriptor }) => {
+        const services = this.config.services[descriptor.id] ?? [];
+        for (const svc of services) {
+          const state = svc.state;
+          if (!state) {
+            continue;
+          }
+          const resolved = substituteMounts(state, resolve);
+          const serialized = JSON.stringify(resolved);
+          // Nothing resolved, or this exact state has already been handed over
+          // — later passes run whenever an address appears, and re-sending a
+          // service its own configuration would be pointless churn.
+          if (serialized === JSON.stringify(state)) {
+            continue;
+          }
+          const key = formatMountRef({
+            runtimeId: descriptor.id,
+            serviceUuid: svc.uuid,
+          });
+          if (this.pushedStates.get(key) === serialized) {
+            continue;
+          }
+          this.pushedStates.set(key, serialized);
+          // The board keeps its references. They are what survives being saved
+          // and reopened somewhere else; an address is only true of this run.
+          await this.configureService(descriptor, svc.uuid, resolved);
+        }
+      }),
+    );
+  }
+
+  private async configureService(
+    runtime: CloudRuntimeDescriptor,
+    serviceUuid: string,
+    state: Record<string, unknown>,
+  ): Promise<void> {
+    if (!runtime.url) {
+      return;
+    }
+    try {
+      const res = await fetch(
+        `${runtime.url}/runtimes/${encodeURIComponent(runtime.id)}/services/${encodeURIComponent(serviceUuid)}`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            ...this.bearer(this.sessionTokens.get(runtime.id)),
+          },
+          body: JSON.stringify(state),
+        },
+      );
+      if (!res.ok) {
+        console.error(
+          `[coordinator] Failed to configure "${serviceUuid}" on runtime "${runtime.id}": ${res.status}`,
+        );
+      }
+    } catch (err) {
+      console.error(
+        `[coordinator] Failed to configure "${serviceUuid}" on runtime "${runtime.id}":`,
+        err instanceof Error ? err.message : err,
+      );
+    }
   }
 
   private async routeResult(

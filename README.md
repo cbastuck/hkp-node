@@ -98,6 +98,19 @@ holding it, so that generic board machinery can read and rewrite it. A board poi
 client at one of these endpoints puts a `hkp-mount://<runtimeId>/<serviceUuid>` reference in
 the same field on the consuming service, since the address is not knowable at design time.
 
+Resolving that reference is the **coordinator's** job, not a runtime's: a runtime sees its
+own services and nothing else, while a reference names a service on another runtime, possibly
+on another machine. For a cloud board this coordinator is `src/coordinator/` — a `BoardSession`
+collects the addresses its runtimes published, then configures each consumer with the plain
+address. It does so after every runtime is provisioned (references pointing at a runtime
+provisioned later cannot resolve before then) and again whenever a service publishes an
+address later, e.g. on being unbypassed.
+
+The board itself keeps its references; only what is handed to a running service is resolved.
+A reference is what survives being saved and reopened elsewhere, an address is only true of
+one run. Services on browser runtimes are not configured from here — the bridge carries
+processing only — so those resolve in the browser, which coordinates its own board state.
+
 Ports are a single machine-wide namespace, so on a shared host a service asking for a specific
 port is a land grab: the second claimant fails and whoever wins receives traffic the other
 expected. An assigned id avoids that, and because runtime ids are only unique per tenant they
