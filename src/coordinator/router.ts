@@ -84,9 +84,9 @@ export function createCoordinatorRouter(
   router.post(
     "/users/:username/boards/:boardName/stop",
     async (req: Request, res: Response) => {
-      // Hands the board's runtimes back so someone else can take them over —
-      // editing, in practice. The board keeps its place and its config; only
-      // its runtimes go away.
+      // Releases the board's runtimes without giving up the board: it keeps
+      // its place and its config, so registering that config again starts it
+      // back up.
       const { username, boardName } = req.params as Record<string, string>;
       const session = coordinator.getBoard(username, boardName);
       if (!session) {
