@@ -56,6 +56,7 @@ All options are passed as environment variables.
 | `HKP_MAX_SERVICES_PER_RUNTIME` | —         | Maximum services per runtime. Unset or `0` means unlimited.                                                                                                                             |
 | `HKP_MIN_TIMER_INTERVAL_MS`  | —           | Lower bound on the Timer service's periodic interval; shorter periods are clamped to it. Unset or `0` means no floor.                                                                    |
 | `HKP_MAX_REQUEST_BODY_BYTES` | `26214400`  | Largest request body accepted on a service endpoint (25 MB). Oversized requests get `413`. Set `0` to disable — unwise, since these endpoints take no token.                             |
+| `HKP_COORDINATOR_DATA_DIR`   | `~/.hkp/coordinator/boards` | Where the coordinator keeps the boards it has been given, one JSON file each, so they survive a restart. Set to the empty string to keep them in memory only. Files hold the board's config — which can carry service credentials — and are written `0600` under `0700` directories. One directory belongs to one coordinator: two processes sharing it will both restore every board and fight over the same runtimes. |
 
 ### Authentication
 

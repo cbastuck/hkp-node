@@ -105,9 +105,9 @@ export function createCoordinatorRouter(
 
   router.delete(
     "/users/:username/boards/:boardName",
-    (req: Request, res: Response) => {
+    async (req: Request, res: Response) => {
       const { username, boardName } = req.params as Record<string, string>;
-      const removed = coordinator.removeBoard(username, boardName);
+      const removed = await coordinator.removeBoard(username, boardName);
       if (!removed) {
         res.sendStatus(404);
         return;

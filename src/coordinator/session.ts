@@ -74,9 +74,18 @@ export class BoardSession {
     // provisioning and is exchanged for per-runtime session tokens. Undefined when
     // auth is off (local dev), in which case runtimes are passthrough.
     private readonly userJwt?: string,
+    // Set when the board comes back from a store rather than from a deploy. It
+    // keeps the date the board was first registered, and it starts stopped:
+    // nothing was provisioned, and provisioning needs a user this session does
+    // not have. See CLOUD-BOARDS.md.
+    restored?: { createdAt: string },
   ) {
-    this.createdAt = new Date().toISOString();
+    this.createdAt = restored?.createdAt ?? new Date().toISOString();
+    if (restored) {
+      this.status = "stopped";
+    }
   }
+
 
   /** Bearer Authorization header for a token, or empty when there is none. */
   private bearer(token: string | undefined): Record<string, string> {
@@ -140,7 +149,7 @@ export class BoardSession {
    * Attached browsers stay attached and are told the board is now empty.
    */
   async stop(): Promise<void> {
-    await this.teardownRuntimes();
+    const unreachable = await this.teardownRuntimes();
     for (const socket of this.sockets.values()) {
       socket.close();
     }
@@ -150,31 +159,60 @@ export class BoardSession {
     this.pushedStates.clear();
     this.serviceStates.clear();
     this.registries.clear();
+    // Whatever went wrong starting the board is history now; what is worth
+    // carrying is what would not let go.
+    this.errors.length = 0;
+    this.errors.push(...unreachable);
     this.status = "stopped";
     this.broadcast(this.snapshot());
   }
 
-  private async teardownRuntimes(): Promise<void> {
+  /**
+   * Releases the runtimes this session provisioned, and reports the ones it
+   * could not reach.
+   *
+   * Releasing is best-effort by design: a runtime host that is down must not
+   * make a board impossible to stop. But a runtime we failed to delete is very
+   * likely still running — provisioned to persist, holding its mount, with
+   * nothing left tracking it. Saying so is the difference between an orphan
+   * someone can go and deal with and one nobody ever hears about.
+   */
+  private async teardownRuntimes(): Promise<string[]> {
+    const unreachable: string[] = [];
     await Promise.all(
       this.provisioned
         .filter(({ descriptor }) => !!descriptor.url)
-        .map(({ descriptor }) =>
-          fetch(
-            `${descriptor.url}/runtimes/${encodeURIComponent(descriptor.id)}`,
-            {
+        .map(async ({ descriptor }) => {
+          const target = `${descriptor.url}/runtimes/${encodeURIComponent(descriptor.id)}`;
+          try {
+            const res = await fetch(target, {
               method: "DELETE",
               // Teardown can happen after the user is gone, so use the session
               // token (still valid for this runtime's lifetime), not the JWT.
               headers: this.bearer(this.sessionTokens.get(descriptor.id)),
-            },
-          ).catch((err) => {
+            });
+            // 404 is the outcome asked for: there is no such runtime. The
+            // runtimes disagree about saying so — hkp-node answers 200 whether
+            // or not it held one, hkp-python and hkp-rt answer 404 — so taking
+            // any non-2xx as a failure would cry wolf on two of the three.
+            if (!res.ok && res.status !== 404) {
+              unreachable.push(
+                `Runtime "${descriptor.id}" at ${descriptor.url} refused to release it (${res.status}); it may still be running.`,
+              );
+            }
+          } catch (err) {
+            const reason = err instanceof Error ? err.message : String(err);
             console.error(
               `[coordinator] Failed to DELETE runtime "${descriptor.id}":`,
-              err instanceof Error ? err.message : err,
+              reason,
             );
-          }),
-        ),
+            unreachable.push(
+              `Runtime "${descriptor.id}" at ${descriptor.url} could not be reached (${reason}); it may still be running.`,
+            );
+          }
+        }),
     );
+    return unreachable;
   }
 
   async destroy(): Promise<void> {

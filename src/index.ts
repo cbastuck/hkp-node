@@ -1,10 +1,12 @@
 #!/usr/bin/env node
 // Copyright (c) 2026 cbastuck
 // SPDX-License-Identifier: AGPL-3.0-only
+import os from "os";
 import path from "path";
 import { config as loadEnv } from "dotenv";
 import { createRuntimeServer } from "./server";
-import { createCoordinatorRouter } from "./coordinator";
+import { BoardCoordinator, createCoordinatorRouter } from "./coordinator";
+import { createFileBoardStore } from "./coordinator/fileBoardStore";
 import { AllowedOrigins, AuthConfig, isLoopbackHost } from "./auth";
 
 async function main() {
@@ -42,9 +44,26 @@ async function main() {
   });
 
   if (coordinatorEnabled) {
+    // A coordinator that forgot its boards whenever it restarted would be a
+    // coordinator you could not restart, so this is on unless it is pointed at
+    // nowhere: HKP_COORDINATOR_DATA_DIR="" keeps the boards in memory.
+    const dataDir =
+      process.env.HKP_COORDINATOR_DATA_DIR ??
+      path.join(os.homedir(), ".hkp", "coordinator", "boards");
     const { router: coordinatorRouter, coordinator } = createCoordinatorRouter({
       auth: authConfig,
+      coordinator: dataDir
+        ? new BoardCoordinator(createFileBoardStore(dataDir))
+        : undefined,
     });
+    // Before the server listens: until this finishes the coordinator would tell
+    // a browser the user has no boards, which is not the same as not answering.
+    await coordinator.restore();
+    if (dataDir) {
+      console.log(
+        `hkp-node coordinator boards: ${dataDir} (${coordinator.getBoardCount()} restored)`,
+      );
+    }
     server.expressApp.use("/coordinator", coordinatorRouter);
     server.setBridgeUpgradeHandler((ws, user) => {
       ws.once("message", (raw) => {
