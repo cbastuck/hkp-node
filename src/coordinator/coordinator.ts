@@ -1,5 +1,6 @@
 import { CloudBoardConfig, BoardSessionInfo } from "./types";
 import { BoardSession } from "./session";
+import { BoardStore, createMemoryBoardStore } from "./boardStore";
 
 export class BoardCoordinator {
   // userId → boardName → BoardSession
@@ -7,6 +8,34 @@ export class BoardCoordinator {
   // In-flight registrations, keyed by user and board, so a second one waits for
   // the first rather than tearing down what it is building.
   private readonly registrations = new Map<string, Promise<BoardSession>>();
+
+  /** Where the boards themselves are kept; see BoardStore. In memory unless a
+   *  caller supplies somewhere that outlives the process. */
+  constructor(private readonly store: BoardStore = createMemoryBoardStore()) {}
+
+  /**
+   * Takes back the boards the store holds, as boards that are not running.
+   *
+   * Await this before serving: until it finishes the coordinator will report
+   * that the user has no boards, and a browser told that would be told wrongly.
+   * A board already registered in this process wins — it is the live one, and
+   * what the store holds is an older copy of the same document.
+   */
+  async restore(): Promise<void> {
+    for (const board of await this.store.load()) {
+      if (this.getBoard(board.userId, board.boardName)) {
+        continue;
+      }
+      const session = new BoardSession(
+        board.boardName,
+        board.userId,
+        board.config,
+        undefined,
+        { createdAt: board.createdAt },
+      );
+      this.userSessions(board.userId).set(board.boardName, session);
+    }
+  }
 
   /**
    * Registers a board, one registration at a time per board.
@@ -67,7 +96,36 @@ export class BoardCoordinator {
     }
 
     this.userSessions(userId).set(config.boardName, session);
+
+    // Deploying is what makes a board the coordinator's, so it is what the
+    // store is told about. Starting a stopped board registers the same config
+    // again and lands here too, which is harmless: it writes what is already
+    // written.
+    try {
+      await this.store.save({
+        userId,
+        boardName: config.boardName,
+        createdAt: session.createdAt,
+        config,
+      });
+    } catch (err) {
+      // The board is provisioned and running; only its survival of a restart is
+      // in doubt. Failing the deploy over that would be the worse trade.
+      console.error(
+        `[coordinator] Failed to persist board "${config.boardName}":`,
+        err instanceof Error ? err.message : err,
+      );
+    }
     return session;
+  }
+
+  /** How many boards this coordinator holds, across every user. */
+  getBoardCount(): number {
+    let total = 0;
+    for (const boards of this.sessions.values()) {
+      total += boards.size;
+    }
+    return total;
   }
 
   getBoard(userId: string, boardName: string): BoardSession | undefined {
@@ -89,13 +147,16 @@ export class BoardCoordinator {
     }));
   }
 
-  removeBoard(userId: string, boardName: string): boolean {
+  async removeBoard(userId: string, boardName: string): Promise<boolean> {
     const session = this.sessions.get(userId)?.get(boardName);
     if (!session) {
       return false;
     }
     session.destroy();
     this.sessions.get(userId)?.delete(boardName);
+    // Deleting a board that outlived a restart has to delete it there too, or
+    // the next restore brings it back.
+    await this.store.remove(userId, boardName);
     return true;
   }
 

@@ -1,5 +1,5 @@
 import http from "node:http";
-import { AddressInfo } from "node:net";
+import { AddressInfo, Socket } from "node:net";
 
 import { WebSocketServer } from "ws";
 
@@ -63,6 +63,15 @@ export async function startStubRuntime(runtimeId: string): Promise<StubRuntime> 
   });
 
   const sockets = new WebSocketServer({ server });
+  // Closing an http server waits for its connections to end, and a coordinator
+  // holds an open WebSocket to this one — so a test that shuts the host down
+  // would wait on the very socket it is trying to take away. Track them and
+  // cut them, so "the host is gone" happens when the test says it does.
+  const connections = new Set<Socket>();
+  server.on("connection", (socket) => {
+    connections.add(socket);
+    socket.on("close", () => connections.delete(socket));
+  });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const { port } = server.address() as AddressInfo;
 
@@ -72,6 +81,10 @@ export async function startStubRuntime(runtimeId: string): Promise<StubRuntime> 
     close: () =>
       new Promise<void>((resolve) => {
         sockets.close();
+        for (const socket of connections) {
+          socket.destroy();
+        }
+        connections.clear();
         server.close(() => resolve());
       }),
   };
