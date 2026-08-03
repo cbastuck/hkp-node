@@ -40,12 +40,23 @@ export type AuthMiddleware = (
  *   When `allowedEmails` is set, the token must additionally carry a **verified**
  *   `email` claim that is on the list; any other authenticated user of the
  *   tenant is rejected.
+ *
+ *   `audience` may list several accepted values. The frontend sends its id_token,
+ *   whose `aud` is the Auth0 *client id* of whichever application signed the user
+ *   in — and the web and native apps must be separate Auth0 applications (only a
+ *   SPA-type one can do the browser flows, only a Native-type one the RFC 8252
+ *   flow). One runtime serves users from both, so it accepts both client ids.
  * - `none` — accept everything (no identity). Only ever resolved for a local
  *   development checkout that opts in via ALLOW_NO_AUTH; the published npm
  *   package never runs in this mode (see resolveServerAuthConfig in index.ts).
  */
 export type AuthConfig =
-  | { mode: "jwt"; domain: string; audience: string; allowedEmails?: string[] }
+  | {
+      mode: "jwt";
+      domain: string;
+      audience: string | string[];
+      allowedEmails?: string[];
+    }
   | { mode: "none" };
 
 /**
@@ -99,9 +110,23 @@ export function isEmailAllowed(
 
 function createJwtVerifier(
   domain: string,
-  audience: string,
+  audience: string | string[],
   allowedEmails?: string[],
 ): (token: string) => Promise<AuthenticatedUser | null> {
+  // An empty `audience` makes jwt.verify skip the check altogether, which would
+  // accept a token minted for any application in the tenant. Refusing to build a
+  // verifier that cannot check is the fail-closed reading, and it also gives the
+  // non-empty list jsonwebtoken's own typing asks for.
+  const audiences = (Array.isArray(audience) ? audience : [audience]).filter(
+    Boolean,
+  );
+  if (!audiences.length) {
+    throw new Error(
+      "JWT authentication needs at least one accepted audience (AUTH0_AUDIENCE)",
+    );
+  }
+  const expected = audiences as [string, ...string[]];
+
   const client = jwksClient({
     jwksUri: `https://${domain}/.well-known/jwks.json`,
     cache: true,
@@ -123,7 +148,7 @@ function createJwtVerifier(
 
   return (token: string) =>
     new Promise<AuthenticatedUser | null>((resolve) => {
-      jwt.verify(token, getSigningKey, { audience }, (err, decoded) => {
+      jwt.verify(token, getSigningKey, { audience: expected }, (err, decoded) => {
         if (err || !decoded || typeof decoded === "string") {
           resolve(null);
           return;

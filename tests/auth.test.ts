@@ -68,6 +68,21 @@ describe("hkp-node authentication", () => {
     await request(baseUrl).get("/runtimes").expect(401);
   });
 
+  it("accepts a list of audiences, and refuses to run with none", () => {
+    // One runtime serves users signed in through more than one Auth0
+    // application (the website's SPA and the native apps' own), whose id_tokens
+    // carry different client ids in `aud`.
+    expect(() =>
+      createAuthenticator({ ...JWT_AUTH, audience: ["spa-client", "native-client"] }),
+    ).not.toThrow();
+    // An empty list would make the verifier skip the audience check entirely and
+    // accept tokens minted for any application in the tenant, so it must not
+    // start at all.
+    expect(() => createAuthenticator({ ...JWT_AUTH, audience: [] })).toThrow(
+      /audience/i,
+    );
+  });
+
   it("resolves opaque session tokens before falling back to JWT verification", async () => {
     const authenticator = createAuthenticator(JWT_AUTH, {
       resolveOpaqueToken: (token) =>

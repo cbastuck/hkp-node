@@ -46,7 +46,7 @@ All options are passed as environment variables.
 | `EXTERNAL_HOST`              | `127.0.0.1` | Hostname written into runtime `outputUrl` (use your machine's LAN/public IP when connecting from other devices)                                                                         |
 | `ALLOWED_ORIGINS`            | `*`         | Comma-separated list of allowed origins for CORS **and** the WebSocket Origin check. Leave as `*` only for local development.                                                           |
 | `AUTH0_DOMAIN`               | —           | Auth0 tenant domain. **Required** (with `AUTH0_AUDIENCE`) to start.                                                                                                                     |
-| `AUTH0_AUDIENCE`             | —           | Auth0 API audience the access token must target. **Required** to start.                                                                                                                 |
+| `AUTH0_AUDIENCE`             | —           | Accepted `aud` values, comma-separated — the Auth0 client id of each application whose users this runtime serves (the frontend sends its id_token). **Required** to start.               |
 | `ALLOWED_EMAILS`             | —           | Comma-separated email allowlist. When set, only tokens with a **verified** `email` claim on the list are accepted; requires Auth0 config (refuses to start without it).                 |
 | `ALLOW_NO_AUTH`              | —           | Set to `true` to run **without authentication**. Only honoured for a local source checkout; the published npm package ignores it. Local development only.                               |
 | `HKP_RUNTIME_URL_ALLOWLIST`  | —           | Comma-separated `host` or `host:port` list. When set, the coordinator may only dial runtimes whose host is listed (strict allowlist; recommended for shared/exposed coordinators).      |
@@ -247,7 +247,9 @@ Example:
 
 ```sh
 # Production (public bind → Auth0 required)
-AUTH0_DOMAIN=hookitapp.eu.auth0.com AUTH0_AUDIENCE=gpk8IFPKfaOTQUzpDRO7vBajOnB72rkM ALLOWED_ORIGINS=https://node.readymadeit.com npx hkp-node
+# AUTH0_AUDIENCE lists every client id whose users this runtime serves: the website's
+# SPA application and the native apps' one are necessarily separate Auth0 applications.
+AUTH0_DOMAIN=hookitapp.eu.auth0.com AUTH0_AUDIENCE=x4iF0MBYfd25oLdJbATNe03dCDUtBs74,gpk8IFPKfaOTQUzpDRO7vBajOnB72rkM ALLOWED_ORIGINS=https://node.readymadeit.com npx hkp-node
 
 # Same, but restricted to specific users (verified email claim must be on the list)
 AUTH0_DOMAIN=your.eu.auth0.com AUTH0_AUDIENCE=your-api ALLOWED_ORIGINS=https://app.example \

@@ -156,6 +156,21 @@ function readInteger(value: string | undefined, fallback: number): number {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
+/**
+ * Accepted `aud` values, comma-separated. Several is the normal case: the web
+ * and native apps are necessarily separate Auth0 applications, so the id_tokens
+ * they issue carry different client ids while both address this one runtime.
+ */
+function parseAudiences(value: string | undefined): string[] {
+  if (!value) {
+    return [];
+  }
+  return value
+    .split(",")
+    .map((audience) => audience.trim())
+    .filter(Boolean);
+}
+
 function parseAllowedEmails(value: string | undefined): string[] | undefined {
   if (!value) {
     return undefined;
@@ -193,15 +208,15 @@ function isDevCheckout(): boolean {
  */
 function resolveServerAuthConfig(host: string): AuthConfig {
   const domain = process.env.AUTH0_DOMAIN;
-  const audience = process.env.AUTH0_AUDIENCE;
+  const audiences = parseAudiences(process.env.AUTH0_AUDIENCE);
   const allowedEmails = parseAllowedEmails(process.env.ALLOWED_EMAILS);
-  if (domain && audience) {
+  if (domain && audiences.length) {
     if (allowedEmails) {
       console.log(
         `[hkp-node] Access restricted to ${allowedEmails.length} allowlisted email(s).`,
       );
     }
-    return { mode: "jwt", domain, audience, allowedEmails };
+    return { mode: "jwt", domain, audience: audiences, allowedEmails };
   }
 
   // An allowlist without JWT auth cannot be enforced; starting anyway would
