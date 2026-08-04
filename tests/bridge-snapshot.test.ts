@@ -141,6 +141,46 @@ describe("attaching to a cloud board", () => {
     expect(snapshot.runtimes.map((rt) => rt.runtimeId)).toEqual(["rt-1"]);
   });
 
+  it("is told what a service says, whatever it says", async () => {
+    // A service's notifications are its output rather than its state — a
+    // Monitor's message appears in no getState — so the browser only ever sees
+    // them here. A payload is whatever the service passed on, so a plain string
+    // has to travel as readily as an object.
+    const { server, baseUrl } = await startRuntimeServer();
+    // Only the monitor: the endpoint service the other boards start with stops
+    // propagation, so nothing downstream of it would see this input.
+    const session = new BoardSession("board-1", "user-1", {
+      boardName: "board-1",
+      runtimes: [{ id: "rt-1", name: "Node", type: "rest", url: baseUrl }],
+      services: {
+        "rt-1": [{ uuid: "mon-1", serviceId: monitorDescriptor.serviceId }],
+      },
+    });
+    cleanups.push(() => session.destroy());
+    await session.start();
+
+    const bridge = await browserBridge(session, []);
+    await bridge.next("snapshot");
+
+    // Run the pipeline in place: the HTTP entry point parses JSON strictly, so
+    // a bare string cannot be posted through it.
+    server.runtimeApp
+      .forOwner("anonymous")
+      .getRuntime("rt-1")
+      ?.process("a plain string", () => {});
+
+    // The runtime also reports where a value is in the pipeline; what the
+    // monitor itself said is the one carrying the value.
+    await bridge.next("notification");
+    const said = bridge.received.filter(
+      (message) =>
+        message.type === "notification" && message.serviceUuid === "mon-1",
+    );
+    expect(said.map((message) => (message as { payload: unknown }).payload)).toContain(
+      "a plain string",
+    );
+  });
+
   it("is told what each runtime can run", async () => {
     // Panel selection resolves by serviceId *and* version, so a browser without
     // the registry renders the wrong UI for a versioned service.

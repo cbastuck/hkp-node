@@ -517,20 +517,22 @@ export class BoardSession {
     } catch {
       return;
     }
-    if (!payload || typeof payload !== "object") {
-      return;
-    }
-
     // Pass it on as what it is. A service's notifications are its output, not
     // its state — a Monitor's message never appears in its getState — so a
     // browser reaching this runtime through us must receive the same
-    // notifications it would have received from the runtime directly.
+    // notifications it would have received from the runtime directly. A payload
+    // is whatever the service said, string and number included; only the mount
+    // address below is looked for, and only an object can carry one.
     this.broadcast({
       type: "notification",
       runtimeId,
       serviceUuid,
       payload,
     });
+
+    if (!payload || typeof payload !== "object") {
+      return;
+    }
 
     const published = (payload as Record<string, unknown>)[MOUNT_FIELD];
     if (typeof published !== "string" || !published) {
