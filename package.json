@@ -1,7 +1,7 @@
 {
   "name": "hkp-node",
-  "version": "1.0.6",
-  "description": "Node.js implementation of the Hookup runtime API. Multi-tenant: requires Auth0 (fails closed) and namespaces runtimes per authenticated user.",
+  "version": "1.0.7",
+  "description": "Node.js Readymade runtime server.",
   "main": "dist/src/index.js",
   "bin": {
     "hkp-node": "dist/src/index.js"
@@ -21,13 +21,13 @@
   },
   "author": "cbastuck <mail@cbastuck.de>",
   "license": "AGPL-3.0-only",
-  "homepage": "https://hookitapp.com",
+  "homepage": "https://readymadeit.com",
   "repository": {
     "type": "git",
-    "url": "https://codeberg.org/cbastuck/hkp-node.git"
+    "url": "https://github.com/cbastuck/hkp-node.git"
   },
   "bugs": {
-    "url": "https://codeberg.org/cbastuck/hkp-node/issues"
+    "url": "https://github.com/cbastuck/hkp-node/issues"
   },
   "dependencies": {
     "cors": "^2.8.5",
