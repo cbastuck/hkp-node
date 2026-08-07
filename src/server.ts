@@ -40,6 +40,7 @@ import {
   SmtpEmailService,
   smtpEmailDescriptor,
 } from "./services/smtp-email";
+import { HoldService, holdDescriptor } from "./services/hold";
 import { HostedRuntime, RuntimeApp, TenantRuntimes } from "./runtime";
 import { MountRegistry } from "./mounts";
 import {
@@ -246,6 +247,13 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
       {
         descriptor: smtpEmailDescriptor,
         create: (config, _createService) => new SmtpEmailService(config),
+      },
+    ],
+    [
+      holdDescriptor.serviceId,
+      {
+        descriptor: holdDescriptor,
+        create: (config, _createService) => new HoldService(config),
       },
     ],
   ]);

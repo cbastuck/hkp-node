@@ -3,7 +3,7 @@
  * Service ID: http-server-subservices
  * Service Name: HttpServerSubservices
  * Runtime: hkp-node
- * Modes: session pipeline hosting
+ * Modes: process_on_session | process_on_data | process_on_both
  * Key Config: bypass/mode/pipeline (the endpoint is assigned, not configured)
  * IO: in=request envelope -> out=response envelope
  * Arrays: not primary
@@ -47,7 +47,21 @@ export const httpServerSubservicesDescriptor: ServiceRegistryEntry = {
   capabilities: ["subservices"],
 };
 
-type HttpServerMode = "process_on_session" | "process_on_data";
+/**
+ * Where the nested pipeline is entered from:
+ *
+ * - `process_on_session` — requests only; data from the outer chain passes
+ *   through untouched.
+ * - `process_on_data` — data from the outer chain is stored and served back to
+ *   requests verbatim; the nested pipeline is not used.
+ * - `process_on_both` — both entry points run the nested pipeline. The pipeline
+ *   is a single ordered list either way, so a service inside it that needs to
+ *   tell a request from a data arrival has to do so from the input.
+ */
+type HttpServerMode =
+  | "process_on_session"
+  | "process_on_data"
+  | "process_on_both";
 
 /**
  * An incoming request as MixedData: JSON metadata plus the raw body. Mirrors
@@ -194,7 +208,8 @@ export class HttpServerSubservicesService implements HostedService {
 
     if (
       config.mode === "process_on_session" ||
-      config.mode === "process_on_data"
+      config.mode === "process_on_data" ||
+      config.mode === "process_on_both"
     ) {
       this.mode = config.mode;
     }
@@ -274,6 +289,15 @@ export class HttpServerSubservicesService implements HostedService {
   ): unknown {
     if (this.mode === "process_on_data") {
       this.latestData = input;
+      return input;
+    }
+
+    // Routing only: the nested pipeline handles data arriving from the outer
+    // chain exactly as it handles a request, and what it returns carries on
+    // down the chain. Whatever has to survive between the two — a value one
+    // side produces and the other reads — is a service's job, not this one's.
+    if (this.mode === "process_on_both" && !this.bypass) {
+      return this.processSessionInput(input);
     }
 
     return input;
