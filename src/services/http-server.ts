@@ -59,9 +59,7 @@ export const httpServerSubservicesDescriptor: ServiceRegistryEntry = {
  *   tell a request from a data arrival has to do so from the input.
  */
 type HttpServerMode =
-  | "process_on_session"
-  | "process_on_data"
-  | "process_on_both";
+  "process_on_session" | "process_on_data" | "process_on_both";
 
 /**
  * An incoming request as MixedData: JSON metadata plus the raw body. Mirrors
@@ -180,6 +178,7 @@ export class HttpServerSubservicesService implements HostedService {
   private mount: MountHandle | null = null;
   private pipelineConfig: ServiceConfiguration[] = [];
   private pipeline: HostedRuntime | null = null;
+  private releasePipelineNotifications: (() => void) | null = null;
   private readonly createService: ServiceCreator;
   private host: RuntimeHost | null = null;
 
@@ -305,6 +304,8 @@ export class HttpServerSubservicesService implements HostedService {
 
   destroy(): void {
     this.releaseMount();
+    this.releasePipelineNotifications?.();
+    this.releasePipelineNotifications = null;
     this.pipeline = null;
     this.pipelineConfig = [];
   }
@@ -363,7 +364,9 @@ export class HttpServerSubservicesService implements HostedService {
     if (contentType) {
       meta.contentType = contentType;
     }
-    const filename = filenameFromDisposition(header(req, "content-disposition"));
+    const filename = filenameFromDisposition(
+      header(req, "content-disposition"),
+    );
     if (filename) {
       meta.filename = filename;
     }
@@ -475,7 +478,9 @@ export class HttpServerSubservicesService implements HostedService {
 
     res.statusCode = 200;
     res.setHeader("content-type", "application/json");
-    const json = JSON.stringify((answeredBySubservices ? answer : output) ?? null);
+    const json = JSON.stringify(
+      (answeredBySubservices ? answer : output) ?? null,
+    );
     res.end(json);
   }
 
@@ -489,9 +494,9 @@ export class HttpServerSubservicesService implements HostedService {
       return input;
     }
 
-    return this.pipeline.process(input, (notification) => {
-      this.notify(notification.payload, notification.instanceId);
-    });
+    // No-op: the nested runtime fans these out to the target registered in
+    // rebuild(). Forwarding them here as well would deliver every one twice.
+    return this.pipeline.process(input, () => {});
   }
 
   private notify(payload: unknown, instanceId?: string): void {
@@ -519,6 +524,7 @@ export class HttpServerSubservicesService implements HostedService {
   }
 
   private rebuild(): void {
+    this.releasePipelineNotifications?.();
     this.pipeline = new HostedRuntime(
       {
         id: `${this.uuid}:http-sub-runtime`,
@@ -528,6 +534,16 @@ export class HttpServerSubservicesService implements HostedService {
       },
       this.createService,
     );
+
+    // A nested runtime has no notification targets of its own, so what its
+    // services report — a Timer's tick, a Hold's counts — reaches nobody unless
+    // the service hosting the pipeline carries it out to the board. Services
+    // report through their host precisely because it is not always a call they
+    // are answering: an autonomous emitter has no caller to report to.
+    this.releasePipelineNotifications =
+      this.pipeline.registerNotificationTarget((notification) =>
+        this.notify(notification.payload, notification.instanceId),
+      );
   }
 
   private getPipelineState(): HttpServerSubservicesState["pipeline"] {

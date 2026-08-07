@@ -1,6 +1,6 @@
 {
   "name": "hkp-node",
-  "version": "1.0.9",
+  "version": "1.0.10",
   "description": "Node.js Readymade runtime server.",
   "main": "dist/src/index.js",
   "bin": {

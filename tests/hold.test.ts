@@ -1,3 +1,4 @@
+import WebSocket from "ws";
 import request from "supertest";
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -23,8 +24,62 @@ async function startServer() {
     auth: { mode: "none" },
   });
   servers.push(server);
-  await server.start();
-  return server;
+  const { baseUrl } = await server.start();
+  return { server, baseUrl };
+}
+
+/**
+ * Collects a nested service's reported state off the runtime socket — the
+ * channel an attached board watches — until `done` is satisfied.
+ */
+function collectState(
+  wsUrl: string,
+  instanceId: string,
+  done: (seen: any[]) => boolean,
+  onOpen: () => void | Promise<void>,
+  timeoutMs = 5000,
+): Promise<any[]> {
+  return new Promise((resolve, reject) => {
+    const socket = new WebSocket(wsUrl);
+    const seen: any[] = [];
+    const timer = setTimeout(() => {
+      socket.close();
+      reject(new Error(`timed out; saw ${JSON.stringify(seen)}`));
+    }, timeoutMs);
+
+    socket.on("message", (raw) => {
+      const message = JSON.parse(raw.toString());
+      if (
+        message.type !== "notification" ||
+        message.instanceId !== instanceId
+      ) {
+        return;
+      }
+      let payload: any;
+      try {
+        payload = JSON.parse(message.value);
+      } catch {
+        return;
+      }
+      if (payload?.__internal) {
+        return;
+      }
+      seen.push(payload);
+      if (done(seen)) {
+        clearTimeout(timer);
+        socket.close();
+        resolve(seen);
+      }
+    });
+
+    socket.on("open", () => {
+      void onOpen();
+    });
+    socket.on("error", (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+  });
 }
 
 function makeHold(state: Record<string, unknown>) {
@@ -180,7 +235,7 @@ describe("hold behind an http-server endpoint", () => {
   }
 
   it("answers a request with the value the data path last produced", async () => {
-    const server = await startServer();
+    const { server } = await startServer();
     await request(server.httpServer)
       .post("/runtimes")
       .send({
@@ -222,7 +277,7 @@ describe("hold behind an http-server endpoint", () => {
   });
 
   it("serves a nested timer's latest tick to callers", async () => {
-    const server = await startServer();
+    const { server } = await startServer();
     await request(server.httpServer)
       .post("/runtimes")
       .send({
@@ -273,5 +328,54 @@ describe("hold behind an http-server endpoint", () => {
     await new Promise((resolve) => setTimeout(resolve, 50));
 
     expect(await (await fetch(url)).json()).toBe("tick 1");
+  });
+
+  it("reports a nested service's state to an attached board", async () => {
+    // Regression: a nested runtime has no notification targets of its own, so
+    // everything its services reported through their host was dropped. An
+    // attached board saw a Hold whose counts never moved while its endpoint
+    // plainly answered.
+    const { server, baseUrl } = await startServer();
+    await request(server.httpServer)
+      .post("/runtimes")
+      .send({
+        id: "rt-1",
+        name: "Node",
+        services: [
+          {
+            serviceId: httpServerSubservicesDescriptor.serviceId,
+            uuid: "http-1",
+            state: {
+              bypass: false,
+              mode: "process_on_both",
+              pipeline: subPipeline(),
+            },
+          },
+        ],
+      })
+      .expect(200);
+
+    const url = await mountUrl(server);
+    const wsUrl = `${baseUrl.replace("http", "ws")}/rt-1`;
+
+    const seen = await collectState(
+      wsUrl,
+      "hold-1",
+      (states) => states.some((state) => state.readCount >= 1),
+      async () => {
+        // The producer writes, then a caller reads: both sides have to show up.
+        await request(server.httpServer)
+          .post("/runtimes/rt-1")
+          .send({ triggerCount: 3 })
+          .expect(200);
+        await fetch(url);
+      },
+    );
+
+    expect(seen.some((state) => state.writeCount === 1)).toBe(true);
+    const last = seen[seen.length - 1];
+    expect(last).toMatchObject({ held: 3, readCount: 1, writeCount: 1 });
+    // Each call reports once; a second delivery channel would double these.
+    expect(seen.filter((state) => state.readCount === 1)).toHaveLength(1);
   });
 });
