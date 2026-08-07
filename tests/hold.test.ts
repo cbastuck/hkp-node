@@ -35,93 +35,121 @@ function makeHold(state: Record<string, unknown>) {
   } as never);
 }
 
-/** The predicate the http-server's request envelope satisfies and data does not. */
-const READ_WHEN = "params && params.meta && params.meta.method";
-
+/** What an http-server request arrives as: no producer property in sight. */
 const REQUEST = { meta: { method: "GET", path: "/", query: {} } };
 
 describe("hold", () => {
-  it("stores what it is given and passes it on", () => {
-    const hold = makeHold({ readWhen: READ_WHEN });
+  it("holds the named property and emits it under the same name", () => {
+    const hold = makeHold({ property: "triggerCount" });
     expect(hold.process({ triggerCount: 1 }, () => {})).toEqual({
       triggerCount: 1,
     });
-    expect(hold.getState()).toMatchObject({
-      hasHeld: true,
-      held: { triggerCount: 1 },
-      lastAction: "write",
-      writeCount: 1,
-    });
+    expect(hold.getState()).toMatchObject({ held: 1, writeCount: 1 });
   });
 
-  it("replays the held value on a read without consuming it", () => {
-    const hold = makeHold({ readWhen: READ_WHEN });
-    hold.process({ triggerCount: 4 }, () => {});
+  it("emits the same shape whichever side calls", () => {
+    const hold = makeHold({ property: "triggerCount" });
+    const written = hold.process({ triggerCount: 4 }, () => {});
+    const read = hold.process(REQUEST, () => {});
+    // What the services after Hold see does not say which side called; only the
+    // counts, which nothing downstream sees, tell them apart.
+    expect(read).toEqual(written);
+    expect(hold.getState()).toMatchObject({ readCount: 1, writeCount: 1 });
+  });
 
+  it("replays without consuming", () => {
+    const hold = makeHold({ property: "triggerCount" });
+    hold.process({ triggerCount: 4 }, () => {});
     expect(hold.process(REQUEST, () => {})).toEqual({ triggerCount: 4 });
-    // Reading twice answers twice: the value is held, not queued.
     expect(hold.process(REQUEST, () => {})).toEqual({ triggerCount: 4 });
-    expect(hold.getState()).toMatchObject({ readCount: 2, writeCount: 1 });
   });
 
   it("keeps the newest value written", () => {
-    const hold = makeHold({ readWhen: READ_WHEN });
+    const hold = makeHold({ property: "triggerCount" });
     hold.process({ triggerCount: 1 }, () => {});
     hold.process({ triggerCount: 2 }, () => {});
     expect(hold.process(REQUEST, () => {})).toEqual({ triggerCount: 2 });
   });
 
-  it("stops on a read before anything is held", () => {
-    const hold = makeHold({ readWhen: READ_WHEN });
+  it("drops everything but the held property", () => {
+    // A producer's other fields are not part of what is held.
+    const hold = makeHold({ property: "triggerCount" });
+    expect(
+      hold.process({ triggerCount: 5, note: "ignored" }, () => {}),
+    ).toEqual({ triggerCount: 5 });
+  });
+
+  it("stops while nothing is held", () => {
+    const hold = makeHold({ property: "triggerCount" });
     expect(hold.process(REQUEST, () => {})).toBeNull();
+    expect(hold.getState()).toMatchObject({ held: null });
   });
 
-  it("passes the read through when configured to", () => {
-    const hold = makeHold({ readWhen: READ_WHEN, empty: "passthrough" });
-    expect(hold.process(REQUEST, () => {})).toEqual(REQUEST);
+  it("reads on inputs that cannot carry a property", () => {
+    const hold = makeHold({ property: "triggerCount" });
+    hold.process({ triggerCount: 6 }, () => {});
+    expect(hold.process("a string", () => {})).toEqual({ triggerCount: 6 });
+    expect(hold.process([1, 2, 3], () => {})).toEqual({ triggerCount: 6 });
   });
 
-  it("merges the held value under the reading input", () => {
-    const hold = makeHold({ readWhen: READ_WHEN, readMode: "merge" });
-    hold.process({ triggerCount: 9 }, () => {});
-    expect(hold.process(REQUEST, () => {})).toEqual({
-      triggerCount: 9,
-      meta: REQUEST.meta,
+  it("reads on a null value, which is nothing to hold", () => {
+    const hold = makeHold({ property: "triggerCount" });
+    hold.process({ triggerCount: 2 }, () => {});
+    expect(hold.process({ triggerCount: null }, () => {})).toEqual({
+      triggerCount: 2,
     });
+    expect(hold.getState()).toMatchObject({ readCount: 1, writeCount: 1 });
   });
 
-  it("treats every call as a write while no predicate is set", () => {
+  it("passes input through while no property is configured", () => {
     const hold = makeHold({});
     expect(hold.process(REQUEST, () => {})).toEqual(REQUEST);
-    expect(hold.getState()).toMatchObject({ lastAction: "write" });
+    expect(hold.getState()).toMatchObject({ held: null });
   });
 
-  it("forgets the held value on clear", () => {
-    const hold = makeHold({ readWhen: READ_WHEN });
+  it("forgets the held value and the counts on clear", () => {
+    const hold = makeHold({ property: "triggerCount" });
     hold.process({ triggerCount: 3 }, () => {});
+    hold.process(REQUEST, () => {});
     hold.configure({ action: "clear" });
-    expect(hold.getState()).toMatchObject({ hasHeld: false, held: null });
+    // The counts described the value that was just discarded.
+    expect(hold.getState()).toMatchObject({
+      held: null,
+      readCount: 0,
+      writeCount: 0,
+    });
     expect(hold.process(REQUEST, () => {})).toBeNull();
   });
 
-  it("stops and reports when the predicate throws", () => {
-    // Neither storing the caller's payload nor replaying stale data is safe
-    // when the predicate cannot say which this is.
-    const hold = makeHold({ readWhen: "params.missing.deeper" });
-    hold.configure({ readWhen: "params.missing.deeper" });
-    expect(hold.process({ triggerCount: 1 }, () => {})).toBeNull();
-    expect(hold.getState().error).toBeTruthy();
-    expect(hold.getState()).toMatchObject({ hasHeld: false });
+  it("forgets the held value and the counts when the property changes", () => {
+    // What was held belonged to the old property name.
+    const hold = makeHold({ property: "triggerCount" });
+    hold.process({ triggerCount: 3 }, () => {});
+    hold.process(REQUEST, () => {});
+    hold.configure({ property: "counter" });
+    expect(hold.getState()).toMatchObject({
+      held: null,
+      readCount: 0,
+      writeCount: 0,
+    });
+    expect(hold.process(REQUEST, () => {})).toBeNull();
+  });
+
+  it("keeps the counts when the property is configured to what it already is", () => {
+    const hold = makeHold({ property: "triggerCount" });
+    hold.process({ triggerCount: 3 }, () => {});
+    hold.configure({ property: "triggerCount" });
+    expect(hold.getState()).toMatchObject({ held: 3, writeCount: 1 });
   });
 
   it("describes a held value that cannot travel as JSON", () => {
-    const hold = makeHold({ readWhen: READ_WHEN });
+    const hold = makeHold({ property: "payload" });
     const circular: Record<string, unknown> = {};
     circular.self = circular;
-    hold.process(circular, () => {});
+    hold.process({ payload: circular }, () => {});
     expect(hold.getState().held).toBe("[Object]");
     // The value itself is untouched — only the reported state is a description.
-    expect(hold.process(REQUEST, () => {})).toBe(circular);
+    expect(hold.process(REQUEST, () => {})).toEqual({ payload: circular });
   });
 });
 
@@ -132,7 +160,7 @@ describe("hold behind an http-server endpoint", () => {
     {
       serviceId: holdDescriptor.serviceId,
       uuid: "hold-1",
-      state: { readWhen: READ_WHEN },
+      state: { property: "triggerCount" },
     },
     {
       serviceId: mapDescriptor.serviceId,

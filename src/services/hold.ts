@@ -3,23 +3,28 @@
  * Service ID: hold
  * Service Name: Hold
  * Runtime: hkp-node
- * Modes: write (store and pass on) | read (replay what is held)
- * Key Config: readWhen, readMode, empty
- * IO: in=any -> out=input on a write, the held value on a read
- * Arrays: held as one opaque value, never concatenated
- * Binary: held as an opaque value; kept out of reported state
+ * Modes: none — a call carrying the property writes, every call reads
+ * Key Config: property
+ * IO: in=any -> out={ property: held value }, or null while nothing is held
+ * Arrays: an array input carries no property, so it reads
+ * Binary: reads; holding non-JSON values is not supported yet
  * MixedData: not native in runtime
  *
  * Sample-and-hold: a pipeline entered from two sides — a producer that runs on
  * its own schedule and a consumer that arrives whenever it arrives — needs the
  * producer's latest value to survive between runs. Hold keeps it.
  *
- * Which of the two a given call is comes from `readWhen`, an expression over
- * the input: truthy means the caller is reading, anything else means a new
- * value is arriving. Discriminating on the input is what lets one ordered list
- * serve both entry points, since the list itself cannot say where a call came
- * from. Prefer a predicate over a shape the *producing service* guarantees
- * rather than over one a payload happens to have today.
+ * One property name is the whole configuration. An input carrying that property
+ * is the producer, and its value replaces what is held. Every call, that one
+ * included, then emits the held value under the same property name — so the
+ * services after Hold receive the same shape whichever side called, and cannot
+ * tell the two apart. That is the point: the ordered list itself cannot say
+ * where a call came from, and with Hold in front of them nothing downstream
+ * needs to.
+ *
+ * A null held value is an empty one, the way null is nothing to pass on
+ * everywhere else, so a producer cannot hold null: an input carrying the
+ * property as null reads like any other.
  */
 import {
   HostedService,
@@ -28,20 +33,11 @@ import {
   ServiceConfiguration,
   ServiceRegistryEntry,
 } from "../types";
-import { CompiledExpression, compileExpression } from "./expression";
 
 export const holdDescriptor: ServiceRegistryEntry = {
   serviceId: "hold",
   serviceName: "Hold",
 };
-
-/** What a read emits: the held value alone, or the held value under the input. */
-type ReadMode = "replace" | "merge";
-
-/** What a read does before anything has been held. */
-type EmptyMode = "stop" | "passthrough";
-
-type LastAction = "read" | "write" | "none";
 
 export class HoldService implements HostedService {
   readonly serviceId = holdDescriptor.serviceId;
@@ -50,17 +46,10 @@ export class HoldService implements HostedService {
 
   private host: RuntimeHost | null = null;
 
-  private readWhenSource = "";
-  private readWhen: CompiledExpression | null = null;
-  private readMode: ReadMode = "replace";
-  private empty: EmptyMode = "stop";
-
-  private held: unknown = undefined;
-  private hasHeld = false;
-  private lastAction: LastAction = "none";
+  private property = "";
+  private held: unknown = null;
   private readCount = 0;
   private writeCount = 0;
-  private error = "";
 
   constructor(config: ServiceConfiguration) {
     this.uuid = config.uuid;
@@ -75,41 +64,24 @@ export class HoldService implements HostedService {
 
   getState(): JsonRecord {
     return {
-      readWhen: this.readWhenSource,
-      readMode: this.readMode,
-      empty: this.empty,
-      hasHeld: this.hasHeld,
+      property: this.property,
       held: reportable(this.held),
-      lastAction: this.lastAction,
       readCount: this.readCount,
       writeCount: this.writeCount,
-      error: this.error,
     };
   }
 
   configure(config: JsonRecord): JsonRecord {
-    if (typeof config.readWhen === "string") {
-      this.readWhenSource = config.readWhen;
-      // An empty predicate is "never a read": every call stores, which makes an
-      // unconfigured Hold a recorder rather than something that replays.
-      this.readWhen = config.readWhen.trim()
-        ? compileExpression(config.readWhen)
-        : null;
-      this.error = "";
-    }
-
-    if (config.readMode === "replace" || config.readMode === "merge") {
-      this.readMode = config.readMode;
-    }
-
-    if (config.empty === "stop" || config.empty === "passthrough") {
-      this.empty = config.empty;
+    if (typeof config.property === "string") {
+      if (config.property !== this.property) {
+        // What is held belongs to the property it was written for.
+        this.forget();
+      }
+      this.property = config.property;
     }
 
     if (config.action === "clear") {
-      this.held = undefined;
-      this.hasHeld = false;
-      this.lastAction = "none";
+      this.forget();
     }
 
     const state = this.getState();
@@ -121,60 +93,39 @@ export class HoldService implements HostedService {
     input: unknown,
     _notify: (payload: unknown, instanceId?: string) => void,
   ): unknown {
-    let isRead = false;
-    if (this.readWhen) {
-      try {
-        isRead = !!this.readWhen(input);
-        this.error = "";
-      } catch (error) {
-        // Neither branch is safe to guess at: storing would overwrite the held
-        // value with a caller's payload, replaying would answer a producer with
-        // stale data. Stop instead, and say why in the state.
-        this.error = error instanceof Error ? error.message : String(error);
-        this.notify(this.getState());
-        return null;
-      }
+    // Nothing named is nothing to hold: an unconfigured Hold is a wire.
+    if (!this.property) {
+      return input;
     }
 
-    return isRead ? this.read(input) : this.write(input);
+    const incoming = carriedValue(input, this.property);
+    if (incoming !== null && incoming !== undefined) {
+      this.held = incoming;
+      this.writeCount += 1;
+    } else {
+      this.readCount += 1;
+    }
+
+    this.notify(this.getState());
+
+    return this.held === null ? null : { [this.property]: this.held };
   }
 
   destroy(): void {
-    this.held = undefined;
-    this.hasHeld = false;
+    this.forget();
   }
 
   // ── Private ────────────────────────────────────────────────────────────────
 
-  private write(input: unknown): unknown {
-    this.held = input;
-    this.hasHeld = true;
-    this.writeCount += 1;
-    this.lastAction = "write";
-    this.notify(this.getState());
-    return input;
-  }
-
-  private read(input: unknown): unknown {
-    this.readCount += 1;
-    this.lastAction = "read";
-    this.notify(this.getState());
-
-    if (!this.hasHeld) {
-      return this.empty === "passthrough" ? input : null;
-    }
-
-    // Merging only applies between two plain objects; anything else has no
-    // sensible union, so the held value stands on its own.
-    if (
-      this.readMode === "merge" &&
-      isJsonRecord(this.held) &&
-      isJsonRecord(input)
-    ) {
-      return { ...this.held, ...input };
-    }
-
-    return this.held;
+  /**
+   * Back to how the service started. The counts go with the value: they say how
+   * often each side has called for what is held now, and left running across a
+   * clear they would describe a value that is gone.
+   */
+  private forget(): void {
+    this.held = null;
+    this.readCount = 0;
+    this.writeCount = 0;
   }
 
   private notify(payload: JsonRecord): void {
@@ -182,20 +133,22 @@ export class HoldService implements HostedService {
   }
 }
 
-function isJsonRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
+/**
+ * The value an input carries for the held property, if it carries one at all —
+ * anything else makes the call a read rather than a write.
+ */
+function carriedValue(input: unknown, property: string): unknown {
+  if (typeof input !== "object" || input === null || Array.isArray(input)) {
+    return undefined;
+  }
+  return (input as Record<string, unknown>)[property];
 }
 
 /**
- * The held value as it can be reported over REST. A service may hold anything
- * the pipeline carries, including bytes, and state travels as JSON — so what
- * does not survive the trip is described rather than sent.
+ * The held value as it can be reported over REST. State travels as JSON, so a
+ * value that does not survive the trip is described rather than sent.
  */
 function reportable(value: unknown): unknown {
-  if (value === undefined) {
-    return null;
-  }
-
   try {
     return JSON.parse(JSON.stringify(value));
   } catch {
