@@ -30,11 +30,12 @@
 import { IncomingMessage, ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
 
-import { HostedRuntime } from "../runtime";
+import { childRun, HostedRuntime, newRun } from "../runtime";
 import { MountContext, MountHandle } from "../mounts";
 import {
   HostedService,
   JsonRecord,
+  ProcessContext,
   RuntimeHost,
   ServiceConfiguration,
   ServiceCreator,
@@ -179,6 +180,7 @@ export class HttpServerSubservicesService implements HostedService {
   private pipelineConfig: ServiceConfiguration[] = [];
   private pipeline: HostedRuntime | null = null;
   private releasePipelineNotifications: (() => void) | null = null;
+  private releasePipelineLogs: (() => void) | null = null;
   private readonly createService: ServiceCreator;
   private host: RuntimeHost | null = null;
 
@@ -306,6 +308,8 @@ export class HttpServerSubservicesService implements HostedService {
     this.releaseMount();
     this.releasePipelineNotifications?.();
     this.releasePipelineNotifications = null;
+    this.releasePipelineLogs?.();
+    this.releasePipelineLogs = null;
     // Nested services hold the same things top-level ones do — timers, sockets,
     // mounts — and nothing else will ever reach them once this service is gone.
     this.pipeline?.destroy();
@@ -441,6 +445,13 @@ export class HttpServerSubservicesService implements HostedService {
       return;
     }
 
+    // Serving a request is one run, however many pipelines it passes through:
+    // the nested handler below descends from it, and the outer chain afterwards
+    // continues it. Minting one here rather than letting each leg mint its own
+    // is what keeps a request's trace joined up instead of arriving as two
+    // unrelated runs that happen to share a timestamp.
+    const runContext = newRun();
+
     let output: unknown;
     let processInput: unknown;
     let answeredBySubservices = false;
@@ -462,7 +473,7 @@ export class HttpServerSubservicesService implements HostedService {
       }
       processInput = request;
       answeredBySubservices = this.hasSubservices();
-      output = this.processSessionInput(processInput);
+      output = this.processSessionInput(processInput, runContext);
     }
 
     // What the nested pipeline produced, before the outer runtime sees it.
@@ -475,7 +486,7 @@ export class HttpServerSubservicesService implements HostedService {
     if (this.host) {
       // No-op: the runtime already fans these out to its notification targets.
       // Re-notifying through the host would deliver every one twice.
-      output = this.host.processFrom(this.uuid, output, () => {});
+      output = this.host.processFrom(this.uuid, output, () => {}, runContext);
       this.host.emitResult(output);
     }
 
@@ -492,14 +503,29 @@ export class HttpServerSubservicesService implements HostedService {
     return !!this.pipeline && this.pipeline.listServices().length > 0;
   }
 
-  private processSessionInput(input: unknown): unknown {
+  /**
+   * Runs the nested pipeline as a run descended from `parent`.
+   *
+   * Both entry points land here, and they differ only in what they descend
+   * from: a request brings the run its caller minted for the whole exchange,
+   * while data from the outer chain arrives mid-call and descends from whatever
+   * that call is running as.
+   */
+  private processSessionInput(
+    input: unknown,
+    parent?: ProcessContext | null,
+  ): unknown {
     if (!this.pipeline || this.pipeline.listServices().length === 0) {
       return input;
     }
 
     // No-op: the nested runtime fans these out to the target registered in
     // rebuild(). Forwarding them here as well would deliver every one twice.
-    return this.pipeline.process(input, () => {});
+    return this.pipeline.process(
+      input,
+      () => {},
+      childRun(parent ?? this.host?.currentContext() ?? null),
+    );
   }
 
   private notify(payload: unknown, instanceId?: string): void {

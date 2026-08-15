@@ -28,6 +28,14 @@ function createHost(): RecordingHost {
       host.processed.push(data);
       return data;
     },
+    currentContext() {
+      return null;
+    },
+    log() {},
+    forwardLog() {},
+    logSettings() {
+      return { logging: false, logData: false, logLevel: "info" as const };
+    },
     notify(payload: unknown, instanceId: string) {
       host.notifications.push({ instanceId, payload });
     },

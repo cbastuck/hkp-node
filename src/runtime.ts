@@ -1,7 +1,12 @@
+import { randomUUID } from "node:crypto";
+
 import {
   HostedService,
   HostedServiceFactory,
   JsonRecord,
+  LogEntry,
+  LogLevel,
+  ProcessContext,
   RuntimeConfiguration,
   RuntimeDescriptor,
   RuntimeHost,
@@ -11,6 +16,56 @@ import {
   ServiceDescriptor,
 } from "./types";
 import { MountHandle, MountHandlers } from "./mounts";
+
+/** Severity order, so a runtime can drop anything below what it records. */
+export const LOG_LEVELS: Record<LogLevel, number> = {
+  debug: 0,
+  info: 1,
+  warn: 2,
+  error: 3,
+};
+
+/** A run with no parent: something outside the board asked for this. */
+export function newRun(): ProcessContext {
+  return { runId: randomUUID() };
+}
+
+/**
+ * Reads a context a peer sent, filling in what it left out.
+ *
+ * A caller that names no run is not continuing one, so a run is begun rather
+ * than left unidentified — work that cannot be attributed to anything is worse
+ * than work attributed to a run of its own. Returns undefined only when there
+ * was no context at all, which lets the caller decide.
+ */
+export function contextFromWire(value: unknown): ProcessContext | undefined {
+  if (typeof value !== "object" || value === null) {
+    return undefined;
+  }
+  const wire = value as Record<string, unknown>;
+  const str = (key: string): string | undefined =>
+    typeof wire[key] === "string" && wire[key] ? (wire[key] as string) : undefined;
+
+  return {
+    runId: str("runId") ?? randomUUID(),
+    parentRunId: str("parentRunId"),
+    requestId: str("requestId"),
+  };
+}
+
+/**
+ * A run invoked from inside another one, as a nested pipeline is.
+ *
+ * The child gets an identity of its own rather than borrowing its parent's, so
+ * that work done inside a sub-pipeline stays distinguishable from work done
+ * around it — which is the whole difference between a trace that shows nesting
+ * and one that shows a flat list in timestamp order.
+ */
+export function childRun(parent: ProcessContext | null): ProcessContext {
+  return parent
+    ? { runId: randomUUID(), parentRunId: parent.runId }
+    : newRun();
+}
 
 /**
  * Grants a runtime's services public endpoints. Supplied by the server, which
@@ -36,6 +91,17 @@ export class HostedRuntime implements RuntimeHost {
   private readonly resultTargets = new Set<(result: unknown) => void>();
   private readonly createService: ServiceCreator;
   private readonly mounts?: RuntimeMounts;
+  /** The call being processed right now; see withContext. */
+  private context: ProcessContext | null = null;
+  /** Which service the pass is inside, so a log entry can name it. */
+  private currentService: string | null = null;
+  private readonly logTargets = new Set<(entry: LogEntry) => void>();
+  /** See RuntimeConfiguration.logData. A board-wide override, not the gate. */
+  private logData = true;
+  /** Whether anything is recorded at all; see RuntimeConfiguration.logging. */
+  private logging = false;
+  /** The least severe level recorded; see RuntimeConfiguration.logLevel. */
+  private logLevel: LogLevel = "info";
 
   constructor(
     config: RuntimeConfiguration,
@@ -46,6 +112,11 @@ export class HostedRuntime implements RuntimeHost {
     this.name = config.name;
     this.boardName = config.boardName ?? "";
     this.garbageCollected = config.garbageCollected === true;
+    this.logData = config.logData !== false;
+    this.logging = config.logging === true;
+    if (config.logLevel && config.logLevel in LOG_LEVELS) {
+      this.logLevel = config.logLevel;
+    }
     this.createService = createService;
     this.mounts = mounts;
 
@@ -132,6 +203,7 @@ export class HostedRuntime implements RuntimeHost {
     this.serviceOrder = [];
     this.notificationTargets.clear();
     this.resultTargets.clear();
+    this.logTargets.clear();
   }
 
   registerNotificationTarget(
@@ -175,18 +247,41 @@ export class HostedRuntime implements RuntimeHost {
   process(
     input: unknown,
     onNotification: (notification: RuntimeNotification) => void,
+    context?: ProcessContext,
   ): unknown {
-    return this.processFromIndex(0, input, onNotification);
+    return this.withContext(context ?? newRun(), () =>
+      this.processFromIndex(0, input, onNotification),
+    );
   }
 
   // ── RuntimeHost ────────────────────────────────────────────────────────────
+
+  currentContext(): ProcessContext | null {
+    return this.context;
+  }
 
   processFrom(
     startAfterUuid: string,
     input: unknown,
     onNotification: (notification: RuntimeNotification) => void,
+    context?: ProcessContext,
   ): unknown {
     const startIndex = this.serviceOrder.indexOf(startAfterUuid) + 1;
+    // Three ways to arrive here, and each wants a different run:
+    //
+    // - Named explicitly: a service that left its call and came back — an HTTP
+    //   response, an awaited write — handing back what it captured.
+    // - Called from inside a call: a service pulling the services after it
+    //   rather than returning to them. Still the same run, and the current
+    //   context already says which, so nothing has to be threaded by hand.
+    // - Neither: a timer tick, an arriving message. Nothing to continue, so
+    //   this begins a run.
+    //
+    // A service that leaves its call and forgets to capture lands in the third
+    // case, which splits its trace in two rather than attributing its work to
+    // whichever run happened to be in flight. Fragmentation is visible in a
+    // trace; misattribution reads as fact.
+    const runContext = context ?? this.context ?? newRun();
 
     // A service pushing from itself (a Timer tick, an inbound message, a peer
     // event) was never called by the loop below, so the loop never reported it.
@@ -207,11 +302,124 @@ export class HostedRuntime implements RuntimeHost {
       onNotification,
     );
 
-    return this.processFromIndex(startIndex, input, onNotification);
+    return this.withContext(runContext, () =>
+      this.processFromIndex(startIndex, input, onNotification),
+    );
   }
 
   notify(payload: unknown, instanceId: string): void {
     this.emitNotification({ instanceId, payload }, () => {});
+  }
+
+  log(level: LogLevel, event: string, data?: unknown): void {
+    // Nothing to attribute an entry to means nothing worth recording: a service
+    // logging outside a call has no run, and an entry that names no run cannot
+    // be found again.
+    // Off means off: no entry is built, so nothing is spent deciding what it
+    // would have said.
+    if (
+      !this.logging ||
+      LOG_LEVELS[level] < LOG_LEVELS[this.logLevel] ||
+      !this.context ||
+      this.logTargets.size === 0
+    ) {
+      return;
+    }
+
+    const entry: LogEntry = {
+      runId: this.context.runId,
+      ts: new Date().toISOString(),
+      runtimeId: this.id,
+      serviceUuid: this.currentService ?? "",
+      level,
+      event,
+    };
+    if (this.context.parentRunId) {
+      entry.parentRunId = this.context.parentRunId;
+    }
+    if (this.logData && data !== undefined) {
+      entry.data = data;
+    }
+
+    for (const target of this.logTargets) {
+      target(entry);
+    }
+  }
+
+  /** service.processed, carrying how long the call took. */
+  private logProcessed(result: unknown, durationMs: number): void {
+    if (!this.logging || LOG_LEVELS.debug < LOG_LEVELS[this.logLevel]) {
+      return;
+    }
+    const before = this.logTargets.size;
+    if (before === 0 || !this.context) {
+      return;
+    }
+    for (const target of this.logTargets) {
+      target({
+        runId: this.context.runId,
+        ...(this.context.parentRunId
+          ? { parentRunId: this.context.parentRunId }
+          : {}),
+        ts: new Date().toISOString(),
+        runtimeId: this.id,
+        serviceUuid: this.currentService ?? "",
+        level: "debug",
+        event: "service.processed",
+        durationMs,
+      });
+    }
+  }
+
+  /**
+   * Where this runtime's entries go. The server registers one to carry them to
+   * the board's coordinator; a nested pipeline's host registers one to carry
+   * them out to the runtime around it.
+   */
+  registerLogTarget(target: (entry: LogEntry) => void): () => void {
+    this.logTargets.add(target);
+    return () => {
+      this.logTargets.delete(target);
+    };
+  }
+
+  /** Forwards an entry produced by a nested pipeline, unchanged. */
+  forwardLog(entry: LogEntry): void {
+    for (const target of this.logTargets) {
+      target(entry);
+    }
+  }
+
+  setLogData(enabled: boolean): void {
+    this.logData = enabled;
+  }
+
+  getLogData(): boolean {
+    return this.logData;
+  }
+
+  logSettings(): { logging: boolean; logData: boolean; logLevel: LogLevel } {
+    return {
+      logging: this.logging,
+      logData: this.logData,
+      logLevel: this.logLevel,
+    };
+  }
+
+  setLogLevel(level: LogLevel): void {
+    this.logLevel = level;
+  }
+
+  getLogLevel(): LogLevel {
+    return this.logLevel;
+  }
+
+  setLogging(enabled: boolean): void {
+    this.logging = enabled;
+  }
+
+  getLogging(): boolean {
+    return this.logging;
   }
 
   mount(serviceUuid: string, handlers: MountHandlers): MountHandle | null {
@@ -219,6 +427,31 @@ export class HostedRuntime implements RuntimeHost {
   }
 
   // ──────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Runs `fn` with `context` as the current one, restoring what was there
+   * before.
+   *
+   * Restoring rather than clearing is what makes this survive a service that
+   * calls back into this runtime from inside its own `process` — the pull that
+   * a cache miss or a router performs. That inner call is still part of the
+   * outer run, and when it returns the outer loop has more services to visit,
+   * so the context it was running under has to come back.
+   *
+   * Safe as ambient state only because a pass is synchronous: the loop never
+   * yields, so no second call can interleave with this one and observe a
+   * context that is not its own. A pass that awaited would need the context
+   * threaded through the call instead.
+   */
+  private withContext<T>(context: ProcessContext, fn: () => T): T {
+    const previous = this.context;
+    this.context = context;
+    try {
+      return fn();
+    } finally {
+      this.context = previous;
+    }
+  }
 
   private processFromIndex(
     startIndex: number,
@@ -246,12 +479,33 @@ export class HostedRuntime implements RuntimeHost {
         onNotification,
       );
 
-      result = service.process(result, (payload, instanceId) => {
-        this.emitNotification(
-          { instanceId: instanceId ?? uuid, payload },
-          onNotification,
-        );
-      });
+      // Restored rather than cleared, for the same reason the context is: a
+      // service that pulls the ones after it re-enters this loop, and when it
+      // returns the entries that follow still belong to the service that
+      // pulled.
+      const outerService = this.currentService;
+      this.currentService = uuid;
+      const startedAt = Date.now();
+      try {
+        // The flow itself, at debug: which service the runtime called, and
+        // below, what it returned and how long it took.
+        //
+        // Deliberately without the value flowing through. The level says how
+        // much of the shape of a run to keep, and turning it up must not also
+        // start recording the data — a board author reaching for more detail
+        // about *what ran* is not asking to write payloads to disk. What flows
+        // through is recorded only where a service was configured to record it.
+        this.log("debug", "service.process");
+        result = service.process(result, (payload, instanceId) => {
+          this.emitNotification(
+            { instanceId: instanceId ?? uuid, payload },
+            onNotification,
+          );
+        });
+        this.logProcessed(result, Date.now() - startedAt);
+      } finally {
+        this.currentService = outerService;
+      }
 
       this.emitNotification(
         {
@@ -267,6 +521,12 @@ export class HostedRuntime implements RuntimeHost {
       );
 
       if (result === null || result === undefined) {
+        // Where the run ended, named. Recorded above debug because it is the
+        // outcome of the run rather than a step in it: a board that keeps only
+        // what matters still wants to know its flow stopped, and where.
+        this.currentService = uuid;
+        this.log("info", "pipeline.stopped");
+        this.currentService = null;
         break;
       }
     }

@@ -7,6 +7,7 @@ import { config as loadEnv } from "dotenv";
 import { createRuntimeServer } from "./server";
 import { BoardCoordinator, createCoordinatorRouter } from "./coordinator";
 import { createFileBoardStore } from "./coordinator/fileBoardStore";
+import { createFileLogStore } from "./coordinator/logStore";
 import { AllowedOrigins, AuthConfig, isLoopbackHost } from "./auth";
 
 async function main() {
@@ -50,10 +51,20 @@ async function main() {
     const dataDir =
       process.env.HKP_COORDINATOR_DATA_DIR ??
       path.join(os.homedir(), ".hkp", "coordinator", "boards");
+    // Beside the boards, and governed by the same switch: a coordinator told to
+    // keep nothing on disk keeps no log either, and one that persists boards
+    // records what they did. Entries carry board data, so createFileLogStore
+    // gives them the board store's own per-user, owner-only posture.
+    const logDir =
+      process.env.HKP_COORDINATOR_LOG_DIR ??
+      (dataDir ? path.join(path.dirname(dataDir), "logs") : "");
     const { router: coordinatorRouter, coordinator } = createCoordinatorRouter({
       auth: authConfig,
       coordinator: dataDir
-        ? new BoardCoordinator(createFileBoardStore(dataDir))
+        ? new BoardCoordinator(
+            createFileBoardStore(dataDir),
+            logDir ? createFileLogStore(logDir) : undefined,
+          )
         : undefined,
     });
     // Before the server listens: until this finishes the coordinator would tell
@@ -63,6 +74,9 @@ async function main() {
       console.log(
         `hkp-node coordinator boards: ${dataDir} (${coordinator.getBoardCount()} restored)`,
       );
+    }
+    if (logDir) {
+      console.log(`hkp-node coordinator board logs: ${logDir}`);
     }
     server.expressApp.use("/coordinator", coordinatorRouter);
     server.setBridgeUpgradeHandler((ws, user) => {

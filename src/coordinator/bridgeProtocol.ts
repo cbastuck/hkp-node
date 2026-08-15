@@ -13,6 +13,8 @@
  * about remote runtimes is cache — see TODO-CLOUD-COORDINATOR.md.
  */
 
+import { LogEntry } from "../types";
+
 /** State a service last reported, keyed by service uuid. */
 export type ServiceStates = Record<string, unknown>;
 
@@ -63,6 +65,15 @@ export type BridgeMessage =
       serviceUuid: string;
       payload: unknown;
     }
+  /**
+   * A log entry from one of the board's runtimes, forwarded for live display.
+   *
+   * Kept apart from `notification` for the reason the log exists at all: a
+   * notification is for whoever is watching and may be dropped when nobody is,
+   * while an entry is written whether or not anyone is attached. What arrives
+   * here is a copy of what was already stored, not the storage path.
+   */
+  | { type: "log"; entry: LogEntry }
   /** One service reported new state. `seq` continues the snapshot's sequence. */
   | {
       type: "serviceState";
@@ -103,7 +114,16 @@ export type BridgeMessage =
   /** A result the browser produced for a `processRuntime` it was asked to run. */
   | { type: "result"; requestId: string; data?: unknown }
   /** A browser runtime finished its own pipeline; drive the next runtime. */
-  | { type: "result-from-browser"; runtimeId: string; data?: unknown };
+  | { type: "result-from-browser"; runtimeId: string; data?: unknown }
+  /**
+   * An entry a runtime this browser hosts recorded.
+   *
+   * The same shape travels the other way for entries from remote runtimes; the
+   * direction is what differs. A browser runtime holds no socket of its own to
+   * the coordinator, so this bridge is the only route its entries have into the
+   * board's log.
+   */
+  | { type: "log"; entry: LogEntry };
 
 /** Narrow a parsed bridge message without trusting its shape. */
 export function isBridgeMessage(value: unknown): value is BridgeMessage {

@@ -61,6 +61,10 @@ function hostSpy() {
       return data;
     },
     notify: () => {},
+    currentContext: () => null,
+    log: () => {},
+    forwardLog: () => {},
+    logSettings: () => ({ logging: false, logData: false, logLevel: "info" as const }),
     emitResult: (output) => {
       emitted.push(output);
     },

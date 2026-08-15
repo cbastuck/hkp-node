@@ -12,7 +12,7 @@
  */
 import { randomUUID } from "node:crypto";
 
-import { HostedRuntime } from "../runtime";
+import { childRun, HostedRuntime } from "../runtime";
 import {
   HostedService,
   JsonRecord,
@@ -47,6 +47,7 @@ export class SubService implements HostedService {
   private pipelineConfig: ServiceConfiguration[] = [];
   private pipeline: HostedRuntime | null = null;
   private releasePipelineNotifications: (() => void) | null = null;
+  private releasePipelineLogs: (() => void) | null = null;
   private readonly createService: ServiceCreator;
   private host: RuntimeHost | null = null;
 
@@ -61,6 +62,19 @@ export class SubService implements HostedService {
 
   setHost(host: RuntimeHost): void {
     this.host = host;
+    // A pipeline built in the constructor was built before there was a host to
+    // ask, so what the board records reaches it here rather than never.
+    this.applyLogSettings();
+  }
+
+  /** Hands the board's log settings to the nested pipeline, if there is one. */
+  private applyLogSettings(): void {
+    const settings = this.host?.logSettings();
+    if (!settings || !this.pipeline) {
+      return;
+    }
+    this.pipeline.setLogging(settings.logging);
+    this.pipeline.setLogData(settings.logData);
   }
 
   configure(config: JsonRecord): JsonRecord {
@@ -135,12 +149,21 @@ export class SubService implements HostedService {
 
     // No-op: the nested runtime fans these out to the target registered in
     // rebuild(). Forwarding them here as well would deliver every one twice.
-    return this.pipeline.process(input, () => {});
+    // The nested pipeline runs as a run of its own, descended from the one
+    // calling it, so what happens inside stays attributable to this service
+    // rather than blending into the pipeline around it.
+    return this.pipeline.process(
+      input,
+      () => {},
+      childRun(this.host?.currentContext() ?? null),
+    );
   }
 
   destroy(): void {
     this.releasePipelineNotifications?.();
     this.releasePipelineNotifications = null;
+    this.releasePipelineLogs?.();
+    this.releasePipelineLogs = null;
     // Nested services hold the same things top-level ones do — timers, sockets,
     // mounts — and nothing else will ever reach them once this service is gone.
     this.pipeline?.destroy();
@@ -192,6 +215,15 @@ export class SubService implements HostedService {
       this.pipeline.registerNotificationTarget((notification) =>
         this.host?.notify(notification.payload, notification.instanceId),
       );
+
+    // A nested pipeline's entries belong to the same board log as everything
+    // else; only the runtime hosting this service can carry them there, since a
+    // nested runtime has no route out of its own.
+    this.releasePipelineLogs = this.pipeline.registerLogTarget((entry) =>
+      this.host?.forwardLog(entry),
+    );
+
+    this.applyLogSettings();
   }
 
   private getPipelineState(): SubServiceState["pipeline"] {

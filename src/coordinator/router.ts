@@ -81,6 +81,91 @@ export function createCoordinatorRouter(
     },
   );
 
+  /**
+   * What this board recorded, newest last.
+   *
+   * Behind the same `auth` + `requireSelf` the other board routes sit behind —
+   * a valid token whose `sub` matches the username — and deliberately not
+   * behind a runtime session token: that is a machine credential minted to
+   * outlive a user's session, and reading a board's history is not something it
+   * should be able to do.
+   *
+   * `data` is withheld unless asked for, because filtering it after it had been
+   * sent would defeat the point of withholding it at all.
+   */
+  router.get(
+    "/users/:username/boards/:boardName/runs",
+    async (req: Request, res: Response) => {
+      const { username, boardName } = req.params as Record<string, string>;
+      if (!coordinator.getBoard(username, boardName)) {
+        res.sendStatus(404);
+        return;
+      }
+
+      const level = req.query.level as string | undefined;
+      const limit = Number(req.query.limit);
+      try {
+        const entries = await coordinator.readLog(username, boardName, {
+          runId: (req.query.runId as string) || undefined,
+          level:
+            level === "debug" || level === "info" || level === "warn" ||
+            level === "error"
+              ? level
+              : undefined,
+          since: (req.query.since as string) || undefined,
+          limit: Number.isFinite(limit) && limit > 0 ? limit : undefined,
+          withData: req.query.withData === "true",
+        });
+        res.json({ entries });
+      } catch (err) {
+        const message =
+          err instanceof Error ? err.message : "Failed to read the log";
+        res.status(500).json({ error: message });
+      }
+    },
+  );
+
+  /**
+   * Whether this board records anything at all.
+   *
+   * Its own route rather than part of re-registering the board, because it is a
+   * setting a board revisits while it runs: registering again would rebuild
+   * every runtime to change one boolean.
+   */
+  router.post(
+    "/users/:username/boards/:boardName/logging",
+    async (req: Request, res: Response) => {
+      const { username, boardName } = req.params as Record<string, string>;
+      const body = req.body as
+        | { enabled?: unknown; level?: unknown }
+        | undefined;
+      const enabled = body?.enabled;
+      if (typeof enabled !== "boolean") {
+        res.sendStatus(400);
+        return;
+      }
+      const level =
+        body?.level === "debug" ||
+        body?.level === "info" ||
+        body?.level === "warn" ||
+        body?.level === "error"
+          ? body.level
+          : "info";
+
+      const result = await coordinator.setBoardLogging(
+        username,
+        boardName,
+        enabled,
+        level,
+      );
+      if (!result) {
+        res.sendStatus(404);
+        return;
+      }
+      res.json({ logging: enabled, level, unreachable: result.unreachable });
+    },
+  );
+
   router.post(
     "/users/:username/boards/:boardName/stop",
     async (req: Request, res: Response) => {

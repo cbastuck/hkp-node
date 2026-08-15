@@ -8,6 +8,8 @@ import {
   isBrowserRuntime,
 } from "./types";
 import { assertRuntimeUrlAllowed } from "./urlGuard";
+import { LogStore } from "./logStore";
+import { LogEntry, LogLevel } from "../types";
 import {
   MOUNT_FIELD,
   formatMountRef,
@@ -79,6 +81,9 @@ export class BoardSession {
     // nothing was provisioned, and provisioning needs a user this session does
     // not have. See CLOUD-BOARDS.md.
     restored?: { createdAt: string },
+    // Where this board's entries are kept. Absent means nothing is collected —
+    // a session in a test, or a coordinator configured without a log root.
+    private readonly logStore?: LogStore,
   ) {
     this.createdAt = restored?.createdAt ?? new Date().toISOString();
     if (restored) {
@@ -165,6 +170,59 @@ export class BoardSession {
     this.errors.push(...unreachable);
     this.status = "stopped";
     this.broadcast(this.snapshot());
+  }
+
+  /**
+   * Turn this board's logging on or off, on the runtimes already running.
+   *
+   * Applied live rather than by re-provisioning: the setting is one a board
+   * revisits — on to look into something, off again afterwards — and rebuilding
+   * every runtime to carry a boolean would restart the board to change its mind.
+   *
+   * The config is updated too, so the setting survives a restart and so a
+   * runtime provisioned later comes up with it already on. Returns the runtimes
+   * it could not reach; they keep whatever they had, which is why the caller is
+   * told rather than left to assume it took.
+   */
+  async setLogging(enabled: boolean, level: LogLevel = "info"): Promise<string[]> {
+    for (const runtime of this.config.runtimes) {
+      // Only what this switch is for. `logData` is not touched: what a board
+      // records about its own flow and what it is willing to write of the data
+      // passing through are different decisions, and a control that quietly
+      // did both would turn a verbosity setting into an exposure one.
+      runtime.state = {
+        ...(runtime.state ?? {}),
+        logging: enabled,
+        logLevel: level,
+      };
+    }
+
+    const unreachable: string[] = [];
+    await Promise.all(
+      this.provisioned.map(async ({ descriptor }) => {
+        const baseUrl = descriptor.url;
+        if (!baseUrl) {
+          return;
+        }
+        const url = `${baseUrl}/runtimes/${encodeURIComponent(descriptor.id)}/state`;
+        try {
+          const response = await fetch(url, {
+            method: "PATCH",
+            headers: {
+              "content-type": "application/json",
+              ...this.bearer(this.sessionTokens.get(descriptor.id)),
+            },
+            body: JSON.stringify({ logging: enabled, logLevel: level }),
+          });
+          if (!response.ok) {
+            unreachable.push(descriptor.id);
+          }
+        } catch {
+          unreachable.push(descriptor.id);
+        }
+      }),
+    );
+    return unreachable;
   }
 
   /**
@@ -291,6 +349,23 @@ export class BoardSession {
         return;
       }
 
+      // An entry from a runtime this browser hosts. The board's log spans every
+      // runtime it uses, and a browser runtime has no other route into it —
+      // it does not hold a socket of its own to this coordinator.
+      //
+      // Not forwarded on to the other bridges, unlike an entry arriving from a
+      // remote runtime: the browser that sent it already has it, and a second
+      // browser watching the same board is not hosting the runtime that
+      // produced it.
+      if (message.type === "log" && message.entry) {
+        this.logStore?.append(
+          this.userId,
+          this.boardName,
+          message.entry as LogEntry,
+        );
+        return;
+      }
+
       if (message.type === "result" && message.requestId) {
         const resolve = this.pendingBrowserResults.get(message.requestId);
         if (resolve) {
@@ -364,6 +439,11 @@ export class BoardSession {
         // browser attached, and our own sockets come and go as sessions are
         // replaced.
         garbageCollected: false,
+        // The board's own settings for this runtime — `logData`, and whatever
+        // a runtime reads from its state later. Carried rather than dropped,
+        // because a board that turned something on when it was written expects
+        // it on when a coordinator provisions it instead of a browser.
+        state: runtime.state ?? {},
         services: services.map((svc) => ({
           uuid: svc.uuid,
           serviceId: svc.serviceId,
@@ -456,6 +536,7 @@ export class BoardSession {
         data?: unknown;
         instanceId?: string;
         value?: string;
+        entry?: unknown;
       };
       try {
         message = JSON.parse(raw.toString());
@@ -464,6 +545,16 @@ export class BoardSession {
           `[coordinator] Failed to parse message from runtime "${runtime.id}":`,
           err instanceof Error ? err.message : err,
         );
+        return;
+      }
+
+      // An entry from one of this board's runtimes. It is written before it is
+      // forwarded: a browser may or may not be attached, and the log is for the
+      // case where none is.
+      if (message.type === "log" && message.entry) {
+        const entry = message.entry as LogEntry;
+        this.logStore?.append(this.userId, this.boardName, entry);
+        this.broadcast({ type: "log", entry });
         return;
       }
 

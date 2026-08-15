@@ -13,6 +13,7 @@
 import {
   HostedService,
   JsonRecord,
+  RuntimeHost,
   ServiceConfiguration,
   ServiceRegistryEntry,
 } from "../types";
@@ -27,6 +28,15 @@ type MonitorState = JsonRecord & {
   logToConsole: boolean;
   message: string;
   renderTextEditor: boolean;
+  /**
+   * Also record what passes through into the board's log.
+   *
+   * A probe is usually dropped in while something is being worked out and taken
+   * out again afterwards, so it is already sitting where a board author found
+   * the flow worth watching. Turning this on keeps that judgement after the
+   * author stops watching, without a second service to place.
+   */
+  logToBoard: boolean;
 };
 
 export class MonitorService implements HostedService {
@@ -35,6 +45,7 @@ export class MonitorService implements HostedService {
   readonly uuid: string;
 
   private state: MonitorState;
+  private host: RuntimeHost | null = null;
 
   constructor(config: ServiceConfiguration) {
     this.uuid = config.uuid;
@@ -43,6 +54,7 @@ export class MonitorService implements HostedService {
       logToConsole: false,
       message: "",
       renderTextEditor: true,
+      logToBoard: false,
     };
 
     if (config.state) {
@@ -63,6 +75,9 @@ export class MonitorService implements HostedService {
     if (typeof config.message === "string") {
       this.state.message = config.message;
     }
+    if (typeof config.logToBoard === "boolean") {
+      this.state.logToBoard = config.logToBoard;
+    }
     return this.getState();
   }
 
@@ -71,8 +86,18 @@ export class MonitorService implements HostedService {
     return config;
   }
 
+  setHost(host: RuntimeHost): void {
+    this.host = host;
+  }
+
   process(input: unknown, notify: (payload: unknown) => void): unknown {
     this.state.message = formatMessage(input);
+    if (this.state.logToBoard) {
+      // The payload rides in `data`, which the runtime drops unless the board
+      // asked for it — so a probe left switched on cannot quietly widen what
+      // the log holds.
+      this.host?.log("info", "monitor", input);
+    }
     if (this.state.logToConsole) {
       // Mirror the C++ monitor service: optional console logging for visibility.
       console.log("[MONITOR]", input);

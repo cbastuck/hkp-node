@@ -28,6 +28,7 @@
 import {
   HostedService,
   JsonRecord,
+  ProcessContext,
   RuntimeHost,
   RuntimeNotification,
   ServiceConfiguration,
@@ -182,7 +183,10 @@ export class HttpClientService implements HostedService {
       return null;
     }
 
-    void this.send(target, input, notify);
+    // Captured here, while still inside the call this request belongs to. By
+    // the time the response arrives the pass has long returned, so this is the
+    // only moment at which the run that asked for it can still be named.
+    void this.send(target, input, notify, this.host?.currentContext() ?? undefined);
     return null;
   }
 
@@ -221,6 +225,7 @@ export class HttpClientService implements HostedService {
     url: string,
     input: unknown,
     notify: (payload: unknown, instanceId?: string) => void,
+    context?: ProcessContext,
   ): Promise<void> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);
@@ -253,7 +258,7 @@ export class HttpClientService implements HostedService {
         status: response.status,
         inFlight: this.inFlight - 1,
       });
-      this.push(result, notify);
+      this.push(result, notify, context);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       notify({ requesting: false, url, error: message });
@@ -366,6 +371,7 @@ export class HttpClientService implements HostedService {
   private push(
     result: JsonRecord,
     notify: (payload: unknown, instanceId?: string) => void,
+    context?: ProcessContext,
   ): void {
     if (!this.host) {
       return;
@@ -374,6 +380,7 @@ export class HttpClientService implements HostedService {
       this.uuid,
       result,
       (n: RuntimeNotification) => notify(n.payload, n.instanceId),
+      context,
     );
     // A downstream service returning null means "stop" — honour it rather than
     // forwarding a dead result to the next runtime.

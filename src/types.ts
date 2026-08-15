@@ -35,6 +35,34 @@ export type RuntimeConfiguration = {
    * to connect to it.
    */
   garbageCollected?: boolean;
+  /**
+   * Whether this runtime records anything at all.
+   *
+   * Off unless the board turns it on. A board that is not being looked into has
+   * no reason to be writing a line per call to somebody's disk, and a log kept
+   * by default is one nobody decided to keep — including for the data it holds.
+   * Turning it on is the act that makes the rest of this meaningful.
+   */
+  logging?: boolean;
+  /**
+   * The least severe level this runtime records. Absent means `info`.
+   *
+   * The flow itself — every service call and return — is recorded at `debug`,
+   * so this is what decides whether a board keeps a trace of what ran or only
+   * what its services chose to say. That is the difference between a log that
+   * answers "where did this stop" and one that costs almost nothing to keep.
+   */
+  logLevel?: LogLevel;
+  /**
+   * Whether this runtime's log entries may carry their `data` payload.
+   *
+   * Declared by the board, in the runtime's state, because it is a decision
+   * about what the board is willing to record rather than one a service can
+   * make for itself: `data` is the one free-form field, so it is the only place
+   * a service can put something it did not mean to keep. Absent means off, so
+   * the quiet default is the safe one and switching it on is deliberate.
+   */
+  logData?: boolean;
   services: ServiceConfiguration[];
   inputs?: Array<Record<string, unknown>>;
 };
@@ -91,14 +119,117 @@ export type RuntimeNotification = {
   payload: unknown;
 };
 
+/**
+ * What travels with a process call rather than with the data it carries.
+ *
+ * The ordered service list says what runs; this says which invocation it is
+ * running as. The distinction matters as soon as anything has to attribute work
+ * after the fact — which run produced this, and what invoked that run — because
+ * the payload cannot answer it: the same data can flow through the same
+ * services for entirely unrelated reasons.
+ *
+ * Kept deliberately separate from `requestId`, which the browser and hkp-rt
+ * runtimes carry for a different purpose: `requestId` is a *reply address*,
+ * exists only while someone awaits a response, and is consumed on resolution.
+ * A run outlives any number of those, so the two are not interchangeable — see
+ * TODO-CONSOLIDATION.md section 4.
+ */
+export type ProcessContext = {
+  /**
+   * Identifies one invocation of a board — one webhook, one timer tick, one
+   * user action — across every service and runtime it reaches.
+   */
+  runId: string;
+  /**
+   * The run this one was invoked from, for a nested pipeline. Absent on a run
+   * that was triggered from outside rather than from inside another run, which
+   * is what makes a trace reconstructable as a tree rather than a list.
+   */
+  parentRunId?: string;
+  /**
+   * Where to send a result somebody is waiting for. Absent for the fire-and-
+   * forget calls that make up most traffic. Unused by this runtime today; named
+   * here so the shape matches the runtimes that do carry one.
+   */
+  requestId?: string;
+};
+
+export type LogLevel = "debug" | "info" | "warn" | "error";
+
+/**
+ * One thing worth recording about a run.
+ *
+ * A board's log is assembled by its coordinator from every runtime it spans,
+ * because only the coordinator can see the whole board — a log held per runtime
+ * would have to be stitched back together by timestamp to answer the first
+ * question anyone asks it, which is what one run did.
+ *
+ * `data` is the only free-form field and therefore the only one that can carry
+ * something a service did not mean to record. It is dropped unless a board asks
+ * for it, so a service that forgets to redact can only leak through a channel
+ * somebody deliberately opened.
+ */
+export type LogEntry = {
+  runId: string;
+  parentRunId?: string;
+  /** ISO 8601, set by the runtime that produced the entry. */
+  ts: string;
+  runtimeId: string;
+  serviceUuid: string;
+  level: LogLevel;
+  /** What happened, as a short stable name a reader can group by. */
+  event: string;
+  data?: unknown;
+  durationMs?: number;
+};
+
 export interface RuntimeHost {
   processFrom(
     startAfterUuid: string,
     data: unknown,
     onNotification: (notification: RuntimeNotification) => void,
+    context?: ProcessContext,
   ): unknown;
   notify(payload: unknown, instanceId: string): void;
   emitResult(output: unknown): void;
+  /**
+   * The context of the call currently being processed, or null outside one.
+   *
+   * A service that finishes its work after its `process` returns — an HTTP
+   * response arriving, a socket pushing — has left the call it belongs to by
+   * the time it has something to pass on. Capturing this while still inside
+   * `process` and handing it back to `processFrom` is what keeps the two halves
+   * recognisable as one run.
+   */
+  currentContext(): ProcessContext | null;
+  /**
+   * Record something about the run in progress.
+   *
+   * Unlike `notify`, which exists for whoever is watching and may be dropped
+   * when nobody is, an entry has to survive with nobody attached — a board
+   * running unwatched is exactly the case a log is for. The run and the service
+   * are taken from the call in progress, so a service says only what happened.
+   */
+  log(level: LogLevel, event: string, data?: unknown): void;
+  /**
+   * Pass an entry a nested pipeline produced outward, unchanged.
+   *
+   * Distinct from `log` because the entry already names its own run and
+   * service: re-deriving those from the call in progress would relabel work
+   * done inside a sub-pipeline as the work of the service hosting it, which is
+   * the nesting the entry exists to record.
+   */
+  forwardLog(entry: LogEntry): void;
+  /**
+   * What the runtime around a nested pipeline records, so the pipeline can
+   * record the same.
+   *
+   * A nested runtime is built from a service's own configuration, which says
+   * nothing about logging — so without asking, a sub-pipeline would sit silent
+   * inside a board that is being looked into, which is where its entries are
+   * most wanted.
+   */
+  logSettings(): { logging: boolean; logData: boolean; logLevel: LogLevel };
   /**
    * Claim a publicly reachable endpoint served by the shared server, for a
    * service that needs to be called from outside (an HTTP endpoint, a

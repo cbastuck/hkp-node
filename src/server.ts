@@ -41,7 +41,12 @@ import {
   smtpEmailDescriptor,
 } from "./services/smtp-email";
 import { HoldService, holdDescriptor } from "./services/hold";
-import { HostedRuntime, RuntimeApp, TenantRuntimes } from "./runtime";
+import {
+  contextFromWire,
+  HostedRuntime,
+  RuntimeApp,
+  TenantRuntimes,
+} from "./runtime";
 import { MountRegistry } from "./mounts";
 import {
   AllowedOrigins,
@@ -56,6 +61,8 @@ import {
 import {
   HostedServiceFactory,
   JsonRecord,
+  LogEntry,
+  LogLevel,
   RuntimeConfiguration,
   RuntimeNotification,
   ServiceConfiguration,
@@ -119,6 +126,8 @@ function tenantKey(owner: string, runtimeId: string): string {
 type WsInboundMessage = {
   type?: string;
   params?: unknown;
+  /** The run this call belongs to, as its caller named it; see ProcessContext. */
+  context?: unknown;
 };
 
 export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
@@ -319,6 +328,29 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
     return runtime.serialize(runtimeOutputUrl(runtime.id));
   }
 
+  /**
+   * Carry a log entry to whoever is collecting this runtime's output.
+   *
+   * The same socket a notification takes, and for the same reason: it is the
+   * connection the board's coordinator already holds, authenticated with a
+   * credential minted to outlive the user's session. An entry differs in what
+   * it is for — a notification is for whoever is watching, an entry has to
+   * survive with nobody attached — but not in how it travels.
+   */
+  function sendJsonLog(socketKey: string, entry: LogEntry) {
+    const sockets = runtimeSockets.get(socketKey);
+    if (!sockets || sockets.size === 0) {
+      return;
+    }
+
+    const message = JSON.stringify({ type: "log", entry });
+    for (const socket of sockets) {
+      if (socket.readyState === WebSocket.OPEN) {
+        socket.send(message);
+      }
+    }
+  }
+
   function sendJsonNotification(
     socketKey: string,
     notification: RuntimeNotification,
@@ -454,6 +486,9 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
       runtime.registerNotificationTarget((notification) => {
         sendJsonNotification(socketKey, notification);
       });
+      runtime.registerLogTarget((entry) => {
+        sendJsonLog(socketKey, entry);
+      });
       runtime.registerResultTarget((result) => {
         const sockets = runtimeSockets.get(socketKey);
         if (!sockets) return;
@@ -538,10 +573,45 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
       return;
     }
 
+    // No context: an external HTTP caller is not continuing a run, it is
+    // starting one.
     const result = runtime.process(req.body, () => {
       // Notifications are broadcast through runtime notification targets.
     });
     res.json(result);
+  });
+
+  /**
+   * Change what a running runtime records, without rebuilding it.
+   *
+   * `logData` is a decision a board revisits — switched on to look into
+   * something, off again afterwards — and re-provisioning to carry it would
+   * restart every service in the runtime to change one boolean. Separate from
+   * POST /runtimes/:id, which processes data rather than configuring anything.
+   */
+  expressApp.patch("/runtimes/:runtimeId/state", (req, res) => {
+    const runtime = getRuntimeOr404(req, res, req.params.runtimeId);
+    if (!runtime) {
+      return;
+    }
+    if (!isJsonRecord(req.body)) {
+      res.sendStatus(400);
+      return;
+    }
+    if (typeof req.body.logging === "boolean") {
+      runtime.setLogging(req.body.logging);
+    }
+    if (isLogLevel(req.body.logLevel)) {
+      runtime.setLogLevel(req.body.logLevel);
+    }
+    if (typeof req.body.logData === "boolean") {
+      runtime.setLogData(req.body.logData);
+    }
+    res.json({
+      logging: runtime.getLogging(),
+      logData: runtime.getLogData(),
+      logLevel: runtime.getLogLevel(),
+    });
   });
 
   expressApp.get("/runtimes/:runtimeId/inputs", (req, res) => {
@@ -820,9 +890,16 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
           if (!runtime) {
             return;
           }
-          const result = runtime.process(message.params, () => {
-            // Notifications are broadcast through runtime notification targets.
-          });
+          const result = runtime.process(
+            message.params,
+            () => {
+              // Notifications are broadcast through runtime notification targets.
+            },
+            // A peer driving this runtime names the run its call belongs to, so
+            // that a board spanning several runtimes reads as one trace rather
+            // than one per runtime.
+            contextFromWire(message.context),
+          );
           sendJsonResult(socket, result);
         }
       });
@@ -879,6 +956,13 @@ function isJsonRecord(value: unknown): value is JsonRecord {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+/** Whether a value is one of the levels a runtime understands. */
+function isLogLevel(value: unknown): value is LogLevel {
+  return (
+    value === "debug" || value === "info" || value === "warn" || value === "error"
+  );
+}
+
 function validateRuntimeConfiguration(
   value: unknown,
 ): RuntimeConfiguration | null {
@@ -908,6 +992,14 @@ function validateRuntimeConfiguration(
       typeof value.boardName === "string" ? value.boardName : undefined,
     // Absent means persist; see RuntimeConfiguration.garbageCollected.
     garbageCollected: value.garbageCollected === true,
+    // Both absent mean off; see RuntimeConfiguration.logging / logData.
+    logging: isJsonRecord(value.state) && value.state.logging === true,
+    logLevel:
+      isJsonRecord(value.state) && isLogLevel(value.state.logLevel)
+        ? value.state.logLevel
+        : undefined,
+    // Absent means allowed; see RuntimeConfiguration.logData.
+    logData: !(isJsonRecord(value.state) && value.state.logData === false),
     services,
   };
 }
