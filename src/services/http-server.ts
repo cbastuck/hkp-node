@@ -306,6 +306,9 @@ export class HttpServerSubservicesService implements HostedService {
     this.releaseMount();
     this.releasePipelineNotifications?.();
     this.releasePipelineNotifications = null;
+    // Nested services hold the same things top-level ones do — timers, sockets,
+    // mounts — and nothing else will ever reach them once this service is gone.
+    this.pipeline?.destroy();
     this.pipeline = null;
     this.pipelineConfig = [];
   }
@@ -525,6 +528,10 @@ export class HttpServerSubservicesService implements HostedService {
 
   private rebuild(): void {
     this.releasePipelineNotifications?.();
+    // The pipeline being replaced is about to become unreachable; its services
+    // keep running until told otherwise. State worth carrying over has already
+    // been read into pipelineConfig by syncStates().
+    this.pipeline?.destroy();
     this.pipeline = new HostedRuntime(
       {
         id: `${this.uuid}:http-sub-runtime`,

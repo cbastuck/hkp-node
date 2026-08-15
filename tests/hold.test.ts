@@ -1,8 +1,8 @@
-import WebSocket from "ws";
 import request from "supertest";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { createRuntimeServer } from "../src/server";
+import { collectNotifications, collectState, flowCount } from "./collectState";
 import { HoldService, holdDescriptor } from "../src/services/hold";
 import { httpServerSubservicesDescriptor } from "../src/services/http-server";
 import { mapDescriptor } from "../src/services/map";
@@ -26,60 +26,6 @@ async function startServer() {
   servers.push(server);
   const { baseUrl } = await server.start();
   return { server, baseUrl };
-}
-
-/**
- * Collects a nested service's reported state off the runtime socket — the
- * channel an attached board watches — until `done` is satisfied.
- */
-function collectState(
-  wsUrl: string,
-  instanceId: string,
-  done: (seen: any[]) => boolean,
-  onOpen: () => void | Promise<void>,
-  timeoutMs = 5000,
-): Promise<any[]> {
-  return new Promise((resolve, reject) => {
-    const socket = new WebSocket(wsUrl);
-    const seen: any[] = [];
-    const timer = setTimeout(() => {
-      socket.close();
-      reject(new Error(`timed out; saw ${JSON.stringify(seen)}`));
-    }, timeoutMs);
-
-    socket.on("message", (raw) => {
-      const message = JSON.parse(raw.toString());
-      if (
-        message.type !== "notification" ||
-        message.instanceId !== instanceId
-      ) {
-        return;
-      }
-      let payload: any;
-      try {
-        payload = JSON.parse(message.value);
-      } catch {
-        return;
-      }
-      if (payload?.__internal) {
-        return;
-      }
-      seen.push(payload);
-      if (done(seen)) {
-        clearTimeout(timer);
-        socket.close();
-        resolve(seen);
-      }
-    });
-
-    socket.on("open", () => {
-      void onOpen();
-    });
-    socket.on("error", (error) => {
-      clearTimeout(timer);
-      reject(error);
-    });
-  });
 }
 
 function makeHold(state: Record<string, unknown>) {
@@ -375,7 +321,42 @@ describe("hold behind an http-server endpoint", () => {
     expect(seen.some((state) => state.writeCount === 1)).toBe(true);
     const last = seen[seen.length - 1];
     expect(last).toMatchObject({ held: 3, readCount: 1, writeCount: 1 });
-    // Each call reports once; a second delivery channel would double these.
-    expect(seen.filter((state) => state.readCount === 1)).toHaveLength(1);
+  });
+
+  it("reports each of a nested service's notifications exactly once", async () => {
+    // Zero means the nested runtime's reports are being dropped; two means they
+    // travel by the host *and* by the callback passed into the pipeline. The
+    // flow (`__internal`) reports are what double, since a service's own state
+    // goes by the host alone.
+    const { server, baseUrl } = await startServer();
+    await request(server.httpServer)
+      .post("/runtimes")
+      .send({
+        id: "rt-1",
+        name: "Node",
+        services: [
+          {
+            serviceId: httpServerSubservicesDescriptor.serviceId,
+            uuid: "http-1",
+            state: {
+              bypass: false,
+              mode: "process_on_session",
+              pipeline: subPipeline(),
+            },
+          },
+        ],
+      })
+      .expect(200);
+
+    const url = await mountUrl(server);
+    const seen = await collectNotifications(
+      `${baseUrl.replace("http", "ws")}/rt-1`,
+      async () => {
+        await fetch(url);
+      },
+    );
+
+    expect(flowCount(seen, "hold-1", "call-process")).toBe(1);
+    expect(flowCount(seen, "hold-1", "call-process-finished")).toBe(1);
   });
 });

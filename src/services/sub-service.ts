@@ -16,6 +16,7 @@ import { HostedRuntime } from "../runtime";
 import {
   HostedService,
   JsonRecord,
+  RuntimeHost,
   ServiceConfiguration,
   ServiceCreator,
   ServiceRegistryEntry,
@@ -45,7 +46,9 @@ export class SubService implements HostedService {
   private bypass = false;
   private pipelineConfig: ServiceConfiguration[] = [];
   private pipeline: HostedRuntime | null = null;
+  private releasePipelineNotifications: (() => void) | null = null;
   private readonly createService: ServiceCreator;
+  private host: RuntimeHost | null = null;
 
   constructor(config: ServiceConfiguration, createService: ServiceCreator) {
     this.uuid = config.uuid;
@@ -54,6 +57,10 @@ export class SubService implements HostedService {
     if (config.state) {
       this.configure(config.state);
     }
+  }
+
+  setHost(host: RuntimeHost): void {
+    this.host = host;
   }
 
   configure(config: JsonRecord): JsonRecord {
@@ -116,7 +123,7 @@ export class SubService implements HostedService {
 
   process(
     input: unknown,
-    notify: (payload: unknown, instanceId?: string) => void,
+    _notify: (payload: unknown, instanceId?: string) => void,
   ): unknown {
     if (
       this.bypass ||
@@ -126,9 +133,18 @@ export class SubService implements HostedService {
       return input;
     }
 
-    return this.pipeline.process(input, (notification) => {
-      notify(notification.payload, notification.instanceId);
-    });
+    // No-op: the nested runtime fans these out to the target registered in
+    // rebuild(). Forwarding them here as well would deliver every one twice.
+    return this.pipeline.process(input, () => {});
+  }
+
+  destroy(): void {
+    this.releasePipelineNotifications?.();
+    this.releasePipelineNotifications = null;
+    // Nested services hold the same things top-level ones do — timers, sockets,
+    // mounts — and nothing else will ever reach them once this service is gone.
+    this.pipeline?.destroy();
+    this.pipeline = null;
   }
 
   private syncStates(): void {
@@ -152,6 +168,11 @@ export class SubService implements HostedService {
   }
 
   private rebuild(): void {
+    this.releasePipelineNotifications?.();
+    // The pipeline being replaced is about to become unreachable; its services
+    // keep running until told otherwise. State worth carrying over has already
+    // been read into pipelineConfig by syncStates().
+    this.pipeline?.destroy();
     this.pipeline = new HostedRuntime(
       {
         id: `${this.uuid}:sub-runtime`,
@@ -161,6 +182,16 @@ export class SubService implements HostedService {
       },
       this.createService,
     );
+
+    // A nested runtime has no notification targets of its own, so what its
+    // services report — a Timer's tick, a Hold's counts — reaches nobody unless
+    // the service hosting the pipeline carries it out to the board. Services
+    // report through their host precisely because it is not always a call they
+    // are answering: an autonomous emitter has no caller to report to.
+    this.releasePipelineNotifications =
+      this.pipeline.registerNotificationTarget((notification) =>
+        this.host?.notify(notification.payload, notification.instanceId),
+      );
   }
 
   private getPipelineState(): SubServiceState["pipeline"] {
