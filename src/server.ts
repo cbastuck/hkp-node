@@ -42,6 +42,20 @@ import {
 } from "./services/smtp-email";
 import { HoldService, holdDescriptor } from "./services/hold";
 import {
+  createFileRecordStore,
+  createMemoryRecordStore,
+  RecordStore,
+} from "./services/recordStore";
+import { StoreService, storeDescriptor } from "./services/store";
+import {
+  DocumentExtractService,
+  documentExtractDescriptor,
+} from "./services/document-extract";
+import {
+  TextGenerationService,
+  textGenerationDescriptor,
+} from "./services/text-generation";
+import {
   contextFromWire,
   HostedRuntime,
   RuntimeApp,
@@ -105,6 +119,21 @@ type CreateRuntimeServerOptions = {
   externalSecure?: boolean;
   host?: string;
   name?: string;
+  /**
+   * Where `store` keeps what boards remember, or a store to use as given.
+   *
+   * Absent means memory: a runtime nobody told where to persist keeps records
+   * for as long as it runs and no longer, which is the honest default for a
+   * server that may be running from a checkout.
+   */
+  recordStore?: RecordStore | string;
+  /**
+   * Keys the derivation of public mount addresses; see MountRegistry.
+   *
+   * Absent draws one per process, so endpoints work but change on restart.
+   * `index.ts` persists one so a webhook configured elsewhere keeps working.
+   */
+  mountSecret?: string;
 };
 
 /** A coordinator session token, bound to the user it was minted for and the
@@ -155,6 +184,16 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
   const externalHost = options.externalHost ?? options.host ?? "127.0.0.1";
   const externalSecure = options.externalSecure ?? false;
   const quotas = options.quotas ?? {};
+  // One store for the whole server; it is the scope handed to each call, not a
+  // store per board, that keeps one board's records out of another's.
+  // An empty path is how "keep nothing on disk" is said, and must not be read
+  // as a root — which would be the working directory.
+  const records: RecordStore =
+    typeof options.recordStore === "string"
+      ? options.recordStore
+        ? createFileRecordStore(options.recordStore)
+        : createMemoryRecordStore()
+      : (options.recordStore ?? createMemoryRecordStore());
 
   /** True when adding one more to `count` would pass the limit (0/unset = no limit). */
   function atQuota(count: number, limit: number | undefined): boolean {
@@ -265,23 +304,47 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
         create: (config, _createService) => new HoldService(config),
       },
     ],
+    [
+      textGenerationDescriptor.serviceId,
+      {
+        descriptor: textGenerationDescriptor,
+        create: (config, _createService) => new TextGenerationService(config),
+      },
+    ],
+    [
+      storeDescriptor.serviceId,
+      {
+        descriptor: storeDescriptor,
+        create: (config, _createService) => new StoreService(config, records),
+      },
+    ],
+    [
+      documentExtractDescriptor.serviceId,
+      {
+        descriptor: documentExtractDescriptor,
+        create: (config, _createService) => new DocumentExtractService(config),
+      },
+    ],
   ]);
 
   // Public service endpoints. Declared before the runtime app because runtimes
   // hand mounts to their services as they are created.
-  const mounts = new MountRegistry((mountPath) => {
-    const address = httpServer.address();
-    if (!address || typeof address === "string") {
-      return undefined;
-    }
-    return externalSecure
-      ? `https://${externalHost}${mountPath}`
-      : `http://${externalHost}:${address.port}${mountPath}`;
-  });
+  const mounts = new MountRegistry(
+    (mountPath) => {
+      const address = httpServer.address();
+      if (!address || typeof address === "string") {
+        return undefined;
+      }
+      return externalSecure
+        ? `https://${externalHost}${mountPath}`
+        : `http://${externalHost}:${address.port}${mountPath}`;
+    },
+    options.mountSecret,
+  );
 
   const runtimeApp = new RuntimeApp(factories, (owner, runtimeId) => ({
-    mount: (serviceUuid, handlers) =>
-      mounts.register(owner, runtimeId, serviceUuid, handlers),
+    mount: (serviceUuid, handlers, options) =>
+      mounts.register(owner, runtimeId, serviceUuid, handlers, options),
   }));
   const expressApp = express();
   expressApp.use(

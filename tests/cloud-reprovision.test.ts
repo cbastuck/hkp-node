@@ -97,11 +97,14 @@ describe("posting a runtime id that already exists", () => {
 
     await provision(server, "rt-1", [endpointService]);
 
-    // A mount path is assigned per registration, so a new address is how you
-    // can tell the runtime was rebuilt rather than handed back.
+    // The address is derived from what identifies the mount, so rebuilding
+    // reproduces it. What proves the rebuild is that the endpoint still
+    // answers after the old runtime was destroyed.
     const second = await publishedMount(server, "rt-1");
-    expect(second).not.toBe(first);
-    expect((await fetch(first)).status).toBe(404);
+    // Same address, and it answers: a rebuilt runtime re-derives the endpoint
+    // it had rather than being handed a new one. Anything outside pointing at
+    // it — a webhook configured in somebody else's product — keeps working.
+    expect(second).toBe(first);
     expect((await fetch(second)).status).toBe(200);
   });
 

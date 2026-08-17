@@ -1,14 +1,53 @@
 #!/usr/bin/env node
 // Copyright (c) 2026 cbastuck
 // SPDX-License-Identifier: AGPL-3.0-only
+import fs from "fs";
 import os from "os";
 import path from "path";
+import { randomBytes } from "crypto";
 import { config as loadEnv } from "dotenv";
 import { createRuntimeServer } from "./server";
 import { BoardCoordinator, createCoordinatorRouter } from "./coordinator";
 import { createFileBoardStore } from "./coordinator/fileBoardStore";
 import { createFileLogStore } from "./coordinator/logStore";
 import { AllowedOrigins, AuthConfig, isLoopbackHost } from "./auth";
+
+/**
+ * The key public mount addresses are derived from.
+ *
+ * Taken from the environment where there is one, so a deployment can hold it
+ * with its other secrets and several instances behind a load balancer agree on
+ * the addresses they serve. Otherwise drawn once and kept beside the rest of
+ * this runtime's data, because the alternative — a fresh key per start — is
+ * what makes an endpoint configured in somebody else's product stop working
+ * after a restart.
+ */
+function resolveMountSecret(): string {
+  if (process.env.HKP_MOUNT_SECRET) {
+    return process.env.HKP_MOUNT_SECRET;
+  }
+  const file = path.join(os.homedir(), ".hkp", "node", "mount-secret");
+  try {
+    const existing = fs.readFileSync(file, "utf8").trim();
+    if (existing) {
+      return existing;
+    }
+  } catch {
+    // Not written yet, which is the first start on this machine.
+  }
+  const secret = randomBytes(32).toString("hex");
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(file, `${secret}\n`, { mode: 0o600 });
+  } catch (err) {
+    console.warn(
+      "[hkp-node] Could not persist the mount secret, so public endpoint " +
+        "addresses will change on restart:",
+      err instanceof Error ? err.message : err,
+    );
+  }
+  return secret;
+}
 
 async function main() {
   if (!process.env.SKIP_LOADING_ENV) {
@@ -30,6 +69,16 @@ async function main() {
     externalSecure,
     host,
     name: process.env.NAME ?? "hkp-node",
+    // Keeps public endpoint addresses the same across restarts; see
+    // MountRegistry. Without a stable key every restart hands every webhook
+    // configured elsewhere a dead URL.
+    mountSecret: resolveMountSecret(),
+    // What boards remember between runs. On by default, because a `store` that
+    // silently forgot everything on restart would be worse than one that is not
+    // there: HKP_STORE_DIR="" keeps records in memory instead.
+    recordStore:
+      process.env.HKP_STORE_DIR ??
+      path.join(os.homedir(), ".hkp", "node", "store"),
     quotas: {
       maxRuntimesPerUser: readInteger(process.env.HKP_MAX_RUNTIMES_PER_USER, 0),
       maxServicesPerRuntime: readInteger(
@@ -153,6 +202,13 @@ async function main() {
   }
 
   const address = await server.start(port, host);
+  const storeDir =
+    process.env.HKP_STORE_DIR ?? path.join(os.homedir(), ".hkp", "node", "store");
+  console.log(
+    storeDir
+      ? `hkp-node board store: ${storeDir}`
+      : "hkp-node board store: in memory (records are lost on restart)",
+  );
   console.log(`hkp-node listening on ${address.baseUrl}`);
 }
 

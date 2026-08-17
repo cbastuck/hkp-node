@@ -65,6 +65,7 @@ export class SubService implements HostedService {
     // A pipeline built in the constructor was built before there was a host to
     // ask, so what the board records reaches it here rather than never.
     this.applyLogSettings();
+    this.applyScope();
   }
 
   /** Hands the board's log settings to the nested pipeline, if there is one. */
@@ -75,6 +76,21 @@ export class SubService implements HostedService {
     }
     this.pipeline.setLogging(settings.logging);
     this.pipeline.setLogData(settings.logData);
+  }
+
+  /**
+   * Hands the tenant and board down to the nested pipeline.
+   *
+   * A pipeline this service builds knows neither, so a service inside it that
+   * keeps something durable would otherwise store it outside the board it
+   * belongs to — and outside its tenant, which is worse. Nesting changes where
+   * a service sits, not who it answers to.
+   */
+  private applyScope(): void {
+    const scope = this.host?.scope();
+    if (scope && this.pipeline) {
+      this.pipeline.setScope(scope);
+    }
   }
 
   configure(config: JsonRecord): JsonRecord {
@@ -224,6 +240,7 @@ export class SubService implements HostedService {
     );
 
     this.applyLogSettings();
+    this.applyScope();
   }
 
   private getPipelineState(): SubServiceState["pipeline"] {

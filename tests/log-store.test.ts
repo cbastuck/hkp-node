@@ -146,6 +146,8 @@ describe("log store", () => {
       // rotation rather than one roll racing forty appends.
       await new Promise((resolve) => setTimeout(resolve, 2));
     }
+    // Closing waits for a roll still in flight, so what is on disk after this
+    // is settled rather than caught mid-rename.
     await settle(log);
 
     const names = (await fs.readdir(path.join(root, "u1"))).sort();
@@ -169,8 +171,6 @@ describe("log store", () => {
       log.append("u1", "board", entry({ event: `e${n}` }));
       await new Promise((resolve) => setTimeout(resolve, 2));
     }
-    // A roll may still be renaming; reading mid-rename would see neither name.
-    await new Promise((resolve) => setTimeout(resolve, 30));
     await settle(log);
 
     const entries = await log.read("u1", "board");

@@ -11,10 +11,12 @@ import {
   RuntimeDescriptor,
   RuntimeHost,
   RuntimeNotification,
+  RuntimeScope,
   ServiceCreator,
   ServiceConfiguration,
   ServiceDescriptor,
 } from "./types";
+import { ANONYMOUS_SUB } from "./auth";
 import { MountHandle, MountHandlers } from "./mounts";
 
 /** Severity order, so a runtime can drop anything below what it records. */
@@ -73,13 +75,19 @@ export function childRun(parent: ProcessContext | null): ProcessContext {
  * not addressable from outside.
  */
 export type RuntimeMounts = {
-  mount(serviceUuid: string, handlers: MountHandlers): MountHandle | null;
+  mount(
+    serviceUuid: string,
+    handlers: MountHandlers,
+    options?: { boardName?: string; mountName?: string },
+  ): MountHandle | null;
 };
 
 export class HostedRuntime implements RuntimeHost {
   readonly id: string;
   readonly name: string;
-  readonly boardName: string;
+  boardName: string;
+  /** The tenant this runtime answers to; see RuntimeScope. */
+  private owner: string;
   /** See RuntimeConfiguration.garbageCollected. Absent means persist. */
   readonly garbageCollected: boolean;
 
@@ -107,9 +115,14 @@ export class HostedRuntime implements RuntimeHost {
     config: RuntimeConfiguration,
     createService: (config: ServiceConfiguration) => HostedService,
     mounts?: RuntimeMounts,
+    // Known only to whoever resolved the caller, so it is passed in rather than
+    // read from the config a client sent. Absent collapses to the single tenant
+    // an unauthenticated server already uses.
+    owner: string = ANONYMOUS_SUB,
   ) {
     this.id = config.id;
     this.name = config.name;
+    this.owner = owner;
     this.boardName = config.boardName ?? "";
     this.garbageCollected = config.garbageCollected === true;
     this.logData = config.logData !== false;
@@ -406,6 +419,23 @@ export class HostedRuntime implements RuntimeHost {
     };
   }
 
+  scope(): RuntimeScope {
+    return { owner: this.owner, boardName: this.boardName };
+  }
+
+  /**
+   * Adopt the scope of the runtime around this one.
+   *
+   * A nested pipeline is built by the service hosting it, which knows neither
+   * tenant nor board — so a runtime created that way starts anonymous, and
+   * anything it stores would land beside every other anonymous board's. The
+   * host hands it the scope once there is one to hand.
+   */
+  setScope(scope: RuntimeScope): void {
+    this.owner = scope.owner;
+    this.boardName = scope.boardName;
+  }
+
   setLogLevel(level: LogLevel): void {
     this.logLevel = level;
   }
@@ -422,8 +452,19 @@ export class HostedRuntime implements RuntimeHost {
     return this.logging;
   }
 
-  mount(serviceUuid: string, handlers: MountHandlers): MountHandle | null {
-    return this.mounts?.mount(serviceUuid, handlers) ?? null;
+  mount(
+    serviceUuid: string,
+    handlers: MountHandlers,
+    options: { mountName?: string } = {},
+  ): MountHandle | null {
+    // The board comes from the runtime, not from the service: a mount's address
+    // is derived from where it sits, and a service does not know that.
+    return (
+      this.mounts?.mount(serviceUuid, handlers, {
+        boardName: this.boardName,
+        mountName: options.mountName,
+      }) ?? null
+    );
   }
 
   // ──────────────────────────────────────────────────────────────────────────
@@ -608,6 +649,7 @@ export class RuntimeApp {
       config,
       (serviceConfig) => this.createService(serviceConfig),
       this.mountsFor?.(owner, config.id),
+      owner,
     );
     owned.set(runtime.id, runtime);
     return runtime;

@@ -155,6 +155,8 @@ function filenameFromDisposition(
 type HttpServerSubservicesState = JsonRecord & {
   bypass: boolean;
   mode: HttpServerMode;
+  /** Name this endpoint is known by; see the field on the service. */
+  mountName: string;
   /** Public endpoint assigned by the runtime; empty while bypassed. Reserved
    *  name: generic board machinery reads and rewrites it (see the frontend's
    *  runtime/board/mount). */
@@ -174,6 +176,12 @@ export class HttpServerSubservicesService implements HostedService {
 
   private bypass = true;
   private mode: HttpServerMode = "process_on_session";
+  /**
+   * What this endpoint is called, which is what its public address is derived
+   * from. Empty falls back to the service's uuid, which is stable in a board
+   * file too — so an address only changes when a board deliberately renames it.
+   */
+  private mountName = "";
   private latestData: unknown = null;
 
   private mount: MountHandle | null = null;
@@ -200,12 +208,21 @@ export class HttpServerSubservicesService implements HostedService {
   }
 
   configure(config: JsonRecord): JsonRecord {
-    const previousBypass = this.bypass;
-
     // `port` is accepted and ignored: the endpoint is served by the shared
     // runtime server under an assigned path, so a service no longer picks a
     // port. Older boards still carry the field, and rejecting it would fail
     // them on load for a setting that no longer means anything.
+
+    if (typeof config.mountName === "string") {
+      // Renaming rotates this endpoint's address, so an already-claimed mount
+      // is released and claimed again under the new name rather than left
+      // answering on the old one.
+      const renamed = config.mountName !== this.mountName;
+      this.mountName = config.mountName;
+      if (renamed && this.mount) {
+        this.releaseMount();
+      }
+    }
 
     if (
       config.mode === "process_on_session" ||
@@ -257,7 +274,10 @@ export class HttpServerSubservicesService implements HostedService {
       }
     }
 
-    if (previousBypass && !this.bypass && !this.mount) {
+    // Anything above may have left this without an endpoint it should have —
+    // coming out of bypass, or a rename that released the old address. One
+    // check covers them rather than one per cause.
+    if (!this.bypass && !this.mount) {
       this.claimMount();
     }
 
@@ -268,6 +288,7 @@ export class HttpServerSubservicesService implements HostedService {
     const state: HttpServerSubservicesState = {
       bypass: this.bypass,
       mode: this.mode,
+      mountName: this.mountName,
       __hkpMount: this.mount?.url ?? "",
       pipeline: this.getPipelineState(),
     };
@@ -282,6 +303,28 @@ export class HttpServerSubservicesService implements HostedService {
     if (!this.bypass && !this.mount) {
       this.claimMount();
     }
+    // A pipeline built in the constructor was built before there was a host to
+    // ask what board it belongs to.
+    this.adoptHostScope();
+  }
+
+  /**
+   * Hands the tenant, board, and log settings down to the nested pipeline.
+   *
+   * A pipeline this service builds knows none of them — it is created with an
+   * id of its own and nothing else — so without this a service inside it that
+   * keeps something durable would store it against an empty board name,
+   * separately from the very same service sitting beside this one. Handling a
+   * request changes where a service runs, not which board it belongs to.
+   */
+  private adoptHostScope(): void {
+    if (!this.pipeline || !this.host) {
+      return;
+    }
+    this.pipeline.setScope(this.host.scope());
+    const settings = this.host.logSettings();
+    this.pipeline.setLogging(settings.logging);
+    this.pipeline.setLogData(settings.logData);
   }
 
   process(
@@ -322,11 +365,15 @@ export class HttpServerSubservicesService implements HostedService {
       return;
     }
 
-    this.mount = this.host.mount(this.uuid, {
-      request: (req, res, context) => {
-        void this.handleRequest(req, res, context);
+    this.mount = this.host.mount(
+      this.uuid,
+      {
+        request: (req, res, context) => {
+          void this.handleRequest(req, res, context);
+        },
       },
-    });
+      { mountName: this.mountName },
+    );
 
     // A board reads the assigned endpoint from here (or from state), since it
     // is not knowable at design time.
@@ -554,6 +601,7 @@ export class HttpServerSubservicesService implements HostedService {
 
   private rebuild(): void {
     this.releasePipelineNotifications?.();
+    this.releasePipelineLogs?.();
     // The pipeline being replaced is about to become unreachable; its services
     // keep running until told otherwise. State worth carrying over has already
     // been read into pipelineConfig by syncStates().
@@ -577,6 +625,15 @@ export class HttpServerSubservicesService implements HostedService {
       this.pipeline.registerNotificationTarget((notification) =>
         this.notify(notification.payload, notification.instanceId),
       );
+
+    // A nested pipeline's entries belong to the same board log as everything
+    // else; only the runtime hosting this service can carry them there, since a
+    // nested runtime has no route out of its own.
+    this.releasePipelineLogs = this.pipeline.registerLogTarget((entry) =>
+      this.host?.forwardLog(entry),
+    );
+
+    this.adoptHostScope();
   }
 
   private getPipelineState(): HttpServerSubservicesState["pipeline"] {

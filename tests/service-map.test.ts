@@ -36,6 +36,9 @@ function createHost(): RecordingHost {
     logSettings() {
       return { logging: false, logData: false, logLevel: "info" as const };
     },
+    scope() {
+      return { owner: "tester", boardName: "Board" };
+    },
     notify(payload: unknown, instanceId: string) {
       host.notifications.push({ instanceId, payload });
     },

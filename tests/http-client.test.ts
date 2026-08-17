@@ -65,6 +65,7 @@ function hostSpy() {
     log: () => {},
     forwardLog: () => {},
     logSettings: () => ({ logging: false, logData: false, logLevel: "info" as const }),
+    scope: () => ({ owner: "tester", boardName: "Board" }),
     emitResult: (output) => {
       emitted.push(output);
     },

@@ -161,9 +161,10 @@ describe("a coordinator that has been restarted", () => {
       .expect(200);
     expect(body.runtimes.map((rt: { id: string }) => rt.id)).toEqual(["node"]);
     expect(second.getBoards("user-1")[0].status).toBe("running");
-    // The old mount went with the runtime it belonged to; the new one answers.
-    expect((await fetch(orphaned)).status).toBe(404);
-    expect((await fetch(await publishedMount(server))).status).toBe(200);
+    // The rebuilt runtime derives the same address, so what was configured
+    // against the orphan still reaches the board that replaced it.
+    expect(await publishedMount(server)).toBe(orphaned);
+    expect((await fetch(orphaned)).status).toBe(200);
   });
 
   it("does not bring back a board that was deleted", async () => {

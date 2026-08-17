@@ -120,6 +120,19 @@ export type RuntimeNotification = {
 };
 
 /**
+ * The tenant and board a runtime belongs to.
+ *
+ * Board rather than runtime, because a board is the unit a person thinks in:
+ * two runtimes of one board are two halves of one app, and something one half
+ * stored is something the other half should find.
+ */
+export type RuntimeScope = {
+  /** The authenticated `sub`, or ANONYMOUS_SUB where auth is off. */
+  owner: string;
+  boardName: string;
+};
+
+/**
  * What travels with a process call rather than with the data it carries.
  *
  * The ordered service list says what runs; this says which invocation it is
@@ -231,6 +244,17 @@ export interface RuntimeHost {
    */
   logSettings(): { logging: boolean; logData: boolean; logLevel: LogLevel };
   /**
+   * Who this runtime belongs to and which board it is part of.
+   *
+   * For a service that keeps something between calls: this server is
+   * multi-tenant and runtimes are namespaced by the authenticated `sub`, so
+   * anything durable has to be namespaced the same way or one tenant's data
+   * becomes another's. A service cannot work that out for itself — it is told
+   * its own configuration and nothing about who asked for it — which is why it
+   * comes from the host rather than from state.
+   */
+  scope(): RuntimeScope;
+  /**
    * Claim a publicly reachable endpoint served by the shared server, for a
    * service that needs to be called from outside (an HTTP endpoint, a
    * signalling server). Returns null when the host cannot serve mounts — an
@@ -238,5 +262,9 @@ export interface RuntimeHost {
    * which case the service has no public endpoint and should say so in its
    * state rather than falling back to a port of its own.
    */
-  mount?(serviceUuid: string, handlers: MountHandlers): MountHandle | null;
+  mount?(
+    serviceUuid: string,
+    handlers: MountHandlers,
+    options?: { mountName?: string },
+  ): MountHandle | null;
 }

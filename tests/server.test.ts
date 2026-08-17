@@ -16,6 +16,9 @@ import { telegramListenerDescriptor } from "../src/services/telegram-listener";
 import { telegramSenderDescriptor } from "../src/services/telegram-sender";
 import { smtpEmailDescriptor } from "../src/services/smtp-email";
 import { holdDescriptor } from "../src/services/hold";
+import { textGenerationDescriptor } from "../src/services/text-generation";
+import { storeDescriptor } from "../src/services/store";
+import { documentExtractDescriptor } from "../src/services/document-extract";
 
 describe("hkp-node runtime server", () => {
   const server = createRuntimeServer({ externalHost: "127.0.0.1" });
@@ -59,6 +62,9 @@ describe("hkp-node runtime server", () => {
       telegramSenderDescriptor,
       smtpEmailDescriptor,
       holdDescriptor,
+      textGenerationDescriptor,
+      storeDescriptor,
+      documentExtractDescriptor,
     ]);
     expect(response.body.runtimes).toHaveLength(1);
     expect(response.body.runtimes[0]).toMatchObject({

@@ -133,7 +133,11 @@ export function createFileLogStore(
   const streams = new Map<string, WriteStream>();
   // Bytes in the live file, so a roll does not need a stat per entry.
   const writtenBytes = new Map<string, number>();
-  const rotating = new Set<string>();
+  // Rolls still running, kept as their promises rather than as a flag: a roll
+  // takes its stream out of `streams` before it starts renaming, so anything
+  // waiting for writes to settle would otherwise see nothing to wait for and
+  // return while the file was still being moved.
+  const rotations = new Map<string, Promise<void>>();
 
   const dirFor = (userId: string) => path.join(root, safeName(userId));
   const fileFor = (userId: string, boardName: string) =>
@@ -208,11 +212,10 @@ export function createFileLogStore(
       stream.write(line);
       writtenBytes.set(file, written);
 
-      if (written >= maxBytes && !rotating.has(file)) {
+      if (written >= maxBytes && !rotations.has(file)) {
         // One roll at a time per board: append is synchronous for the caller,
         // so a second one arriving mid-roll must not start another.
-        rotating.add(file);
-        void rotate(userId, boardName)
+        const running = rotate(userId, boardName)
           .catch((err) =>
             console.error(
               `[coordinator] Log rotation failed for "${boardName}":`,
@@ -221,8 +224,9 @@ export function createFileLogStore(
           )
           .finally(() => {
             writtenBytes.set(file, 0);
-            rotating.delete(file);
+            rotations.delete(file);
           });
+        rotations.set(file, running);
       }
     },
 
@@ -306,12 +310,19 @@ export function createFileLogStore(
 
     async remove(userId, boardName) {
       const file = fileFor(userId, boardName);
+      // A roll in flight is about to rename this file into place behind it;
+      // deleting first would leave that rename to recreate what was removed.
+      await rotations.get(file);
       streams.get(file)?.end();
       streams.delete(file);
       await fs.rm(file, { force: true });
     },
 
     async close() {
+      // Rolls first: each one ends its own stream and then renames, so a close
+      // that only ended the streams it can see would return with a file half
+      // moved — the state a coordinator would come back up on.
+      await Promise.all([...rotations.values()]);
       await Promise.all(
         [...streams.values()].map(
           (stream) =>
