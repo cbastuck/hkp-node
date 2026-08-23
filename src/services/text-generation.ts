@@ -4,9 +4,10 @@
  * Service Name: Text Generation
  * Runtime: hkp-node
  * Modes: none (the backend is configuration, not a mode)
- * Key Config: backend (anthropic), apiKey (write-only), baseUrl, model,
- *             systemPrompt, temperature, topP, topK, maxTokens, timeoutSec,
- *             stream, thinking, thinkingBudgetTokens, jsonSchema
+ * Key Config: backend (anthropic|server), apiKey (write-only), baseUrl
+ *             (anthropic), serverUrl (server), model, systemPrompt,
+ *             temperature, topP, topK, maxTokens, timeoutSec, stream,
+ *             thinking, thinkingBudgetTokens, jsonSchema
  * IO: in=String (the prompt) or JSON ({prompt} | {text} | {messages: [...]}),
  *     optionally carrying images ({meta, binary} | {images: [...]})
  *     out=null immediately; the result is pushed through the rest of the
@@ -16,12 +17,24 @@
  *
  * The node implementation of the `text-generation` concept hkp-python and
  * hkp-rt also provide, sharing their state contract and output shape so a board
- * can move the service between runtimes and keep its UI panel. Those two run
- * models locally; this one calls a hosted API, which is what makes it the one
- * that works on a board deployed to a coordinator with nobody watching.
+ * can move the service between runtimes and keep its UI panel.
  *
- * Three things this adds, all of which the local backends have no equivalent
- * for:
+ * Two backends, and which one a board wants is a question of where the model
+ * is:
+ *
+ *   - `anthropic` calls a hosted API. The one that works on a board deployed to
+ *     a coordinator with nobody watching, since there is no model to run.
+ *   - `server` talks to an OpenAI-compatible server on the same machine
+ *     (llama-server, Ollama, vLLM, LM Studio), the same backend hkp-python and
+ *     hkp-rt spell `server` — so a board can be developed against a local model
+ *     and deployed against a hosted one by changing two fields.
+ *
+ * Node cannot load a GGUF in-process the way those two can, which is why there
+ * is no `local` here: on this runtime, local means a server next door.
+ *
+ * Three things `anthropic` adds, which the local backends have no equivalent
+ * for — except `jsonSchema`, which `server` carries too where the server
+ * implements it (llama.cpp does, by turning the schema into a grammar):
  *
  *   - `jsonSchema` constrains the answer to a shape. Sent as a single forced
  *     tool, which is the API's own mechanism for it, and the parsed object is
@@ -53,10 +66,12 @@ export const textGenerationDescriptor: ServiceRegistryEntry = {
   capabilities: [],
 };
 
-/** Backends this runtime can talk to. A list of one, so adding is one entry. */
-const BACKENDS = ["anthropic"];
+/** Backends this runtime can talk to. */
+const BACKENDS = ["anthropic", "server"];
 
 const DEFAULT_BASE_URL = "https://api.anthropic.com";
+/** Where llama-server and friends listen by default; the port hkp-python uses. */
+const DEFAULT_SERVER_URL = "http://127.0.0.1:8081";
 const DEFAULT_MODEL = "claude-sonnet-5";
 const DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant";
 const DEFAULT_TEMPERATURE = 0.7;
@@ -78,6 +93,10 @@ const ANTHROPIC_VERSION = "2023-06-01";
  * instruction rather than as an internal identifier.
  */
 const SCHEMA_TOOL_NAME = "respond";
+
+/** Reasoning inline in the answer, which is how some chat templates emit it. */
+const THINK_OPEN = "<think>";
+const THINK_CLOSE = "</think>";
 
 /** Notifications are throttled to this, which is plenty for a live view. */
 const STREAM_NOTIFY_INTERVAL_MS = 50;
@@ -122,6 +141,7 @@ export class TextGenerationService implements HostedService {
   private backend = "anthropic";
   private apiKey = "";
   private baseUrl = DEFAULT_BASE_URL;
+  private serverUrl = DEFAULT_SERVER_URL;
   private model = DEFAULT_MODEL;
   private systemPrompt = DEFAULT_SYSTEM_PROMPT;
   private temperature = DEFAULT_TEMPERATURE;
@@ -162,6 +182,7 @@ export class TextGenerationService implements HostedService {
       apiKey: "",
       apiKeyConfigured: this.resolveKey().length > 0,
       baseUrl: this.baseUrl,
+      serverUrl: this.serverUrl,
       model: this.model,
       systemPrompt: this.systemPrompt,
       temperature: this.temperature,
@@ -189,6 +210,9 @@ export class TextGenerationService implements HostedService {
     }
     if (typeof config.baseUrl === "string" && config.baseUrl) {
       this.baseUrl = config.baseUrl.replace(/\/+$/, "");
+    }
+    if (typeof config.serverUrl === "string" && config.serverUrl) {
+      this.serverUrl = config.serverUrl.replace(/\/+$/, "");
     }
     if (typeof config.model === "string" && config.model) {
       this.model = config.model;
@@ -268,7 +292,9 @@ export class TextGenerationService implements HostedService {
     }
 
     const key = this.resolveKey();
-    if (!key) {
+    // A server next door is reached by address, not by credential — only the
+    // hosted API has one to be missing.
+    if (!key && this.backend === "anthropic") {
       return this.fail(
         notify,
         "no API key — configure apiKey, or set ANTHROPIC_API_KEY where this runtime runs",
@@ -294,7 +320,35 @@ export class TextGenerationService implements HostedService {
 
   /** The configured key, or the environment's when none was configured. */
   private resolveKey(): string {
+    // The environment's key belongs to the hosted API. A `server` board names
+    // its own address, so falling back here would hand that credential to
+    // whatever is listening there — the key is used only if a board set one.
+    if (this.backend === "server") {
+      return this.apiKey;
+    }
     return this.apiKey || process.env.ANTHROPIC_API_KEY || "";
+  }
+
+  private endpoint(): string {
+    return this.backend === "server"
+      ? `${this.serverUrl}/v1/chat/completions`
+      : `${this.baseUrl}/v1/messages`;
+  }
+
+  private headers(apiKey: string): Record<string, string> {
+    if (this.backend === "server") {
+      // A local server usually wants no credential at all; the ones that do
+      // take a bearer token.
+      return {
+        "content-type": "application/json",
+        ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+      };
+    }
+    return {
+      "content-type": "application/json",
+      "x-api-key": apiKey,
+      "anthropic-version": ANTHROPIC_VERSION,
+    };
   }
 
   private async generate(
@@ -311,33 +365,55 @@ export class TextGenerationService implements HostedService {
     this.setStatus(notify, "generating");
     const started = Date.now();
 
+    const server = this.backend === "server";
+
     try {
-      const response = await fetch(`${this.baseUrl}/v1/messages`, {
+      const response = await fetch(this.endpoint(), {
         method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "x-api-key": apiKey,
-          "anthropic-version": ANTHROPIC_VERSION,
-        },
-        body: JSON.stringify(this.requestBody(messages)),
+        headers: this.headers(apiKey),
+        body: JSON.stringify(
+          server ? this.serverRequestBody(messages) : this.requestBody(messages),
+        ),
         signal: controller.signal,
       });
 
       if (!response.ok) {
         const detail = (await response.text()).slice(0, 400);
-        this.fail(notify, `API returned HTTP ${response.status}: ${detail}`);
+        this.fail(
+          notify,
+          `${server ? "server" : "API"} returned HTTP ${response.status}: ${detail}`,
+        );
         return;
       }
 
       const message = this.streaming()
-        ? await this.readStream(response, notify)
+        ? await (server
+            ? this.readServerStream(response, notify)
+            : this.readStream(response, notify))
         : ((await response.json()) as JsonRecord);
 
-      const result = this.toResult(message, started);
+      const result = server
+        ? this.toServerResult(message, started)
+        : this.toResult(message, started);
       this.setStatus(notify, "idle");
       notify(result);
       this.push(result, notify, context);
     } catch (err) {
+      if (
+        server &&
+        err instanceof Error &&
+        err.name !== "AbortError" &&
+        !(err instanceof SyntaxError)
+      ) {
+        // "fetch failed" says nothing about what to do; a board pointed at a
+        // server nobody started is by far the likeliest way to get here.
+        this.fail(
+          notify,
+          `no OpenAI-compatible server reachable at ${this.serverUrl} — start one, e.g.: ` +
+            `llama-server -m model.gguf --port ${port(this.serverUrl)}`,
+        );
+        return;
+      }
       const reason =
         err instanceof Error && err.name === "AbortError"
           ? `no answer within ${this.timeoutSec}s`
@@ -403,6 +479,160 @@ export class TextGenerationService implements HostedService {
       body.tool_choice = { type: "tool", name: SCHEMA_TOOL_NAME };
     }
     return body;
+  }
+
+  /**
+   * The same call, in the shape an OpenAI-compatible server expects.
+   *
+   * The differences from `requestBody` are all vocabulary rather than meaning:
+   * the system prompt is a message rather than a parameter, sampling is
+   * snake_case, and a schema is asked for as a response format rather than as
+   * a forced tool. `top_k` and `chat_template_kwargs` are llama-server
+   * extensions, sent the way hkp-python sends them so one board configuration
+   * drives either runtime.
+   */
+  private serverRequestBody(messages: Message[]): JsonRecord {
+    const body: JsonRecord = {
+      messages: this.withSystemPrompt(messages).map(openAiMessage),
+      temperature: this.temperature,
+      top_p: this.topP,
+      top_k: this.topK,
+      max_tokens: this.maxTokens,
+      stream: this.streaming(),
+    };
+    if (this.model) {
+      body.model = this.model;
+    }
+    if (this.thinking !== null) {
+      // Only sent when a board said something, so a server whose template does
+      // not know the flag never sees it.
+      body.chat_template_kwargs = { enable_thinking: this.thinking };
+    }
+    if (this.jsonSchema) {
+      body.response_format = {
+        type: "json_schema",
+        json_schema: {
+          name: SCHEMA_TOOL_NAME,
+          schema: this.jsonSchema,
+          strict: true,
+        },
+      };
+    }
+    return body;
+  }
+
+  /** A system prompt travels as a message here, and only if there isn't one. */
+  private withSystemPrompt(messages: Message[]): Message[] {
+    if (!this.systemPrompt || messages.some((m) => m?.role === "system")) {
+      return messages;
+    }
+    return [{ role: "system", content: this.systemPrompt }, ...messages];
+  }
+
+  /** Reduces a chat-completions response to the shared output contract. */
+  private toServerResult(response: JsonRecord, started: number): Result {
+    const choices = Array.isArray(response.choices)
+      ? (response.choices as JsonRecord[])
+      : [];
+    const message = (choices[0]?.message ?? {}) as JsonRecord;
+    const { text, thinking } = splitThinking(
+      typeof message.content === "string" ? message.content : "",
+      typeof message.reasoning_content === "string"
+        ? message.reasoning_content
+        : "",
+    );
+
+    const usage = (response.usage ?? {}) as JsonRecord;
+    const result: Result = {
+      text,
+      model: typeof response.model === "string" ? response.model : this.model,
+      durationMs: Date.now() - started,
+      usage: {
+        promptTokens: isNumber(usage.prompt_tokens) ? usage.prompt_tokens : 0,
+        completionTokens: isNumber(usage.completion_tokens)
+          ? usage.completion_tokens
+          : 0,
+      },
+    };
+    if (thinking) {
+      result.thinking = thinking;
+    }
+    if (this.jsonSchema) {
+      try {
+        result.json = JSON.parse(text);
+      } catch {
+        // A server that does not implement response_format answers in prose
+        // and reports nothing unusual, so this is the only place it shows.
+        // The text is still emitted: a board that logs it can see what came
+        // back, which is what tells the difference from an empty answer.
+        this.host?.log("warn", "service.degraded", {
+          message:
+            "answer did not parse as JSON — this server may not implement " +
+            "response_format: json_schema",
+        });
+      }
+    }
+    return result;
+  }
+
+  /**
+   * Accumulates a streamed chat-completions response into the shape the
+   * non-streamed path produces, notifying `{streamText}` on the way — the same
+   * shape the anthropic path and hkp-python both use, so one UI renders any of
+   * them.
+   */
+  private async readServerStream(
+    response: Response,
+    notify: Notify,
+  ): Promise<JsonRecord> {
+    let text = "";
+    let thinking = "";
+    let model = this.model;
+    let promptTokens = 0;
+    let completionTokens = 0;
+    let lastNotifiedAt = 0;
+
+    for await (const event of readEvents(response)) {
+      if (typeof event.model === "string") {
+        model = event.model;
+      }
+      // Sent on the final chunk when the server was asked for usage, and
+      // absent otherwise; either way the last one seen is the total.
+      const usage = (event.usage ?? {}) as JsonRecord;
+      if (isNumber(usage.prompt_tokens)) {
+        promptTokens = usage.prompt_tokens;
+      }
+      if (isNumber(usage.completion_tokens)) {
+        completionTokens = usage.completion_tokens;
+      }
+
+      const choices = Array.isArray(event.choices)
+        ? (event.choices as JsonRecord[])
+        : [];
+      const delta = (choices[0]?.delta ?? {}) as JsonRecord;
+      if (typeof delta.reasoning_content === "string") {
+        thinking += delta.reasoning_content;
+      }
+      if (typeof delta.content === "string" && delta.content) {
+        text += delta.content;
+        const now = Date.now();
+        if (now - lastNotifiedAt >= STREAM_NOTIFY_INTERVAL_MS) {
+          lastNotifiedAt = now;
+          notify({ streamText: text });
+        }
+      }
+    }
+
+    notify({ streamText: text, streamDone: true });
+
+    return {
+      model,
+      choices: [{ message: { content: text, reasoning_content: thinking } }],
+      usage: {
+        prompt_tokens: promptTokens,
+        completion_tokens: completionTokens,
+      },
+    };
   }
 
   /**
@@ -641,6 +871,63 @@ export class TextGenerationService implements HostedService {
     this.host?.log("error", "service.failed", { message: error });
     notify({ error });
     return null;
+  }
+}
+
+/**
+ * One message, in OpenAI vocabulary.
+ *
+ * Text and role are the same on both sides; only images differ — a base64
+ * source becomes a data URI, which is how that API carries the same bytes.
+ */
+function openAiMessage(message: Message): JsonRecord {
+  if (!Array.isArray(message.content)) {
+    return { role: message.role, content: message.content };
+  }
+  const parts = (message.content as JsonRecord[]).map((part) => {
+    if (part?.type !== "image") {
+      return part;
+    }
+    const source = (part.source ?? {}) as JsonRecord;
+    return {
+      type: "image_url",
+      image_url: { url: `data:${source.media_type};base64,${source.data}` },
+    };
+  });
+  return { role: message.role, content: parts };
+}
+
+/**
+ * Separates reasoning from the answer.
+ *
+ * A server reports it either as its own field or inline in the content as
+ * `<think>…</think>`, depending on how it handles the model's chat template —
+ * so both are read, and a board sees the same `thinking` field either way.
+ */
+function splitThinking(
+  content: string,
+  declared: string,
+): { text: string; thinking: string } {
+  const close = content.indexOf(THINK_CLOSE);
+  if (close === -1) {
+    return { text: content.trim(), thinking: declared.trim() };
+  }
+  const head = content.slice(0, close);
+  const inline = head.startsWith(THINK_OPEN)
+    ? head.slice(THINK_OPEN.length)
+    : head;
+  return {
+    text: content.slice(close + THINK_CLOSE.length).trim(),
+    thinking: `${declared}${inline}`.trim(),
+  };
+}
+
+/** The port a hint should name, so the suggestion matches the configuration. */
+function port(url: string): string {
+  try {
+    return new URL(url).port || "8081";
+  } catch {
+    return "8081";
   }
 }
 

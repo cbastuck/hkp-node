@@ -14,7 +14,7 @@ import { RuntimeHost } from "../src/types";
  * output contract, and both are visible without spending a token.
  */
 
-type Recorded = { headers: http.IncomingHttpHeaders; body: any };
+type Recorded = { url: string; headers: http.IncomingHttpHeaders; body: any };
 
 type Endpoint = {
   url: string;
@@ -37,7 +37,7 @@ async function startEndpoint(
       } catch {
         body = {};
       }
-      received.push({ headers: req.headers, body });
+      received.push({ url: req.url ?? "", headers: req.headers, body });
 
       const answer = reply(body);
       if (answer.sse) {
@@ -502,5 +502,217 @@ describe("text-generation failure", () => {
 
     expect(t.service.process(null, t.notify)).toBeNull();
     expect(t.notifications).toEqual([]);
+  });
+});
+
+/**
+ * The other backend: an OpenAI-compatible server on the same machine.
+ *
+ * Everything a board configures means the same thing on both, so what these
+ * check is the translation — and the one place the two must *not* behave
+ * alike, which is the credential.
+ */
+
+const CHAT_ANSWER = {
+  model: "qwen3-0.6b",
+  choices: [{ message: { content: "Blue." } }],
+  usage: { prompt_tokens: 12, completion_tokens: 3 },
+};
+
+describe("text-generation server backend", () => {
+  it("asks a chat-completions server, in its own vocabulary", async () => {
+    const server = await endpoint(() => ({ json: CHAT_ANSWER }));
+    const t = serviceWith({
+      backend: "server",
+      serverUrl: server.url,
+      model: "qwen3-0.6b",
+      systemPrompt: "Answer in one word.",
+      stream: false,
+      maxTokens: 64,
+    });
+
+    t.service.process("What colour is the sky?", t.notify);
+    const result = await settled(t.pushed);
+
+    expect(server.received[0].url).toBe("/v1/chat/completions");
+    expect(server.received[0].body).toMatchObject({
+      model: "qwen3-0.6b",
+      max_tokens: 64,
+      // A system prompt is a message here, not a parameter.
+      messages: [
+        { role: "system", content: "Answer in one word." },
+        { role: "user", content: "What colour is the sky?" },
+      ],
+    });
+    expect(result).toMatchObject({
+      text: "Blue.",
+      model: "qwen3-0.6b",
+      usage: { promptTokens: 12, completionTokens: 3 },
+    });
+  });
+
+  it("never sends the hosted API's key to an address a board named", async () => {
+    // The env key exists for the anthropic backend. A board pointing `server`
+    // at any URL it likes would otherwise hand that credential to whatever is
+    // listening there.
+    vi.stubEnv("ANTHROPIC_API_KEY", "sk-ant-secret");
+    const server = await endpoint(() => ({ json: CHAT_ANSWER }));
+    const t = serviceWith({
+      backend: "server",
+      serverUrl: server.url,
+      stream: false,
+    });
+
+    t.service.process("hello", t.notify);
+    await settled(t.pushed);
+
+    expect(server.received[0].headers.authorization).toBeUndefined();
+    expect(JSON.stringify(server.received[0])).not.toContain("sk-ant-secret");
+  });
+
+  it("runs without any key at all", async () => {
+    const server = await endpoint(() => ({ json: CHAT_ANSWER }));
+    const t = serviceWith({
+      backend: "server",
+      serverUrl: server.url,
+      stream: false,
+    });
+
+    // The anthropic backend refuses here; a local server is reached by
+    // address, so there is nothing to be missing.
+    expect(t.service.process("hello", t.notify)).toBeNull();
+    await settled(t.pushed);
+    expect(server.received).toHaveLength(1);
+  });
+
+  it("asks for a schema as a response format, and parses what comes back", async () => {
+    const schema = {
+      type: "object",
+      properties: { hotel: { type: "string" }, rooms: { type: "integer" } },
+      required: ["hotel", "rooms"],
+    };
+    const server = await endpoint(() => ({
+      json: {
+        model: "qwen3-0.6b",
+        choices: [
+          {
+            message: { content: '{"hotel":"Mercure","rooms":3}' },
+          },
+        ],
+        usage: { prompt_tokens: 40, completion_tokens: 12 },
+      },
+    }));
+    const t = serviceWith({
+      backend: "server",
+      serverUrl: server.url,
+      jsonSchema: schema,
+    });
+
+    t.service.process("Two rooms at the Mercure", t.notify);
+    const result = await settled(t.pushed);
+
+    expect(server.received[0].body.response_format).toMatchObject({
+      type: "json_schema",
+      json_schema: { schema },
+    });
+    // Same output contract as the forced-tool path on the anthropic backend.
+    expect(result.json).toEqual({ hotel: "Mercure", rooms: 3 });
+    expect(result.text).toBe('{"hotel":"Mercure","rooms":3}');
+  });
+
+  it("still hands over the answer when a server ignores the schema", async () => {
+    // Not every OpenAI-compatible server implements response_format, and one
+    // that does not answers in prose while reporting nothing unusual.
+    const warnings: unknown[] = [];
+    const server = await endpoint(() => ({
+      json: {
+        model: "qwen3-0.6b",
+        choices: [{ message: { content: "Three rooms, at the Mercure." } }],
+      },
+    }));
+    const t = serviceWith({
+      backend: "server",
+      serverUrl: server.url,
+      jsonSchema: { type: "object" },
+    });
+    (t.service as any).host.log = (level: string, event: string, data: unknown) => {
+      warnings.push({ level, event, data });
+    };
+
+    t.service.process("Two rooms at the Mercure", t.notify);
+    const result = await settled(t.pushed);
+
+    expect(result.json).toBeUndefined();
+    expect(result.text).toBe("Three rooms, at the Mercure.");
+    expect(warnings).toHaveLength(1);
+  });
+
+  it("streams token by token, reporting the growing text", async () => {
+    const server = await endpoint(() => ({
+      sse: [
+        JSON.stringify({ model: "qwen3-0.6b", choices: [{ delta: { content: "Bl" } }] }),
+        JSON.stringify({ choices: [{ delta: { content: "ue." } }] }),
+        JSON.stringify({ choices: [{ delta: {} }], usage: { prompt_tokens: 5, completion_tokens: 2 } }),
+        "[DONE]",
+      ],
+    }));
+    const t = serviceWith({ backend: "server", serverUrl: server.url });
+
+    t.service.process("What colour is the sky?", t.notify);
+    const result = await settled(t.pushed);
+
+    expect(server.received[0].body.stream).toBe(true);
+    expect(result).toMatchObject({
+      text: "Blue.",
+      usage: { promptTokens: 5, completionTokens: 2 },
+    });
+    expect(t.notifications).toContainEqual({ streamText: "Blue.", streamDone: true });
+  });
+
+  it("separates reasoning from the answer, however the server reports it", async () => {
+    const server = await endpoint(() => ({
+      json: {
+        model: "qwen3-0.6b",
+        choices: [
+          {
+            message: { content: "<think>Sky is blue.</think>Blue." },
+          },
+        ],
+      },
+    }));
+    const t = serviceWith({
+      backend: "server",
+      serverUrl: server.url,
+      stream: false,
+    });
+
+    t.service.process("What colour is the sky?", t.notify);
+    const result = await settled(t.pushed);
+
+    expect(result.text).toBe("Blue.");
+    expect(result.thinking).toBe("Sky is blue.");
+  });
+
+  it("says what to do when nothing is listening", async () => {
+    const t = serviceWith({
+      backend: "server",
+      serverUrl: "http://127.0.0.1:1",
+      stream: false,
+      timeoutSec: 5,
+    });
+
+    const failures: any[] = [];
+    t.service.process("hello", (payload: any) => {
+      t.notifications.push(payload);
+      if (typeof payload?.error === "string") {
+        failures.push(payload);
+      }
+    });
+
+    const reported = await settled(failures);
+    expect(reported.error).toContain("no OpenAI-compatible server reachable");
+    // The suggestion names the port the board actually configured.
+    expect(reported.error).toContain("--port 1");
+    expect(t.service.getState().status).toBe("error");
   });
 });
