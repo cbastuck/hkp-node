@@ -4,8 +4,8 @@
  * Service Name: Text Generation
  * Runtime: hkp-node
  * Modes: none (the backend is configuration, not a mode)
- * Key Config: backend (anthropic|server), apiKey (write-only), baseUrl
- *             (anthropic), serverUrl (server), model, systemPrompt,
+ * Key Config: backend (anthropic|server), apiKey (write-only), serverUrl
+ *             (empty = the backend's own address), model, systemPrompt,
  *             temperature, topP, topK, maxTokens, timeoutSec, stream,
  *             thinking, thinkingBudgetTokens, jsonSchema
  * IO: in=String (the prompt) or JSON ({prompt} | {text} | {messages: [...]}),
@@ -69,9 +69,21 @@ export const textGenerationDescriptor: ServiceRegistryEntry = {
 /** Backends this runtime can talk to. */
 const BACKENDS = ["anthropic", "server"];
 
-const DEFAULT_BASE_URL = "https://api.anthropic.com";
-/** Where llama-server and friends listen by default; the port hkp-python uses. */
-const DEFAULT_SERVER_URL = "http://127.0.0.1:8081";
+/**
+ * Where each backend goes when a board does not say.
+ *
+ * The address is one field, `serverUrl`, because only one is ever in use —
+ * two would mean a board carrying the address of a service it is not talking
+ * to, which reads like configuration and is not. Left empty it means "wherever
+ * this backend lives", which is what makes switching backends work: a default
+ * is resolved when the request is made rather than written into the board, so
+ * nothing stale is carried across the switch.
+ */
+const DEFAULT_URLS: Record<string, string> = {
+  anthropic: "https://api.anthropic.com",
+  // Where llama-server and friends listen; the port hkp-python uses too.
+  server: "http://127.0.0.1:8081",
+};
 const DEFAULT_MODEL = "claude-sonnet-5";
 const DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant";
 const DEFAULT_TEMPERATURE = 0.7;
@@ -107,6 +119,8 @@ type Result = {
   text: string;
   json?: unknown;
   thinking?: string;
+  /** Only when the answer did not simply end: "length", "content_filter", … */
+  finishReason?: string;
   model: string;
   durationMs: number;
   usage: { promptTokens: number; completionTokens: number };
@@ -140,8 +154,8 @@ export class TextGenerationService implements HostedService {
   private host: RuntimeHost | null = null;
   private backend = "anthropic";
   private apiKey = "";
-  private baseUrl = DEFAULT_BASE_URL;
-  private serverUrl = DEFAULT_SERVER_URL;
+  /** Empty means the backend's own address; see DEFAULT_URLS. */
+  private serverUrl = "";
   private model = DEFAULT_MODEL;
   private systemPrompt = DEFAULT_SYSTEM_PROMPT;
   private temperature = DEFAULT_TEMPERATURE;
@@ -181,8 +195,10 @@ export class TextGenerationService implements HostedService {
       // Write-only: what was configured never comes back out.
       apiKey: "",
       apiKeyConfigured: this.resolveKey().length > 0,
-      baseUrl: this.baseUrl,
       serverUrl: this.serverUrl,
+      // Read-only, and the point of it: which address this configuration
+      // actually reaches, without having to know how a backend spells one.
+      endpoint: this.endpoint(),
       model: this.model,
       systemPrompt: this.systemPrompt,
       temperature: this.temperature,
@@ -208,10 +224,9 @@ export class TextGenerationService implements HostedService {
     if (typeof config.apiKey === "string" && config.apiKey) {
       this.apiKey = config.apiKey;
     }
-    if (typeof config.baseUrl === "string" && config.baseUrl) {
-      this.baseUrl = config.baseUrl.replace(/\/+$/, "");
-    }
-    if (typeof config.serverUrl === "string" && config.serverUrl) {
+    if (typeof config.serverUrl === "string") {
+      // An empty string is meaningful — it hands the address back to the
+      // backend — so unlike the other strings it is not ignored.
       this.serverUrl = config.serverUrl.replace(/\/+$/, "");
     }
     if (typeof config.model === "string" && config.model) {
@@ -329,10 +344,23 @@ export class TextGenerationService implements HostedService {
     return this.apiKey || process.env.ANTHROPIC_API_KEY || "";
   }
 
+  /**
+   * Where the request goes.
+   *
+   * A local server is given as a bare origin and serves the API at its root,
+   * so the version belongs in the path. A hosted provider is given the way its
+   * documentation gives it — `https://…/api/v1` — and appending another `/v1`
+   * to that reaches nothing. Both forms are accepted rather than one being
+   * declared correct, because both are what the two kinds of server hand out.
+   */
   private endpoint(): string {
-    return this.backend === "server"
-      ? `${this.serverUrl}/v1/chat/completions`
-      : `${this.baseUrl}/v1/messages`;
+    const base = this.serverUrl || DEFAULT_URLS[this.backend] || "";
+    if (this.backend !== "server") {
+      return `${base}/v1/messages`;
+    }
+    return /\/v\d+$/.test(base)
+      ? `${base}/chat/completions`
+      : `${base}/v1/chat/completions`;
   }
 
   private headers(apiKey: string): Record<string, string> {
@@ -395,22 +423,37 @@ export class TextGenerationService implements HostedService {
       const result = server
         ? this.toServerResult(message, started)
         : this.toResult(message, started);
+
+      // Handing an empty answer onward is worse than failing: the services
+      // after this one cannot tell it from a real one, so a board that settles
+      // its work at the end would mark the item done having produced nothing.
+      // Stopping here leaves it exactly where a failed run should leave it.
+      if (!result.text && result.json === undefined) {
+        this.fail(
+          notify,
+          result.finishReason === "length"
+            ? `the model used all ${this.maxTokens} tokens without answering — ` +
+              "raise maxTokens, or set thinking: false if it reasons first"
+            : "the model returned an empty answer",
+        );
+        return;
+      }
+
       this.setStatus(notify, "idle");
       notify(result);
       this.push(result, notify, context);
     } catch (err) {
-      if (
-        server &&
-        err instanceof Error &&
-        err.name !== "AbortError" &&
-        !(err instanceof SyntaxError)
-      ) {
+      // A connection that never opened, as distinct from anything else that
+      // went wrong in here: fetch reports those as a TypeError carrying the
+      // socket error as its cause. Claiming a wider set would answer "the
+      // server is not running" to a question that was never asked.
+      if (server && err instanceof TypeError && (err as Error).cause) {
         // "fetch failed" says nothing about what to do; a board pointed at a
         // server nobody started is by far the likeliest way to get here.
         this.fail(
           notify,
-          `no OpenAI-compatible server reachable at ${this.serverUrl} — start one, e.g.: ` +
-            `llama-server -m model.gguf --port ${port(this.serverUrl)}`,
+          `no OpenAI-compatible server reachable at ${this.endpoint()} — start one, e.g.: ` +
+            `llama-server -m model.gguf --port ${port(this.endpoint())}`,
         );
         return;
       }
@@ -429,9 +472,8 @@ export class TextGenerationService implements HostedService {
   /**
    * Whether this call streams.
    *
-   * A schema-constrained answer does not: it arrives as tool arguments, which
-   * are only useful once complete, so streaming would buy partial JSON nobody
-   * can render.
+   * A schema-constrained answer does not: half of a JSON object is of no use
+   * to anything, so streaming would buy partial output nobody can render.
    */
   private streaming(): boolean {
     return this.stream && !this.jsonSchema;
@@ -509,12 +551,17 @@ export class TextGenerationService implements HostedService {
       body.chat_template_kwargs = { enable_thinking: this.thinking };
     }
     if (this.jsonSchema) {
+      // No `strict`: under its OpenAI meaning it additionally requires every
+      // property to be listed in `required` and `additionalProperties: false`,
+      // which contradicts the schemas boards actually write — a shape whose
+      // fields are filled in only when the source says them. The schema is
+      // still enforced; `strict` governs a stricter reading of the schema
+      // itself, not whether it applies.
       body.response_format = {
         type: "json_schema",
         json_schema: {
           name: SCHEMA_TOOL_NAME,
           schema: this.jsonSchema,
-          strict: true,
         },
       };
     }
@@ -535,6 +582,10 @@ export class TextGenerationService implements HostedService {
       ? (response.choices as JsonRecord[])
       : [];
     const message = (choices[0]?.message ?? {}) as JsonRecord;
+    const finishReason =
+      typeof choices[0]?.finish_reason === "string"
+        ? choices[0].finish_reason
+        : "";
     const { text, thinking } = splitThinking(
       typeof message.content === "string" ? message.content : "",
       typeof message.reasoning_content === "string"
@@ -557,18 +608,28 @@ export class TextGenerationService implements HostedService {
     if (thinking) {
       result.thinking = thinking;
     }
-    if (this.jsonSchema) {
+    // "stop" is the answer ending because it was finished; anything else is
+    // the answer ending for a reason a board should be able to see.
+    if (finishReason && finishReason !== "stop") {
+      result.finishReason = finishReason;
+    }
+    // Only worth reporting when there is an answer to hand on anyway: an
+    // empty one is a failure, and `generate` says so rather than warning here
+    // and passing it down as well.
+    if (this.jsonSchema && text) {
       try {
         result.json = JSON.parse(text);
       } catch {
-        // A server that does not implement response_format answers in prose
-        // and reports nothing unusual, so this is the only place it shows.
-        // The text is still emitted: a board that logs it can see what came
-        // back, which is what tells the difference from an empty answer.
+        // Two very different causes, and saying the wrong one sends whoever
+        // reads this looking in the wrong place.
         this.host?.log("warn", "service.degraded", {
           message:
-            "answer did not parse as JSON — this server may not implement " +
-            "response_format: json_schema",
+            finishReason === "length"
+              ? `answer was cut off at maxTokens (${this.maxTokens}) before it ` +
+                "was valid JSON — raise maxTokens, or set thinking: false if " +
+                "the model reasons before answering"
+              : "answer did not parse as JSON — this server may not implement " +
+                "response_format: json_schema",
         });
       }
     }
@@ -590,6 +651,7 @@ export class TextGenerationService implements HostedService {
     let model = this.model;
     let promptTokens = 0;
     let completionTokens = 0;
+    let finishReason = "";
     let lastNotifiedAt = 0;
 
     for await (const event of readEvents(response)) {
@@ -609,6 +671,9 @@ export class TextGenerationService implements HostedService {
       const choices = Array.isArray(event.choices)
         ? (event.choices as JsonRecord[])
         : [];
+      if (typeof choices[0]?.finish_reason === "string") {
+        finishReason = choices[0].finish_reason;
+      }
       const delta = (choices[0]?.delta ?? {}) as JsonRecord;
       if (typeof delta.reasoning_content === "string") {
         thinking += delta.reasoning_content;
@@ -627,7 +692,12 @@ export class TextGenerationService implements HostedService {
 
     return {
       model,
-      choices: [{ message: { content: text, reasoning_content: thinking } }],
+      choices: [
+        {
+          message: { content: text, reasoning_content: thinking },
+          finish_reason: finishReason,
+        },
+      ],
       usage: {
         prompt_tokens: promptTokens,
         completion_tokens: completionTokens,

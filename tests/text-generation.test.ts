@@ -148,7 +148,7 @@ describe("text-generation request", () => {
     // would put it in the conversation rather than above it.
     const api = await endpoint(() => ({ json: ANSWER }));
     const t = serviceWith({
-      baseUrl: api.url,
+      serverUrl: api.url,
       apiKey: "sk-test",
       systemPrompt: "Answer in one word.",
       stream: false,
@@ -165,7 +165,7 @@ describe("text-generation request", () => {
 
   it("identifies itself with the key and a pinned API version", async () => {
     const api = await endpoint(() => ({ json: ANSWER }));
-    const t = serviceWith({ baseUrl: api.url, apiKey: "sk-test", stream: false });
+    const t = serviceWith({ serverUrl: api.url, apiKey: "sk-test", stream: false });
 
     t.service.process("hi", t.notify);
     await settled(t.pushed);
@@ -176,7 +176,7 @@ describe("text-generation request", () => {
 
   it("passes a conversation through as it was given", async () => {
     const api = await endpoint(() => ({ json: ANSWER }));
-    const t = serviceWith({ baseUrl: api.url, apiKey: "sk-test", stream: false });
+    const t = serviceWith({ serverUrl: api.url, apiKey: "sk-test", stream: false });
 
     t.service.process(
       {
@@ -197,7 +197,7 @@ describe("text-generation request", () => {
     // The shape http-client and http-server-subservices produce, so a scan can
     // be piped straight in.
     const api = await endpoint(() => ({ json: ANSWER }));
-    const t = serviceWith({ baseUrl: api.url, apiKey: "sk-test", stream: false });
+    const t = serviceWith({ serverUrl: api.url, apiKey: "sk-test", stream: false });
 
     t.service.process(
       {
@@ -222,7 +222,7 @@ describe("text-generation request", () => {
     // is rejected outright, so they have to be absent rather than defaulted.
     const api = await endpoint(() => ({ json: ANSWER }));
     const t = serviceWith({
-      baseUrl: api.url,
+      serverUrl: api.url,
       apiKey: "sk-test",
       stream: false,
       thinking: true,
@@ -247,7 +247,7 @@ describe("text-generation request", () => {
 describe("text-generation output", () => {
   it("reports what the shared contract promises", async () => {
     const api = await endpoint(() => ({ json: ANSWER }));
-    const t = serviceWith({ baseUrl: api.url, apiKey: "sk-test", stream: false });
+    const t = serviceWith({ serverUrl: api.url, apiKey: "sk-test", stream: false });
 
     t.service.process("hi", t.notify);
     const result = await settled(t.pushed);
@@ -269,7 +269,7 @@ describe("text-generation output", () => {
         usage: { input_tokens: 1, output_tokens: 1 },
       },
     }));
-    const t = serviceWith({ baseUrl: api.url, apiKey: "sk-test", stream: false });
+    const t = serviceWith({ serverUrl: api.url, apiKey: "sk-test", stream: false });
 
     t.service.process("why", t.notify);
     const result = await settled(t.pushed);
@@ -281,7 +281,7 @@ describe("text-generation output", () => {
   it("stops the push and hands the answer over when it arrives", async () => {
     // Generation takes seconds; the pass it started in returned long before.
     const api = await endpoint(() => ({ json: ANSWER }));
-    const t = serviceWith({ baseUrl: api.url, apiKey: "sk-test", stream: false });
+    const t = serviceWith({ serverUrl: api.url, apiKey: "sk-test", stream: false });
 
     expect(t.service.process("hi", t.notify)).toBeNull();
 
@@ -310,7 +310,7 @@ describe("text-generation streaming", () => {
         JSON.stringify({ type: "message_stop" }),
       ],
     }));
-    const t = serviceWith({ baseUrl: api.url, apiKey: "sk-test", stream: true });
+    const t = serviceWith({ serverUrl: api.url, apiKey: "sk-test", stream: true });
 
     t.service.process("hi", t.notify);
     const result = await settled(t.pushed);
@@ -342,7 +342,7 @@ describe("text-generation schema", () => {
         usage: { input_tokens: 20, output_tokens: 8 },
       },
     }));
-    const t = serviceWith({ baseUrl: api.url, apiKey: "sk-test", jsonSchema: schema });
+    const t = serviceWith({ serverUrl: api.url, apiKey: "sk-test", jsonSchema: schema });
 
     t.service.process("extract it", t.notify);
     const result = await settled(t.pushed);
@@ -362,7 +362,7 @@ describe("text-generation schema", () => {
   it("takes a schema a hand-written board carries as text", async () => {
     const api = await endpoint(() => ({ json: ANSWER }));
     const t = serviceWith({
-      baseUrl: api.url,
+      serverUrl: api.url,
       apiKey: "sk-test",
       jsonSchema: '{"type":"object"}',
     });
@@ -376,7 +376,7 @@ describe("text-generation schema", () => {
   it("drops the constraint when a board clears it", async () => {
     const api = await endpoint(() => ({ json: ANSWER }));
     const t = serviceWith({
-      baseUrl: api.url,
+      serverUrl: api.url,
       apiKey: "sk-test",
       stream: false,
       jsonSchema: { type: "object" },
@@ -403,7 +403,7 @@ describe("text-generation credentials", () => {
     // The state a client holds has apiKey: "", and it configures with what it
     // holds. Reading that as "clear it" would log the board out on any edit.
     const api = await endpoint(() => ({ json: ANSWER }));
-    const t = serviceWith({ baseUrl: api.url, apiKey: "sk-test", stream: false });
+    const t = serviceWith({ serverUrl: api.url, apiKey: "sk-test", stream: false });
 
     t.service.configure({ apiKey: "", temperature: 0.1 });
     t.service.process("hi", t.notify);
@@ -416,7 +416,7 @@ describe("text-generation credentials", () => {
     // What a deployed board does, so the credential never enters the board.
     vi.stubEnv("ANTHROPIC_API_KEY", "sk-from-env");
     const api = await endpoint(() => ({ json: ANSWER }));
-    const t = serviceWith({ baseUrl: api.url, stream: false });
+    const t = serviceWith({ serverUrl: api.url, stream: false });
 
     t.service.process("hi", t.notify);
     await settled(t.pushed);
@@ -425,7 +425,7 @@ describe("text-generation credentials", () => {
   });
 
   it("says so rather than calling without one", async () => {
-    const t = serviceWith({ baseUrl: "http://127.0.0.1:1" });
+    const t = serviceWith({ serverUrl: "http://127.0.0.1:1" });
 
     expect(t.service.process("hi", t.notify)).toBeNull();
     expect(t.notifications).toContainEqual({ status: "error" });
@@ -439,7 +439,7 @@ describe("text-generation credentials", () => {
   it("keeps the reason where somebody can still read it", async () => {
     // A notification is gone the moment nobody is looking, and this board is
     // meant to run with nobody looking.
-    const t = serviceWith({ baseUrl: "http://127.0.0.1:1" });
+    const t = serviceWith({ serverUrl: "http://127.0.0.1:1" });
 
     t.service.process("hi", t.notify);
 
@@ -450,7 +450,7 @@ describe("text-generation credentials", () => {
 
   it("stops complaining once it works", async () => {
     const api = await endpoint(() => ({ json: ANSWER }));
-    const t = serviceWith({ baseUrl: api.url, stream: false });
+    const t = serviceWith({ serverUrl: api.url, stream: false });
 
     t.service.process("hi", t.notify);
     expect(String(t.service.getState().error)).toContain("ANTHROPIC_API_KEY");
@@ -472,7 +472,7 @@ describe("text-generation failure", () => {
       status: 429,
       json: { error: { type: "rate_limit_error", message: "slow down" } },
     }));
-    const t = serviceWith({ baseUrl: api.url, apiKey: "sk-test", stream: false });
+    const t = serviceWith({ serverUrl: api.url, apiKey: "sk-test", stream: false });
 
     t.service.process("hi", t.notify);
     await settled(t.notifications);
@@ -611,10 +611,14 @@ describe("text-generation server backend", () => {
     t.service.process("Two rooms at the Mercure", t.notify);
     const result = await settled(t.pushed);
 
-    expect(server.received[0].body.response_format).toMatchObject({
+    expect(server.received[0].body.response_format).toEqual({
       type: "json_schema",
-      json_schema: { schema },
+      json_schema: { name: "respond", schema },
     });
+    // Not `strict`: that reading also demands every property be required and
+    // additionalProperties be false, which this schema — two required fields
+    // out of several — is not, and boards write schemas like this one.
+    expect(server.received[0].body.response_format.json_schema.strict).toBeUndefined();
     // Same output contract as the forced-tool path on the anthropic backend.
     expect(result.json).toEqual({ hotel: "Mercure", rooms: 3 });
     expect(result.text).toBe('{"hotel":"Mercure","rooms":3}');
@@ -714,5 +718,226 @@ describe("text-generation server backend", () => {
     // The suggestion names the port the board actually configured.
     expect(reported.error).toContain("--port 1");
     expect(t.service.getState().status).toBe("error");
+  });
+});
+
+describe("text-generation server address", () => {
+  it("adds the API version to a bare origin", async () => {
+    // What a local server hands out: an origin, serving the API at its root.
+    const server = await endpoint(() => ({ json: CHAT_ANSWER }));
+    const t = serviceWith({
+      backend: "server",
+      serverUrl: server.url,
+      stream: false,
+    });
+
+    t.service.process("hello", t.notify);
+    await settled(t.pushed);
+
+    expect(server.received[0].url).toBe("/v1/chat/completions");
+  });
+
+  it("does not add it twice to a base URL that already carries one", async () => {
+    // What a hosted provider hands out, e.g. https://…/api/v1 — appending
+    // another /v1 reaches nothing, and the 404 says nothing about why.
+    const server = await endpoint(() => ({ json: CHAT_ANSWER }));
+    const t = serviceWith({
+      backend: "server",
+      serverUrl: `${server.url}/api/v1`,
+      stream: false,
+    });
+
+    t.service.process("hello", t.notify);
+    await settled(t.pushed);
+
+    expect(server.received[0].url).toBe("/api/v1/chat/completions");
+  });
+
+  it("sends a configured key as a bearer token", async () => {
+    const server = await endpoint(() => ({ json: CHAT_ANSWER }));
+    const t = serviceWith({
+      backend: "server",
+      serverUrl: server.url,
+      apiKey: "hosted-token",
+      stream: false,
+    });
+
+    t.service.process("hello", t.notify);
+    await settled(t.pushed);
+
+    expect(server.received[0].headers.authorization).toBe("Bearer hosted-token");
+    // Still write-only: what a board configured never comes back out.
+    expect(t.service.getState().apiKey).toBe("");
+    expect(t.service.getState().apiKeyConfigured).toBe(true);
+  });
+});
+
+describe("text-generation empty answers", () => {
+  it("fails rather than passing on an answer that is nothing", async () => {
+    // A model that reasons before answering can spend its whole budget doing
+    // so. What comes back is a well-formed response carrying no answer, and
+    // passing it on lets a board settle work it never did.
+    const server = await endpoint(() => ({
+      json: {
+        model: "Qwen3",
+        choices: [{ message: { content: "" }, finish_reason: "length" }],
+        usage: { prompt_tokens: 101, completion_tokens: 1024 },
+      },
+    }));
+    const t = serviceWith({
+      backend: "server",
+      serverUrl: server.url,
+      maxTokens: 1024,
+      stream: false,
+    });
+
+    const failures: any[] = [];
+    t.service.process("Two rooms at the Mercure", (payload: any) => {
+      if (typeof payload?.error === "string") {
+        failures.push(payload);
+      }
+    });
+
+    const failure = await settled(failures);
+    expect(failure.error).toContain("used all 1024 tokens without answering");
+    // Nothing reached the rest of the pipeline, so nothing downstream can
+    // mistake this for a completed job.
+    expect(t.pushed).toEqual([]);
+    expect(t.service.getState().status).toBe("error");
+  });
+
+  it("reports why an answer stopped when it did produce something", async () => {
+    const server = await endpoint(() => ({
+      json: {
+        model: "Qwen3",
+        choices: [
+          { message: { content: "Two rooms at the" }, finish_reason: "length" },
+        ],
+      },
+    }));
+    const t = serviceWith({
+      backend: "server",
+      serverUrl: server.url,
+      stream: false,
+    });
+
+    t.service.process("hello", t.notify);
+    const result = await settled(t.pushed);
+
+    expect(result.text).toBe("Two rooms at the");
+    expect(result.finishReason).toBe("length");
+  });
+
+  it("says nothing about the finish reason when the answer simply ended", async () => {
+    const server = await endpoint(() => ({
+      json: {
+        model: "Qwen3",
+        choices: [{ message: { content: "Blue." }, finish_reason: "stop" }],
+      },
+    }));
+    const t = serviceWith({
+      backend: "server",
+      serverUrl: server.url,
+      stream: false,
+    });
+
+    t.service.process("hello", t.notify);
+    const result = await settled(t.pushed);
+
+    expect(result.finishReason).toBeUndefined();
+  });
+});
+
+/**
+ * One address, resolved against the backend in use.
+ *
+ * One field, because only one address is ever in use — a second would mean a
+ * board carrying the address of a service it is not talking to. `endpoint` is
+ * read-only and says where a configuration actually reaches, including the API
+ * version, which the address alone does not answer.
+ */
+describe("text-generation address", () => {
+  it("goes to the backend's own address when a board says nothing", () => {
+    expect(serviceWith({ backend: "anthropic" }).service.getState().endpoint).toBe(
+      "https://api.anthropic.com/v1/messages",
+    );
+    expect(serviceWith({ backend: "server" }).service.getState().endpoint).toBe(
+      "http://127.0.0.1:8081/v1/chat/completions",
+    );
+  });
+
+  it("follows the backend when one is switched, carrying nothing across", () => {
+    // The reason the default is resolved at use rather than stored: a board
+    // that never chose an address must not inherit the other backend's.
+    const t = serviceWith({ backend: "anthropic" });
+
+    t.service.configure({ backend: "server" });
+    expect(t.service.getState().endpoint).toBe(
+      "http://127.0.0.1:8081/v1/chat/completions",
+    );
+
+    t.service.configure({ backend: "anthropic" });
+    expect(t.service.getState().endpoint).toBe(
+      "https://api.anthropic.com/v1/messages",
+    );
+  });
+
+  it("keeps an address a board did choose", () => {
+    const t = serviceWith({
+      backend: "server",
+      serverUrl: "https://inference.example.com/api/v1",
+    });
+
+    expect(t.service.getState().endpoint).toBe(
+      "https://inference.example.com/api/v1/chat/completions",
+    );
+  });
+
+  it("hands the address back to the backend when cleared", () => {
+    const t = serviceWith({ backend: "server", serverUrl: "http://elsewhere:9000" });
+
+    // Empty is a value here, not an omission — unlike every other string.
+    t.service.configure({ serverUrl: "" });
+
+    expect(t.service.getState().serverUrl).toBe("");
+    expect(t.service.getState().endpoint).toBe(
+      "http://127.0.0.1:8081/v1/chat/completions",
+    );
+  });
+
+
+});
+
+describe("text-generation reporting", () => {
+  it("reports an empty schema answer once, as a failure", async () => {
+    // The parse of "" fails too. Warning about that *and* failing would say
+    // the same thing twice, in two places, with two different wordings.
+    const logged: unknown[] = [];
+    const server = await endpoint(() => ({
+      json: {
+        model: "Qwen3",
+        choices: [{ message: { content: "" }, finish_reason: "length" }],
+      },
+    }));
+    const t = serviceWith({
+      backend: "server",
+      serverUrl: server.url,
+      jsonSchema: { type: "object" },
+      stream: false,
+    });
+    (t.service as any).host.log = (_l: string, event: string) => {
+      logged.push(event);
+    };
+
+    const failures: any[] = [];
+    t.service.process("hello", (payload: any) => {
+      if (typeof payload?.error === "string") {
+        failures.push(payload);
+      }
+    });
+    await settled(failures);
+
+    expect(logged).toEqual(["service.failed"]);
+    expect(logged).not.toContain("service.degraded");
   });
 });

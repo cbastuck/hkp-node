@@ -510,9 +510,8 @@ export class StoreService implements HostedService {
       }
 
       // A run of its own, so that whatever finishes the work at the far end can
-      // say which record it finished. Minted here rather than taken from the
-      // call in progress because there is none: this usually runs from a
-      // configure, which is all a facade button can send.
+      // say which record it finished — one pass carries one record, and the
+      // run is what tells the acknowledgement which.
       const context = newRun();
       const leased = await this.store.setLease(scope, key, {
         at: new Date().toISOString(),
