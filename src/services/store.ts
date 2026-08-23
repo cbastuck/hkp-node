@@ -3,9 +3,9 @@
  * Service ID: store
  * Service Name: Store
  * Runtime: hkp-node
- * Modes: put, get, list, delete, clear, release
- * Key Config: mode, namespace, key, keyFrom, valueFrom, limit,
- *             keys (release, transient)
+ * Modes: put, get, list, delete, clear, release, ack, requeue
+ * Key Config: mode, namespace, key, keyFrom, valueFrom, limit, show
+ * Input for release/requeue: { keys: [...] }, or the keys themselves
  * IO: in=anything to keep (put), or the key to act on (get/delete/release)
  *     out=null immediately; the outcome is pushed through the rest of the
  *     pipeline when the disk answers:
@@ -15,6 +15,8 @@
  *       delete  -> { key, deleted }
  *       clear   -> { cleared }
  *       release -> one pass per released record, each { key, value, ... }
+ *       ack     -> { key, acknowledged } for the record this run was carrying
+ *       requeue -> nothing; the records go back to waiting
  *
  * What a board remembers between runs. Scoped to the board and to the tenant
  * that owns it — a service is told its own configuration and nothing about who
@@ -45,11 +47,18 @@
  *
  * `release` is the human checkpoint: a person looks at what is waiting and lets
  * some of it through. The records they picked continue down the pipeline, one
- * pass each, and leave the store; the rest stay exactly where they were. It
- * runs from `configure` as well as from an input, because a facade button can
- * only configure a service — which is also why `keys` is never reported in
- * `getState`: a key list that survived into a saved board would release again
- * the next time the board was opened.
+ * pass each; the rest stay exactly where they were. The keys arrive as input —
+ * a facade `process` action carries them — so nothing about a choice somebody
+ * made once is written into the board's saved state.
+ *
+ * A released record is **leased, not deleted**. It leaves the queue but stays
+ * on disk until an `ack` says the work finished, so a pipeline that fails
+ * leaves it recoverable rather than consumed. That matters because the pipeline
+ * cannot report its own outcome: services that answer late return `null` from
+ * their pass, so "it worked" and "it failed" look identical to whatever called
+ * them. Putting an `ack` at the end of the pipeline is how a board says where
+ * success actually is — and anything that never reaches it stays in flight,
+ * visible through `show: "in-flight"` and returnable with `requeue`.
  */
 import {
   HostedService,
@@ -60,6 +69,7 @@ import {
   ServiceConfiguration,
   ServiceRegistryEntry,
 } from "../types";
+import { newRun } from "../runtime";
 import { RecordStore, StoredRecord, StoreScope } from "./recordStore";
 
 export const storeDescriptor: ServiceRegistryEntry = {
@@ -69,9 +79,31 @@ export const storeDescriptor: ServiceRegistryEntry = {
   capabilities: [],
 };
 
-type Mode = "put" | "get" | "list" | "delete" | "clear" | "release";
+type Mode =
+  | "put"
+  | "get"
+  | "list"
+  | "delete"
+  | "clear"
+  | "release"
+  | "ack"
+  | "requeue";
 
-const MODES: Mode[] = ["put", "get", "list", "delete", "clear", "release"];
+const MODES: Mode[] = [
+  "put",
+  "get",
+  "list",
+  "delete",
+  "clear",
+  "release",
+  "ack",
+  "requeue",
+];
+
+/** Which records a `list` is asking about; see the `show` state. */
+type Show = "waiting" | "in-flight" | "all";
+
+const SHOWS: Show[] = ["waiting", "in-flight", "all"];
 
 type Notify = (payload: unknown, instanceId?: string) => void;
 
@@ -88,6 +120,19 @@ function valueAt(input: unknown, path: string): unknown {
     current = (current as JsonRecord)[step];
   }
   return current;
+}
+
+/**
+ * A record as the board sees it, with the state it is in said outright.
+ *
+ * Stored, a record either carries a lease or does not. That is the whole truth
+ * of it, but it makes every consumer infer the state from the presence of an
+ * object — a facade column would have to render a timestamp and hope the reader
+ * understands what a blank one means. The state is a fact about the record, so
+ * the service reports it rather than leaving it to be worked out.
+ */
+function described(record: StoredRecord): JsonRecord {
+  return { ...record, state: record.lease ? "in-flight" : "waiting" };
 }
 
 /** A key that sorts by when it was made, so an unkeyed dump keeps its order. */
@@ -133,6 +178,7 @@ export class StoreService implements HostedService {
   private keyFrom = "";
   private valueFrom = "";
   private limit = 0;
+  private show: Show = "waiting";
   private lastCount = 0;
   /** Why the last attempt failed; see the note in text-generation. */
   private lastError = "";
@@ -159,6 +205,7 @@ export class StoreService implements HostedService {
       keyFrom: this.keyFrom,
       valueFrom: this.valueFrom,
       limit: this.limit,
+      show: this.show,
       // What the last pass saw, so a panel shows whether anything is in there
       // without having to run a `list` to find out.
       lastCount: this.lastCount,
@@ -185,14 +232,10 @@ export class StoreService implements HostedService {
     if (typeof config.limit === "number" && config.limit >= 0) {
       this.limit = Math.trunc(config.limit);
     }
-
-    // Releasing happens here rather than in `process` because a facade can only
-    // configure a service — a button sends a payload, it does not start a pass.
-    // The same shape a Timer uses for `start: true`.
-    const keys = readKeys(config.keys);
-    if (keys.length > 0) {
-      void this.releaseKeys(keys, (payload) => this.host?.notify(payload, this.uuid));
+    if (typeof config.show === "string" && SHOWS.includes(config.show as Show)) {
+      this.show = config.show as Show;
     }
+
     return this.getState();
   }
 
@@ -266,7 +309,7 @@ export class StoreService implements HostedService {
           this.resolveValue(input),
         );
         this.lastCount = 1;
-        return { ...record };
+        return described(record);
       }
 
       case "get": {
@@ -279,16 +322,25 @@ export class StoreService implements HostedService {
         this.lastCount = record ? 1 : 0;
         // A miss stops the pipeline, which is what makes it usable as a cache:
         // whatever follows is the "go and fetch it" path.
-        return record ? { ...record } : null;
+        return record ? described(record) : null;
       }
 
       case "list": {
-        const all = await this.store.list(scope);
+        // Waiting by default, because the queue is what has not been dealt
+        // with — a record handed to a pipeline is somebody's problem already,
+        // and showing it would invite a second person to take it too.
+        const all = (await this.store.list(scope)).filter((record) =>
+          this.show === "all"
+            ? true
+            : this.show === "in-flight"
+              ? !!record.lease
+              : !record.lease,
+        );
         const records = this.limit > 0 ? all.slice(0, this.limit) : all;
         this.lastCount = records.length;
         // Kept whole rather than reduced to values: when a record arrived and
         // what it is called is most of what a batch pass needs to work with.
-        return { records: records as unknown as JsonRecord[], count: records.length };
+        return { records: records.map(described), count: records.length };
       }
 
       case "delete": {
@@ -309,11 +361,7 @@ export class StoreService implements HostedService {
       }
 
       case "release": {
-        const keys = readKeys(
-          input && typeof input === "object" && "keys" in (input as JsonRecord)
-            ? (input as JsonRecord).keys
-            : input,
-        );
+        const keys = this.keysFrom(input);
         if (keys.length === 0) {
           this.fail(notify, "release needs the keys to let through");
           return null;
@@ -322,6 +370,31 @@ export class StoreService implements HostedService {
         // Each record was pushed on its own; there is no single result to
         // continue with here.
         return null;
+      }
+
+      case "requeue": {
+        const keys = this.keysFrom(input);
+        if (keys.length === 0) {
+          this.fail(notify, "requeue needs the keys to put back");
+          return null;
+        }
+        await this.requeueKeys(keys, notify);
+        return null;
+      }
+
+      case "ack": {
+        const settled = await this.settle(input, scope);
+        if (!settled) {
+          // Nothing to settle is not a failure: a pipeline may run for reasons
+          // that have nothing to do with the queue, and reaching an `ack` with
+          // no record in hand simply means there was none.
+          this.lastCount = 0;
+          return null;
+        }
+        this.lastCount = 1;
+        // What was settled, so anything after this knows what finished. The
+        // input is not passed through: the record is the subject here.
+        return { key: settled.key, acknowledged: true };
       }
     }
   }
@@ -338,6 +411,83 @@ export class StoreService implements HostedService {
    * the record, which is what retry and dead-lettering exist to fix; until then
    * the honest description is that approving is final.
    */
+  /** The keys an input names, whether it wraps them or is them. */
+  private keysFrom(input: unknown): string[] {
+    return readKeys(
+      input && typeof input === "object" && "keys" in (input as JsonRecord)
+        ? (input as JsonRecord).keys
+        : input,
+    );
+  }
+
+  /**
+   * Settles the record this run was carrying.
+   *
+   * A named key wins where the board gives one. Otherwise the run does the
+   * naming: `release` hands each record to a run of its own and writes that run
+   * onto the record, and the run id threads through every service after it —
+   * including the ones that answer long after the pass that started them. So an
+   * acknowledgement at the far end of a pipeline knows what it is settling
+   * without the board having to carry the key through every step, which the
+   * services in between would otherwise drop.
+   */
+  private async settle(
+    input: unknown,
+    scope: StoreScope,
+  ): Promise<StoredRecord | null> {
+    const named = this.resolveKey(input);
+    if (named) {
+      const record = await this.store.get(scope, named);
+      if (record) {
+        await this.store.remove(scope, named);
+      }
+      return record;
+    }
+
+    const runId = this.host?.currentContext()?.runId;
+    if (!runId) {
+      return null;
+    }
+    const held = (await this.store.list(scope)).find(
+      (record) => record.lease?.run === runId,
+    );
+    if (!held) {
+      return null;
+    }
+    await this.store.remove(scope, held.key);
+    return held;
+  }
+
+  /**
+   * Puts records back where anyone can take them again.
+   *
+   * The way out of a lease that will never be settled: a pipeline that failed
+   * leaves its record in flight, and somebody looking at the queue decides it
+   * is worth another go.
+   */
+  private async requeueKeys(keys: string[], notify: Notify): Promise<void> {
+    const scope = this.scope();
+    if (!scope) {
+      this.fail(notify, "store has no runtime to scope its records to");
+      return;
+    }
+    let returned = 0;
+    for (const key of keys) {
+      const record = await this.store.get(scope, key);
+      // Only what was actually handed out. With one table showing both states,
+      // a selection can hold records that were already waiting, and counting
+      // those as returned would report work that did not happen.
+      if (!record?.lease) {
+        continue;
+      }
+      if (await this.store.setLease(scope, key, null)) {
+        returned += 1;
+      }
+    }
+    this.lastCount = returned;
+    notify({ requeued: returned, requested: keys.length });
+  }
+
   private async releaseKeys(keys: string[], notify: Notify): Promise<void> {
     const scope = this.scope();
     if (!scope) {
@@ -345,7 +495,6 @@ export class StoreService implements HostedService {
       return;
     }
 
-    const context = this.host?.currentContext() ?? undefined;
     let released = 0;
     for (const key of keys) {
       const record = await this.store.get(scope, key);
@@ -354,9 +503,28 @@ export class StoreService implements HostedService {
         // at the same queue is the normal case.
         continue;
       }
-      await this.store.remove(scope, key);
+      if (record.lease) {
+        // Already in flight. Handing it out twice is how one enquiry gets
+        // answered twice, which is worse than handing it out late.
+        continue;
+      }
+
+      // A run of its own, so that whatever finishes the work at the far end can
+      // say which record it finished. Minted here rather than taken from the
+      // call in progress because there is none: this usually runs from a
+      // configure, which is all a facade button can send.
+      const context = newRun();
+      const leased = await this.store.setLease(scope, key, {
+        at: new Date().toISOString(),
+        run: context.runId,
+      });
+      if (!leased) {
+        continue;
+      }
       released += 1;
-      this.push({ ...record }, notify, context);
+      // Leased, not deleted: nothing removes it until something acknowledges
+      // the work, so a pipeline that fails leaves it recoverable.
+      this.push(described(leased), notify, context);
     }
     this.lastCount = released;
     notify({ released, requested: keys.length });

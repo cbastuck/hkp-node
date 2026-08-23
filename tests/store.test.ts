@@ -299,7 +299,7 @@ describe("store release", () => {
     return sink as any[];
   }
 
-  it("lets the picked records through and leaves the rest", async () => {
+  it("lets the picked records through and leaves the rest waiting", async () => {
     // The human checkpoint: the queue is what has *not* been dealt with.
     const { store } = await fileStore();
     for (const name of ["a", "b", "c"]) {
@@ -307,11 +307,45 @@ describe("store release", () => {
     }
     const t = serviceOn(store, { mode: "release" });
 
-    t.service.configure({ keys: ["a", "c"] });
+    t.service.process({ keys: ["a", "c"] }, t.notify);
     const pushed = await pushes(t.pushed, 2);
 
     expect(pushed.map((r) => r.key).sort()).toEqual(["a", "c"]);
-    expect((await store.list(BOARD)).map((r) => r.key)).toEqual(["b"]);
+    const waiting = await pass(
+      serviceOn(store, { mode: "list" }),
+      undefined,
+    );
+    expect(waiting.records.map((r: any) => r.key)).toEqual(["b"]);
+  });
+
+  it("keeps a released record until something says the work finished", async () => {
+    // The whole point: a pipeline that fails must leave the record recoverable
+    // rather than having consumed it.
+    const { store } = await fileStore();
+    await store.put(BOARD, "a", { v: 1 });
+    const t = serviceOn(store, { mode: "release" });
+
+    t.service.process({ keys: ["a"] }, t.notify);
+    await pushes(t.pushed, 1);
+
+    // Gone from the queue, still on disk.
+    const held = await store.get(BOARD, "a");
+    expect(held).not.toBeNull();
+    expect(held!.lease).toBeTruthy();
+  });
+
+  it("does not hand the same record out twice", async () => {
+    // How one enquiry gets answered twice, which is worse than answering late.
+    const { store } = await fileStore();
+    await store.put(BOARD, "a", { v: 1 });
+    const t = serviceOn(store, { mode: "release" });
+
+    t.service.process({ keys: ["a"] }, t.notify);
+    await pushes(t.pushed, 1);
+    t.service.process({ keys: ["a"] }, t.notify);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    expect(t.pushed).toHaveLength(1);
   });
 
   it("hands over one record per pass, not a batch of them", async () => {
@@ -322,7 +356,7 @@ describe("store release", () => {
     await store.put(BOARD, "b", { rooms: 2 });
     const t = serviceOn(store, { mode: "release" });
 
-    t.service.configure({ keys: ["a", "b"] });
+    t.service.process({ keys: ["a", "b"] }, t.notify);
     const pushed = await pushes(t.pushed, 2);
 
     expect(pushed).toHaveLength(2);
@@ -330,19 +364,20 @@ describe("store release", () => {
     expect(pushed[1].value).toEqual({ rooms: 2 });
   });
 
-  it("acts on configure, because that is all a facade can do", async () => {
-    // A facade button sends a payload; it does not start a pipeline pass.
+  it("keeps a choice somebody made once out of the board's state", async () => {
+    // Releasing is an act, not a setting. Were the keys configuration they
+    // would be saved with the board and released again on the next open.
     const { store } = await fileStore();
     await store.put(BOARD, "a", {});
     const t = serviceOn(store, { mode: "release" });
 
     const state = t.service.configure({ keys: ["a"] });
-    await pushes(t.pushed, 1);
+    await new Promise((resolve) => setTimeout(resolve, 30));
 
-    // And the key does not survive into the board's saved state, or opening
-    // that board again would release it a second time.
     expect(state.keys).toBeUndefined();
     expect(t.service.getState().keys).toBeUndefined();
+    // Configuring alone releases nothing.
+    expect(t.pushed).toEqual([]);
   });
 
   it("takes records as readily as keys", async () => {
@@ -363,7 +398,7 @@ describe("store release", () => {
     await store.put(BOARD, "a", {});
     const t = serviceOn(store, { mode: "release" });
 
-    t.service.configure({ keys: ["a", "gone"] });
+    t.service.process({ keys: ["a", "gone"] }, t.notify);
     await pushes(t.pushed, 1);
     await new Promise((resolve) => setTimeout(resolve, 20));
 
@@ -375,11 +410,177 @@ describe("store release", () => {
     await store.put(BOARD, "a", {});
     const t = serviceOn(store, { mode: "release" });
 
-    t.service.configure({ keys: [] });
+    t.service.process({ keys: [] }, t.notify);
     await new Promise((resolve) => setTimeout(resolve, 20));
 
     expect(t.pushed).toEqual([]);
     expect(await store.list(BOARD)).toHaveLength(1);
+  });
+});
+
+describe("store acknowledgement", () => {
+  /**
+   * A host that runs a "pipeline" for whatever is pushed into it, the way a
+   * runtime does — including keeping the run context across an asynchronous
+   * gap, which is what the correlation depends on.
+   */
+  function pipelineHost(
+    store: RecordStore,
+    downstream: (record: any, context: any) => Promise<void> | void,
+  ) {
+    const host: any = {
+      processFrom: (
+        _uuid: string,
+        data: unknown,
+        _onNotification: unknown,
+        context: unknown,
+      ) => {
+        void downstream(data, context);
+        return null;
+      },
+      notify: () => {},
+      currentContext: () => host.__context ?? null,
+      log: () => {},
+      forwardLog: () => {},
+      logSettings: () => ({ logging: false, logData: false, logLevel: "info" as const }),
+      scope: () => BOARD,
+      emitResult: () => {},
+    };
+    return host;
+  }
+
+  it("settles the record its run was carrying", async () => {
+    // The key does not survive the pipeline — a model's answer carries no
+    // record id — so the run is what says which record finished.
+    const { store } = await fileStore();
+    await store.put(BOARD, "a", { v: 1 });
+
+    const acked: unknown[] = [];
+    const ack = new StoreService(
+      { uuid: "ack", serviceId: "store", state: { mode: "ack" } } as any,
+      store,
+    );
+
+    const host: any = pipelineHost(store, async (_record, context) => {
+      // What a service that answers late does: it hands the context it
+      // captured back, long after the pass that started it returned.
+      host.__context = context;
+      ack.setHost(host);
+      ack.process({ text: "a model's answer, with no key in it" }, (payload) =>
+        acked.push(payload),
+      );
+    });
+
+    const release = new StoreService(
+      { uuid: "rel", serviceId: "store", state: { mode: "release" } } as any,
+      store,
+    );
+    release.setHost(host);
+    release.process({ keys: ["a"] }, () => {});
+
+    await new Promise((resolve) => setTimeout(resolve, 60));
+
+    expect(await store.get(BOARD, "a")).toBeNull();
+  });
+
+  it("settles a record named outright", async () => {
+    const { store } = await fileStore();
+    await store.put(BOARD, "a", { v: 1 });
+    const t = serviceOn(store, { mode: "ack", key: "a" });
+
+    expect(await pass(t, undefined)).toEqual({ key: "a", acknowledged: true });
+    expect(await store.get(BOARD, "a")).toBeNull();
+  });
+
+  it("passes nothing on when there was nothing to settle", async () => {
+    // A pipeline may run for reasons that have nothing to do with the queue.
+    const { store } = await fileStore();
+    const t = serviceOn(store, { mode: "ack" });
+
+    await quietPass(t, { unrelated: true });
+  });
+});
+
+describe("store record state", () => {
+  it("says which state a record is in, rather than implying it", async () => {
+    // So one table can show both, with a column a reader understands.
+    const { store } = await fileStore();
+    await store.put(BOARD, "waiting", {});
+    await store.put(BOARD, "held", {});
+    await store.setLease(BOARD, "held", { at: "2026-08-17T10:00:00.000Z" });
+
+    const listed = await pass(
+      serviceOn(store, { mode: "list", show: "all" }),
+      undefined,
+    );
+
+    const byKey = Object.fromEntries(
+      listed.records.map((r: any) => [r.key, r.state]),
+    );
+    expect(byKey).toEqual({ waiting: "waiting", held: "in-flight" });
+  });
+
+  it("says it on a record it hands to the pipeline too", async () => {
+    const { store } = await fileStore();
+    await store.put(BOARD, "a", {});
+    const t = serviceOn(store, { mode: "release" });
+
+    t.service.process({ keys: ["a"] }, t.notify);
+    const pushed: any = await settled(t.pushed);
+
+    expect(pushed.state).toBe("in-flight");
+  });
+});
+
+describe("store requeue", () => {
+  it("does not report returning what was never handed out", async () => {
+    // One table shows both states, so a selection can hold records that were
+    // already waiting; counting those would report work that did not happen.
+    const { store } = await fileStore();
+    await store.put(BOARD, "waiting", {});
+    await store.put(BOARD, "held", {});
+    await store.setLease(BOARD, "held", { at: "2026-08-17T10:00:00.000Z" });
+
+    const t = serviceOn(store, { mode: "requeue" });
+    t.service.process({ keys: ["waiting", "held"] }, t.notify);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    expect(t.service.getState().lastCount).toBe(1);
+  });
+
+  it("puts a stranded record back where anyone can take it", async () => {
+    const { store } = await fileStore();
+    await store.put(BOARD, "a", { v: 1 });
+    await store.setLease(BOARD, "a", { at: "2026-08-16T10:00:00.000Z", run: "r1" });
+
+    const t = serviceOn(store, { mode: "requeue" });
+    t.service.process({ keys: ["a"] }, t.notify);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    expect((await store.get(BOARD, "a"))!.lease).toBeUndefined();
+  });
+
+  it("shows what is in flight to whoever asks for it", async () => {
+    // Where a stranded record becomes visible instead of silently lost.
+    const { store } = await fileStore();
+    await store.put(BOARD, "waiting", {});
+    await store.put(BOARD, "stuck", {});
+    await store.setLease(BOARD, "stuck", { at: "2026-08-16T10:00:00.000Z" });
+
+    const queue = await pass(serviceOn(store, { mode: "list" }), undefined);
+    expect(queue.records.map((r: any) => r.key)).toEqual(["waiting"]);
+
+    const flight = await pass(
+      serviceOn(store, { mode: "list", show: "in-flight" }),
+      undefined,
+    );
+    expect(flight.records.map((r: any) => r.key)).toEqual(["stuck"]);
+
+    const both = await pass(
+      serviceOn(store, { mode: "list", show: "all" }),
+      undefined,
+    );
+    expect(both.count).toBe(2);
   });
 });
 

@@ -320,6 +320,35 @@ export class HostedRuntime implements RuntimeHost {
     );
   }
 
+  /**
+   * Runs the pipeline starting **at** a service rather than after it.
+   *
+   * `processFrom` exists for a service handing work onward — it means "carry on
+   * behind me", so it advances past the caller. This is the other question:
+   * something outside the pipeline wants a particular service to do its job
+   * with a given payload, and that service must actually run.
+   *
+   * hkp-rt spells the same distinction as `processFrom(service, data,
+   * advanceBefore)`; kept as a separate entry point here so the advancing call,
+   * which every service uses, cannot change shape by accident.
+   */
+  processAt(
+    startAtUuid: string,
+    input: unknown,
+    onNotification: (notification: RuntimeNotification) => void,
+    context?: ProcessContext,
+  ): unknown {
+    const startIndex = this.serviceOrder.indexOf(startAtUuid);
+    if (startIndex < 0) {
+      throw new Error(`No such service: ${startAtUuid}`);
+    }
+    // Nothing to continue: whoever asked for this is outside the board, so it
+    // begins a run rather than joining one.
+    return this.withContext(context ?? newRun(), () =>
+      this.processFromIndex(startIndex, input, onNotification),
+    );
+  }
+
   notify(payload: unknown, instanceId: string): void {
     this.emitNotification({ instanceId, payload }, () => {});
   }

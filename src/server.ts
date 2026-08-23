@@ -774,6 +774,48 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
     },
   );
 
+  /**
+   * Run the pipeline starting at one service, with a given payload.
+   *
+   * Distinct from configuring it: configure says what a service *is*, this says
+   * do your job with this. A facade button had only the former, so anything it
+   * needed to cause had to be smuggled in as a config field that a service read
+   * as a command — which is how `store` ended up releasing records from inside
+   * `configure`.
+   *
+   * The service named here runs; it is not skipped the way `processFrom` skips
+   * the caller that is handing work onward.
+   */
+  expressApp.post(
+    "/runtimes/:runtimeId/services/:instanceId/process",
+    (req, res) => {
+      const runtime = getRuntimeOr404(req, res, req.params.runtimeId);
+      if (!runtime) {
+        return;
+      }
+      if (req.body === undefined) {
+        res.sendStatus(400);
+        return;
+      }
+      if (!runtime.getService(req.params.instanceId)) {
+        res.sendStatus(404);
+        return;
+      }
+
+      // No context: an external caller is not continuing a run, it is starting
+      // one — the same reasoning as POST /runtimes/:runtimeId.
+      const result = runtime.processAt(
+        req.params.instanceId,
+        req.body,
+        () => {
+          // Notifications are broadcast through runtime notification targets.
+        },
+        contextFromWire((req.body as JsonRecord | undefined)?.__context),
+      );
+      res.json(result ?? null);
+    },
+  );
+
   expressApp.get("/runtimes/:runtimeId/services/:instanceId", (req, res) => {
     const runtime = getRuntimeOr404(req, res, req.params.runtimeId);
     if (!runtime) {

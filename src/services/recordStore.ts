@@ -33,11 +33,35 @@ import { RuntimeScope } from "../types";
 /** Bumped only when the shape on disk changes; an unknown one is left alone. */
 const FORMAT_VERSION = 1;
 
+/**
+ * A record, and whether somebody is currently dealing with it.
+ *
+ * A lease is what makes "released" different from "gone": the record has been
+ * handed to a pipeline and is no longer waiting, but it has not been settled
+ * either. Nothing removes it until something says the work finished, so a
+ * pipeline that fails leaves it recoverable rather than lost.
+ */
+export type RecordLease = {
+  /** When it was handed out. What a lease timeout would read. */
+  at: string;
+  /**
+   * The run it was handed to.
+   *
+   * How an acknowledgement at the far end of a pipeline knows which record it
+   * is settling: the run id threads through every service, including the ones
+   * that answer long after the pass that started them, so it survives the gap
+   * that the record's own key does not.
+   */
+  run?: string;
+};
+
 export type StoredRecord = {
   key: string;
   value: unknown;
   createdAt: string;
   updatedAt: string;
+  /** Absent while the record is waiting; present once it is being dealt with. */
+  lease?: RecordLease;
 };
 
 type RecordFile = StoredRecord & { version: number };
@@ -57,6 +81,15 @@ export type RecordStore = {
   get(scope: StoreScope, key: string): Promise<StoredRecord | null>;
   /** Every record of one table, oldest first. */
   list(scope: StoreScope): Promise<StoredRecord[]>;
+  /**
+   * Hands a record out, or takes it back. Returns the record as it now stands,
+   * or null when there is none by that key.
+   */
+  setLease(
+    scope: StoreScope,
+    key: string,
+    lease: RecordLease | null,
+  ): Promise<StoredRecord | null>;
   /** True when there was something to delete. */
   remove(scope: StoreScope, key: string): Promise<boolean>;
   /** Everything this table kept. Returns how many records went. */
@@ -104,14 +137,36 @@ export function createFileRecordStore(root: string): RecordStore {
     if (!isRecordFile(parsed) || parsed.version !== FORMAT_VERSION) {
       return null;
     }
-    const { key, value, createdAt, updatedAt } = parsed;
-    return { key, value, createdAt, updatedAt };
+    const { key, value, createdAt, updatedAt, lease } = parsed;
+    return { key, value, createdAt, updatedAt, ...(lease ? { lease } : {}) };
+  }
+
+  /**
+   * Writes a record whole, beside its target and then renamed into place: a
+   * rename within one directory is atomic, so a crash mid-write leaves the
+   * previous record intact rather than half of the new one.
+   */
+  async function write(
+    scope: StoreScope,
+    record: StoredRecord,
+  ): Promise<StoredRecord> {
+    const dir = tableDir(scope);
+    await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+    const file = recordPath(scope, record.key);
+    const contents: RecordFile = { version: FORMAT_VERSION, ...record };
+    const temporary = `${file}.${randomBytes(6).toString("hex")}.tmp`;
+    await fs.writeFile(temporary, JSON.stringify(contents), { mode: 0o600 });
+    try {
+      await fs.rename(temporary, file);
+    } catch (err) {
+      await fs.rm(temporary, { force: true });
+      throw err;
+    }
+    return record;
   }
 
   return {
     async put(scope, key, value) {
-      const dir = tableDir(scope);
-      await fs.mkdir(dir, { recursive: true, mode: 0o700 });
       const file = recordPath(scope, key);
       const now = new Date().toISOString();
       // Overwriting keeps the record's original age: when it first arrived is
@@ -125,16 +180,23 @@ export function createFileRecordStore(root: string): RecordStore {
         updatedAt: now,
       };
 
-      const contents: RecordFile = { version: FORMAT_VERSION, ...record };
-      const temporary = `${file}.${randomBytes(6).toString("hex")}.tmp`;
-      await fs.writeFile(temporary, JSON.stringify(contents), { mode: 0o600 });
-      try {
-        await fs.rename(temporary, file);
-      } catch (err) {
-        await fs.rm(temporary, { force: true });
-        throw err;
+      return write(scope, record);
+    },
+
+    async setLease(scope, key, lease) {
+      const record = await read(recordPath(scope, key));
+      if (!record) {
+        return null;
       }
-      return record;
+      // The value and its age are untouched: handing a record out is a fact
+      // about who is dealing with it, not an edit to what it says.
+      const updated: StoredRecord = { ...record };
+      if (lease) {
+        updated.lease = lease;
+      } else {
+        delete updated.lease;
+      }
+      return write(scope, updated);
     },
 
     async get(scope, key) {
@@ -239,6 +301,22 @@ export function createMemoryRecordStore(): RecordStore {
 
     async get(scope, key) {
       return boardOf(scope).get(key) ?? null;
+    },
+
+    async setLease(scope, key, lease) {
+      const board = boardOf(scope);
+      const record = board.get(key);
+      if (!record) {
+        return null;
+      }
+      const updated: StoredRecord = { ...record };
+      if (lease) {
+        updated.lease = lease;
+      } else {
+        delete updated.lease;
+      }
+      board.set(key, updated);
+      return updated;
     },
 
     async list(scope) {
