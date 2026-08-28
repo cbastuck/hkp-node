@@ -2,14 +2,32 @@
  * Expression evaluation for services that let a board author write small
  * dynamic terms — a Map template's `key=` rows, for example.
  *
- * An expression is a single JavaScript expression evaluated with the incoming
- * data bound to `params` and the helper functions below in scope. The browser
- * runtime evaluates the same sources (through expression-eval), so the helper
- * set is kept aligned: a template authored in the shared Map UI behaves the
- * same whichever runtime hosts the service. Helpers that need a browser (DOM,
- * vault, AudioContext) have no counterpart here and are left out.
+ * An expression is parsed to an AST and interpreted against a scope holding
+ * the incoming data as `params` and the helper functions below. It is not
+ * JavaScript: the grammar is jsep's, so there are no statements, no
+ * assignment, no function or arrow expressions, no object literals and no
+ * template strings — array literals, member access, calls, `||`/`&&` and the
+ * ternary are the whole of it.
+ *
+ * **Nothing outside the scope is reachable, and that is the point.** A term
+ * naming `process` or `require` evaluates to `undefined` rather than to the
+ * real thing, and reaching a constructor through a value that *is* in scope
+ * (`x.constructor.constructor("…")()`, the usual way out of an interpreter
+ * like this) is refused by the evaluator. Compiling these terms with
+ * `new Function` — which is what this module used to do — made every
+ * expression a board contained arbitrary code in the runtime's own process.
+ * The evaluator is a boundary, so keep it one: no helper below may hand back
+ * a constructor, a module, or a way to reach either.
+ *
+ * The browser runtime evaluates the same sources through the same library, so
+ * one template behaves the same whichever runtime hosts the service and the
+ * shared Map UI can validate for both. The helper set is kept aligned for the
+ * same reason; helpers that need a browser (DOM, vault, AudioContext) have no
+ * counterpart here and are left out.
  */
 import { randomUUID } from "node:crypto";
+
+import { eval as evaluateAst, parse } from "expression-eval";
 
 export type CompiledExpression = (params: unknown) => unknown;
 
@@ -256,19 +274,16 @@ function uuidV7(): string {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
-// A predicate for find/filter is itself an expression string. It is compiled
+// A predicate for find/filter is itself an expression string. It is parsed
 // once per call and evaluated per element with `item`/`index` in scope, since
-// the expression dialect has no lambdas.
+// the expression dialect has no lambdas. `params` is deliberately not in
+// scope: the browser's predicate does not bind it either, and a predicate that
+// works in one runtime and not the other is worse than one that is merely
+// narrow.
 function itemPredicate(predicate: string) {
-  const evaluate = new Function(
-    ...GLOBAL_NAMES,
-    "item",
-    "index",
-    `"use strict"; return (${predicate});`,
-  ) as (...args: unknown[]) => unknown;
-
+  const ast = parse(predicate);
   return (item: unknown, index: number) =>
-    !!evaluate(...GLOBAL_VALUES, item, index);
+    !!evaluateAst(ast, { item, index, ...globalScope });
 }
 
 export const globalScope: Record<string, unknown> = {
@@ -320,26 +335,23 @@ export const globalScope: Record<string, unknown> = {
   },
 };
 
-const GLOBAL_NAMES = Object.keys(globalScope);
-const GLOBAL_VALUES = GLOBAL_NAMES.map((name) => globalScope[name]);
-
 /**
  * Compiles an expression source into a callable. Non-string sources are
  * constants and are returned as-is; a source that does not parse throws when
  * called, so the caller decides how a broken term is reported.
+ *
+ * Parsing happens once, evaluation once per pass — the same split the old
+ * `new Function` had, so a template still costs one compile and not one per
+ * input.
  */
 export function compileExpression(source: unknown): CompiledExpression {
   if (typeof source !== "string") {
     return () => source;
   }
 
-  let evaluate: (...args: unknown[]) => unknown;
+  let ast: ReturnType<typeof parse>;
   try {
-    evaluate = new Function(
-      ...GLOBAL_NAMES,
-      "params",
-      `"use strict"; return (${source});`,
-    ) as (...args: unknown[]) => unknown;
+    ast = parse(source);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return () => {
@@ -347,5 +359,7 @@ export function compileExpression(source: unknown): CompiledExpression {
     };
   }
 
-  return (params: unknown) => evaluate(...GLOBAL_VALUES, params);
+  // `params` names the input, and the helpers sit beside it — the same scope
+  // the browser builds, so the same term resolves the same names.
+  return (params: unknown) => evaluateAst(ast, { params, ...globalScope });
 }

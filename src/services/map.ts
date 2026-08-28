@@ -15,6 +15,11 @@
  * against `params`, a plain key is a static value, a dot in a key nests the
  * result, and a lone "=" key produces a scalar instead of an object. Templates
  * that nest objects or arrays keep their shape and are evaluated recursively.
+ *
+ * Both runtimes parse those terms with the same library, so the shared UI can
+ * tell an author whether a template is valid without knowing where it will
+ * run. What a term may reach is bounded there rather than here — see
+ * `expression.ts`.
  */
 import {
   HostedService,
@@ -52,6 +57,27 @@ type TemplateNode =
       type: "object";
       entries: Array<{ key: string; dynamic: boolean; node: TemplateNode }>;
     };
+
+/**
+ * A sensed template: the shape of what arrived, and nothing that runs.
+ *
+ * Sensing builds a template out of *input*, and a template key ending in "="
+ * is an expression — so a field named `pwned=` would arrive as data and be
+ * compiled as code on the next pass. Input reaches this service from wherever
+ * the board is fed: an unauthenticated mount, an email body, an HTTP response.
+ * None of those may decide what the runtime executes.
+ *
+ * The suffix is dropped rather than the field, so sensing an unlucky name
+ * still produces the field it was meant to. Nothing is lost: a legitimate
+ * sensed key is a data field, never an expression a board wrote.
+ */
+function sensed(flat: JsonRecord): JsonRecord {
+  const safe: JsonRecord = {};
+  for (const [key, value] of Object.entries(flat)) {
+    safe[key.endsWith("=") ? key.replace(/=+$/, "") : key] = value;
+  }
+  return safe;
+}
 
 export class MapService implements HostedService {
   readonly serviceId = mapDescriptor.serviceId;
@@ -126,9 +152,11 @@ export class MapService implements HostedService {
   process(input: unknown, _notify: (payload: unknown) => void): unknown {
     if (this.state.sensingMode) {
       this.updateTemplate(
-        isJsonRecord(input) || Array.isArray(input)
-          ? flatten(input)
-          : { value: input },
+        sensed(
+          isJsonRecord(input) || Array.isArray(input)
+            ? flatten(input)
+            : { value: input },
+        ),
       );
       this.updateSensingMode(false);
       return null;
