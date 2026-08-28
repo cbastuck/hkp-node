@@ -374,7 +374,7 @@ export class DocumentExtractService implements HostedService {
       const output = this.shape(result, source, started);
       this.setStatus(notify, "idle");
       notify(output);
-      this.push(output, notify, context);
+      await this.push(output, notify, context);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       this.fail(notify, `extraction failed: ${message}`);
@@ -564,15 +564,15 @@ export class DocumentExtractService implements HostedService {
     return null;
   }
 
-  private push(
+  private async push(
     result: JsonRecord,
     notify: Notify,
     context?: ProcessContext,
-  ): void {
+  ): Promise<void> {
     if (!this.host) {
       return;
     }
-    const output = this.host.processFrom(
+    const output = await this.host.processFrom(
       this.uuid,
       result,
       (n: RuntimeNotification) => notify(n.payload, n.instanceId),

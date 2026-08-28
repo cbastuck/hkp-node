@@ -197,12 +197,19 @@ export type LogEntry = {
 };
 
 export interface RuntimeHost {
+  /**
+   * Runs the services after `startAfterUuid` and answers with what they
+   * produced.
+   *
+   * Asynchronous because a pass is: the runtime awaits each service, so a
+   * service that pulls the ones behind it has to await them too.
+   */
   processFrom(
     startAfterUuid: string,
     data: unknown,
     onNotification: (notification: RuntimeNotification) => void,
     context?: ProcessContext,
-  ): unknown;
+  ): Promise<unknown>;
   notify(payload: unknown, instanceId: string): void;
   emitResult(output: unknown): void;
   /**

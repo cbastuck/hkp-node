@@ -258,7 +258,7 @@ export class HttpClientService implements HostedService {
         status: response.status,
         inFlight: this.inFlight - 1,
       });
-      this.push(result, notify, context);
+      await this.push(result, notify, context);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       notify({ requesting: false, url, error: message });
@@ -368,15 +368,15 @@ export class HttpClientService implements HostedService {
    * itself; nothing else will, and running the remaining services alone would
    * leave the chain dead from here on.
    */
-  private push(
+  private async push(
     result: JsonRecord,
     notify: (payload: unknown, instanceId?: string) => void,
     context?: ProcessContext,
-  ): void {
+  ): Promise<void> {
     if (!this.host) {
       return;
     }
-    const output = this.host.processFrom(
+    const output = await this.host.processFrom(
       this.uuid,
       result,
       (n: RuntimeNotification) => notify(n.payload, n.instanceId),

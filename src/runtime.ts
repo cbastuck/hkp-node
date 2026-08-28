@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 
 import {
@@ -99,10 +100,21 @@ export class HostedRuntime implements RuntimeHost {
   private readonly resultTargets = new Set<(result: unknown) => void>();
   private readonly createService: ServiceCreator;
   private readonly mounts?: RuntimeMounts;
-  /** The call being processed right now; see withContext. */
-  private context: ProcessContext | null = null;
-  /** Which service the pass is inside, so a log entry can name it. */
-  private currentService: string | null = null;
+  /**
+   * The call being processed right now, and which service it is inside.
+   *
+   * Async-local rather than a field: a pass awaits the services it calls, so
+   * two runs started independently — a timer tick and an arriving message —
+   * interleave freely. A plain field would let the second overwrite the first's
+   * context mid-await, and every log entry and captured run id after that point
+   * would name the wrong run. `AsyncLocalStorage` gives each run its own view
+   * and restores the outer one on the way out, which is what a nested pull
+   * needs.
+   */
+  private readonly runState = new AsyncLocalStorage<{
+    context: ProcessContext;
+    service: string | null;
+  }>();
   private readonly logTargets = new Set<(entry: LogEntry) => void>();
   /** See RuntimeConfiguration.logData. A board-wide override, not the gate. */
   private logData = true;
@@ -261,7 +273,7 @@ export class HostedRuntime implements RuntimeHost {
     input: unknown,
     onNotification: (notification: RuntimeNotification) => void,
     context?: ProcessContext,
-  ): unknown {
+  ): Promise<unknown> {
     return this.withContext(context ?? newRun(), () =>
       this.processFromIndex(0, input, onNotification),
     );
@@ -270,7 +282,12 @@ export class HostedRuntime implements RuntimeHost {
   // ── RuntimeHost ────────────────────────────────────────────────────────────
 
   currentContext(): ProcessContext | null {
-    return this.context;
+    return this.runState.getStore()?.context ?? null;
+  }
+
+  /** Which service the current pass is inside, for a log entry to name. */
+  private get currentService(): string | null {
+    return this.runState.getStore()?.service ?? null;
   }
 
   processFrom(
@@ -278,7 +295,7 @@ export class HostedRuntime implements RuntimeHost {
     input: unknown,
     onNotification: (notification: RuntimeNotification) => void,
     context?: ProcessContext,
-  ): unknown {
+  ): Promise<unknown> {
     const startIndex = this.serviceOrder.indexOf(startAfterUuid) + 1;
     // Three ways to arrive here, and each wants a different run:
     //
@@ -294,7 +311,7 @@ export class HostedRuntime implements RuntimeHost {
     // case, which splits its trace in two rather than attributing its work to
     // whichever run happened to be in flight. Fragmentation is visible in a
     // trace; misattribution reads as fact.
-    const runContext = context ?? this.context ?? newRun();
+    const runContext = context ?? this.currentContext() ?? newRun();
 
     // A service pushing from itself (a Timer tick, an inbound message, a peer
     // event) was never called by the loop below, so the loop never reported it.
@@ -337,7 +354,7 @@ export class HostedRuntime implements RuntimeHost {
     input: unknown,
     onNotification: (notification: RuntimeNotification) => void,
     context?: ProcessContext,
-  ): unknown {
+  ): Promise<unknown> {
     const startIndex = this.serviceOrder.indexOf(startAtUuid);
     if (startIndex < 0) {
       throw new Error(`No such service: ${startAtUuid}`);
@@ -362,22 +379,26 @@ export class HostedRuntime implements RuntimeHost {
     if (
       !this.logging ||
       LOG_LEVELS[level] < LOG_LEVELS[this.logLevel] ||
-      !this.context ||
       this.logTargets.size === 0
     ) {
       return;
     }
 
+    const run = this.currentContext();
+    if (!run) {
+      return;
+    }
+
     const entry: LogEntry = {
-      runId: this.context.runId,
+      runId: run.runId,
       ts: new Date().toISOString(),
       runtimeId: this.id,
       serviceUuid: this.currentService ?? "",
       level,
       event,
     };
-    if (this.context.parentRunId) {
-      entry.parentRunId = this.context.parentRunId;
+    if (run.parentRunId) {
+      entry.parentRunId = run.parentRunId;
     }
     if (this.logData && data !== undefined) {
       entry.data = data;
@@ -394,15 +415,14 @@ export class HostedRuntime implements RuntimeHost {
       return;
     }
     const before = this.logTargets.size;
-    if (before === 0 || !this.context) {
+    const run = this.currentContext();
+    if (before === 0 || !run) {
       return;
     }
     for (const target of this.logTargets) {
       target({
-        runId: this.context.runId,
-        ...(this.context.parentRunId
-          ? { parentRunId: this.context.parentRunId }
-          : {}),
+        runId: run.runId,
+        ...(run.parentRunId ? { parentRunId: run.parentRunId } : {}),
         ts: new Date().toISOString(),
         runtimeId: this.id,
         serviceUuid: this.currentService ?? "",
@@ -514,20 +534,31 @@ export class HostedRuntime implements RuntimeHost {
    * threaded through the call instead.
    */
   private withContext<T>(context: ProcessContext, fn: () => T): T {
-    const previous = this.context;
-    this.context = context;
+    // The service is carried alongside the context so both are restored
+    // together on the way out of a nested pull.
+    return this.runState.run({ context, service: this.currentService }, fn);
+  }
+
+  /** Runs `fn` with the pass recorded as being inside `uuid`. */
+  private inService<T>(uuid: string | null, fn: () => T): T {
+    const store = this.runState.getStore();
+    if (!store) {
+      return fn();
+    }
+    const outer = store.service;
+    store.service = uuid;
     try {
       return fn();
     } finally {
-      this.context = previous;
+      store.service = outer;
     }
   }
 
-  private processFromIndex(
+  private async processFromIndex(
     startIndex: number,
     input: unknown,
     onNotification: (notification: RuntimeNotification) => void,
-  ): unknown {
+  ): Promise<unknown> {
     let result: unknown = input;
 
     for (const uuid of this.serviceOrder.slice(startIndex)) {
@@ -549,14 +580,12 @@ export class HostedRuntime implements RuntimeHost {
         onNotification,
       );
 
+      const startedAt = Date.now();
       // Restored rather than cleared, for the same reason the context is: a
       // service that pulls the ones after it re-enters this loop, and when it
       // returns the entries that follow still belong to the service that
       // pulled.
-      const outerService = this.currentService;
-      this.currentService = uuid;
-      const startedAt = Date.now();
-      try {
+      const pending = this.inService(uuid, () => {
         // The flow itself, at debug: which service the runtime called, and
         // below, what it returned and how long it took.
         //
@@ -566,16 +595,22 @@ export class HostedRuntime implements RuntimeHost {
         // about *what ran* is not asking to write payloads to disk. What flows
         // through is recorded only where a service was configured to record it.
         this.log("debug", "service.process");
-        result = service.process(result, (payload, instanceId) => {
+        return service.process(result, (payload, instanceId) => {
           this.emitNotification(
             { instanceId: instanceId ?? uuid, payload },
             onNotification,
           );
         });
-        this.logProcessed(result, Date.now() - startedAt);
-      } finally {
-        this.currentService = outerService;
-      }
+      });
+
+      // A service may answer within the call or after it. Awaiting either is
+      // what lets the one that answers late still be a service the pipeline
+      // reads a result from, rather than one that has to call the rest of the
+      // pipeline itself. Awaiting a plain value costs a microtask.
+      result = isThenable(pending) ? await pending : pending;
+      this.inService(uuid, () =>
+        this.logProcessed(result, Date.now() - startedAt),
+      );
 
       this.emitNotification(
         {
@@ -594,9 +629,7 @@ export class HostedRuntime implements RuntimeHost {
         // Where the run ended, named. Recorded above debug because it is the
         // outcome of the run rather than a step in it: a board that keeps only
         // what matters still wants to know its flow stopped, and where.
-        this.currentService = uuid;
-        this.log("info", "pipeline.stopped");
-        this.currentService = null;
+        this.inService(uuid, () => this.log("info", "pipeline.stopped"));
         break;
       }
     }
@@ -741,4 +774,13 @@ export class RuntimeApp {
       this.createService(serviceConfig),
     );
   }
+}
+
+/** Whether a value is worth awaiting — a promise, or anything promise-like. */
+function isThenable(value: unknown): value is PromiseLike<unknown> {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    typeof (value as PromiseLike<unknown>).then === "function"
+  );
 }

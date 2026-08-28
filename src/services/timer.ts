@@ -175,9 +175,9 @@ export class TimerService {
           durationMs(this._periodicValue, this._periodicUnit),
           this.minIntervalMs,
         );
-        this._timer = setInterval(() => this._tick(), ms);
+        this._timer = setInterval(() => void this._tick(), ms);
         if (immediate) {
-          setTimeout(() => this._tick(), 1);
+          setTimeout(() => void this._tick(), 1);
         }
       } else {
         if (this._timer) {
@@ -186,7 +186,7 @@ export class TimerService {
         const ms = immediate
           ? 1
           : durationMs(this._oneShotDelay, this._oneShotDelayUnit);
-        setTimeout(() => this._tick(), ms);
+        setTimeout(() => void this._tick(), ms);
       }
     }
 
@@ -207,7 +207,7 @@ export class TimerService {
       // the run that handed this input over, resumed. Captured now because by
       // the time the timer fires the call it belongs to is long gone.
       const context = this._host?.currentContext() ?? undefined;
-      setTimeout(() => this._tickWithInput(input, context), ms);
+      setTimeout(() => void this._tickWithInput(input, context), ms);
     }
     return input;
   }
@@ -218,7 +218,7 @@ export class TimerService {
 
   // ── Private ──────────────────────────────────────────────────────────────
 
-  private _tick(): void {
+  private async _tick(): Promise<void> {
     if (
       this._conditionUntilTriggerCount !== undefined &&
       this._counter >= this._conditionUntilTriggerCount
@@ -229,7 +229,7 @@ export class TimerService {
     const triggerCount = ++this._counter;
     this._notify({ counter: triggerCount });
     if (this._host) {
-      const result = this._host.processFrom(
+      const result = await this._host.processFrom(
         this.uuid,
         { triggerCount },
         // No-op: the runtime already fans these out to its notification
@@ -240,7 +240,10 @@ export class TimerService {
     }
   }
 
-  private _tickWithInput(input: unknown, context?: ProcessContext): void {
+  private async _tickWithInput(
+    input: unknown,
+    context?: ProcessContext,
+  ): Promise<void> {
     const triggerCount = ++this._counter;
     this._notify({ counter: triggerCount });
     if (this._host) {
@@ -248,7 +251,7 @@ export class TimerService {
         typeof input === "object" && input !== null
           ? { ...(input as object), triggerCount }
           : { triggerCount };
-      const result = this._host.processFrom(
+      const result = await this._host.processFrom(
         this.uuid,
         merged,
         // No-op: the runtime already fans these out to its notification

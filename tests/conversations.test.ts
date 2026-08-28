@@ -233,7 +233,7 @@ describe("transitions", () => {
 });
 
 describe("polling for work", () => {
-  it("pushes one pass per conversation, each its own run", () => {
+  it("says what it found, and leaves iterating to an iterator", () => {
     const databases = createMemoryDatabaseStore();
     const ingest = serviceWith({ mode: "ingest" }, databases);
     ingest.run(mail({ messageId: "<a@x>" }));
@@ -243,18 +243,14 @@ describe("polling for work", () => {
       { mode: "actionable", inState: ["init"] },
       databases,
     );
+    const found = poll.run(null) as any;
 
-    // Nothing continues from the poll itself; each conversation continues on
-    // its own.
-    expect(poll.run(null)).toBeNull();
-    expect(poll.pushed).toHaveLength(2);
-    expect(poll.pushed.map((p: any) => p.data.conversationId).sort()).toEqual([
-      "a@x",
-      "b@x",
-    ]);
-    const runs = new Set(poll.pushed.map((p) => p.runId));
-    expect(runs.size).toBe(2);
-    expect([...runs].every(Boolean)).toBe(true);
+    expect(found.count).toBe(2);
+    expect(found.conversations.map((c: any) => c.conversationId).sort()).toEqual(
+      ["a@x", "b@x"],
+    );
+    // Nothing is called on its own behalf: the pipeline simply continues.
+    expect(poll.pushed).toHaveLength(0);
   });
 
   it("selects only the states it was told to", () => {
@@ -268,9 +264,9 @@ describe("polling for work", () => {
       { mode: "actionable", inState: "init, waiting-reply" },
       databases,
     );
-    poll.run(null);
+    const found = poll.run(null) as any;
 
-    expect(poll.pushed.map((p: any) => p.data.conversationId)).toEqual(["a@x"]);
+    expect(found.conversations.map((c: any) => c.conversationId)).toEqual(["a@x"]);
   });
 
   it("waits out the idle window before picking a conversation up again", () => {
@@ -283,18 +279,16 @@ describe("polling for work", () => {
     );
 
     // Just ingested: whatever acted on it last may still be acting on it.
-    poll.run(null);
-    expect(poll.pushed).toHaveLength(0);
+    expect((poll.run(null) as any).count).toBe(0);
 
     // The same conversation, an hour and a half of stillness later.
     databases.open({ owner: "tester", boardName: "SYN" }).run(
       "UPDATE conversation SET updatedAt = $then",
       { $then: new Date(Date.now() - 5400 * 1000).toISOString() },
     );
-    poll.run(null);
-    expect(poll.pushed.map((p: any) => p.data.conversationId)).toEqual([
-      "a@example.com",
-    ]);
+    expect(
+      (poll.run(null) as any).conversations.map((c: any) => c.conversationId),
+    ).toEqual(["a@example.com"]);
   });
 
   it("refuses to poll without being told which states are work", () => {

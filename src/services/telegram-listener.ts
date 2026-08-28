@@ -202,7 +202,11 @@ export class TelegramListenerService implements HostedService {
       date: new Date(msg.date * 1000).toISOString(),
     };
 
-    this._push(payload);
+    void this._push(payload).catch((err) =>
+      this._host?.log("error", "service.failed", {
+        message: `telegram push failed: ${err instanceof Error ? err.message : String(err)}`,
+      }),
+    );
   }
 
   private async _call(
@@ -219,9 +223,9 @@ export class TelegramListenerService implements HostedService {
     return response.json();
   }
 
-  private _push(data: unknown): void {
+  private async _push(data: unknown): Promise<void> {
     if (!this._host) return;
-    const result = this._host.processFrom(
+    const result = await this._host.processFrom(
       this.uuid,
       data,
       (n: RuntimeNotification) =>

@@ -89,7 +89,7 @@ function hostSpy() {
   const pushed: unknown[] = [];
   const emitted: unknown[] = [];
   const host: RuntimeHost = {
-    processFrom: (_uuid, data) => {
+    processFrom: async (_uuid, data) => {
       pushed.push(data);
       return data;
     },
@@ -154,8 +154,7 @@ describe("text-generation request", () => {
       stream: false,
     });
 
-    t.service.process("What colour is the sky?", t.notify);
-    await settled(t.pushed);
+    await t.service.process("What colour is the sky?", t.notify);
 
     expect(api.received[0].body.messages).toEqual([
       { role: "user", content: "What colour is the sky?" },
@@ -167,8 +166,7 @@ describe("text-generation request", () => {
     const api = await endpoint(() => ({ json: ANSWER }));
     const t = serviceWith({ serverUrl: api.url, apiKey: "sk-test", stream: false });
 
-    t.service.process("hi", t.notify);
-    await settled(t.pushed);
+    await t.service.process("hi", t.notify);
 
     expect(api.received[0].headers["x-api-key"]).toBe("sk-test");
     expect(api.received[0].headers["anthropic-version"]).toBe("2023-06-01");
@@ -178,7 +176,7 @@ describe("text-generation request", () => {
     const api = await endpoint(() => ({ json: ANSWER }));
     const t = serviceWith({ serverUrl: api.url, apiKey: "sk-test", stream: false });
 
-    t.service.process(
+    await t.service.process(
       {
         messages: [
           { role: "user", content: "first" },
@@ -188,7 +186,6 @@ describe("text-generation request", () => {
       },
       t.notify,
     );
-    await settled(t.pushed);
 
     expect(api.received[0].body.messages).toHaveLength(3);
   });
@@ -199,7 +196,7 @@ describe("text-generation request", () => {
     const api = await endpoint(() => ({ json: ANSWER }));
     const t = serviceWith({ serverUrl: api.url, apiKey: "sk-test", stream: false });
 
-    t.service.process(
+    await t.service.process(
       {
         meta: { contentType: "image/png" },
         binary: new Uint8Array([1, 2, 3]),
@@ -207,7 +204,6 @@ describe("text-generation request", () => {
       },
       t.notify,
     );
-    await settled(t.pushed);
 
     const [image, text] = api.received[0].body.messages[0].content;
     expect(image.type).toBe("image");
@@ -230,8 +226,7 @@ describe("text-generation request", () => {
       maxTokens: 512,
     });
 
-    t.service.process("think about it", t.notify);
-    await settled(t.pushed);
+    await t.service.process("think about it", t.notify);
 
     const body = api.received[0].body;
     expect(body.thinking).toEqual({ type: "enabled", budget_tokens: 2048 });
@@ -249,8 +244,7 @@ describe("text-generation output", () => {
     const api = await endpoint(() => ({ json: ANSWER }));
     const t = serviceWith({ serverUrl: api.url, apiKey: "sk-test", stream: false });
 
-    t.service.process("hi", t.notify);
-    const result = await settled(t.pushed);
+    const result: any = await t.service.process("hi", t.notify);
 
     expect(result.text).toBe("Blue.");
     expect(result.model).toBe("claude-sonnet-5");
@@ -271,22 +265,25 @@ describe("text-generation output", () => {
     }));
     const t = serviceWith({ serverUrl: api.url, apiKey: "sk-test", stream: false });
 
-    t.service.process("why", t.notify);
-    const result = await settled(t.pushed);
+    const result: any = await t.service.process("why", t.notify);
 
     expect(result.text).toBe("Blue.");
     expect(result.thinking).toBe("the sky scatters blue");
   });
 
-  it("stops the push and hands the answer over when it arrives", async () => {
-    // Generation takes seconds; the pass it started in returned long before.
+  it("answers the pass that called it, however long it takes", async () => {
+    // Generation takes seconds to minutes, and the runtime waits. Answering
+    // here rather than pushing later is what lets the services after this one
+    // be ordinary services: a `join` merging the answer with the question, a
+    // `put-artifact` filing it, neither told which run it belongs to.
     const api = await endpoint(() => ({ json: ANSWER }));
     const t = serviceWith({ serverUrl: api.url, apiKey: "sk-test", stream: false });
 
-    expect(t.service.process("hi", t.notify)).toBeNull();
-
-    await settled(t.pushed);
-    expect(await settled(t.emitted)).toMatchObject({ text: "Blue." });
+    expect(await t.service.process("hi", t.notify)).toMatchObject({
+      text: "Blue.",
+    });
+    // Nothing is called on its own behalf any more.
+    expect(t.pushed).toHaveLength(0);
   });
 });
 
@@ -312,8 +309,7 @@ describe("text-generation streaming", () => {
     }));
     const t = serviceWith({ serverUrl: api.url, apiKey: "sk-test", stream: true });
 
-    t.service.process("hi", t.notify);
-    const result = await settled(t.pushed);
+    const result: any = await t.service.process("hi", t.notify);
 
     expect(api.received[0].body.stream).toBe(true);
     expect(result.text).toBe("Blue.");
@@ -323,6 +319,55 @@ describe("text-generation streaming", () => {
       streamText: "Blue.",
       streamDone: true,
     });
+  });
+});
+
+describe("text-generation streaming is off under a schema", () => {
+  const schema = { type: "object", properties: { n: { type: "integer" } } };
+
+  it("does not stream, whatever the board asked for", async () => {
+    const api = await endpoint(() => ({
+      json: {
+        model: "stub",
+        choices: [
+          { finish_reason: "stop", message: { content: '{"n":1}' } },
+        ],
+        usage: {},
+      },
+    }));
+    const t = serviceWith({
+      backend: "server",
+      serverUrl: api.url,
+      stream: true,
+      jsonSchema: schema,
+    });
+
+    await t.service.process({ prompt: "hi" }, t.notify);
+
+    expect(api.received[0].body.stream).toBe(false);
+  });
+
+  it("keeps the board's setting rather than rewriting it", () => {
+    // Rewriting would lose what the board author chose, and saving the board
+    // would then persist a value they never set.
+    const t = serviceWith({ stream: true, jsonSchema: schema });
+
+    expect(t.service.getState().stream).toBe(true);
+  });
+
+  it("says why, where the UI can show it", () => {
+    // Otherwise the panel shows a switch reading "on" over a request that says
+    // "off", and nothing on screen accounts for the difference.
+    const t = serviceWith({ stream: true, jsonSchema: schema });
+    const meta = t.service.getState().__meta__ as any;
+
+    expect(meta?.stream?.data?.note).toContain("JSON schema");
+  });
+
+  it("says nothing when there is nothing to explain", () => {
+    const t = serviceWith({ stream: true });
+
+    expect(t.service.getState().__meta__).toBeUndefined();
   });
 });
 
@@ -344,8 +389,7 @@ describe("text-generation schema", () => {
     }));
     const t = serviceWith({ serverUrl: api.url, apiKey: "sk-test", jsonSchema: schema });
 
-    t.service.process("extract it", t.notify);
-    const result = await settled(t.pushed);
+    const result: any = await t.service.process("extract it", t.notify);
 
     const body = api.received[0].body;
     expect(body.tools[0].input_schema).toEqual(schema);
@@ -367,8 +411,7 @@ describe("text-generation schema", () => {
       jsonSchema: '{"type":"object"}',
     });
 
-    t.service.process("go", t.notify);
-    await settled(t.pushed);
+    await t.service.process("go", t.notify);
 
     expect(api.received[0].body.tools[0].input_schema).toEqual({ type: "object" });
   });
@@ -383,8 +426,7 @@ describe("text-generation schema", () => {
     });
 
     t.service.configure({ jsonSchema: null });
-    t.service.process("go", t.notify);
-    await settled(t.pushed);
+    await t.service.process("go", t.notify);
 
     expect(api.received[0].body.tools).toBeUndefined();
   });
@@ -406,8 +448,7 @@ describe("text-generation credentials", () => {
     const t = serviceWith({ serverUrl: api.url, apiKey: "sk-test", stream: false });
 
     t.service.configure({ apiKey: "", temperature: 0.1 });
-    t.service.process("hi", t.notify);
-    await settled(t.pushed);
+    await t.service.process("hi", t.notify);
 
     expect(api.received[0].headers["x-api-key"]).toBe("sk-test");
   });
@@ -418,8 +459,7 @@ describe("text-generation credentials", () => {
     const api = await endpoint(() => ({ json: ANSWER }));
     const t = serviceWith({ serverUrl: api.url, stream: false });
 
-    t.service.process("hi", t.notify);
-    await settled(t.pushed);
+    await t.service.process("hi", t.notify);
 
     expect(api.received[0].headers["x-api-key"]).toBe("sk-from-env");
   });
@@ -427,7 +467,7 @@ describe("text-generation credentials", () => {
   it("says so rather than calling without one", async () => {
     const t = serviceWith({ serverUrl: "http://127.0.0.1:1" });
 
-    expect(t.service.process("hi", t.notify)).toBeNull();
+    expect(await t.service.process("hi", t.notify)).toBeNull();
     expect(t.notifications).toContainEqual({ status: "error" });
     expect(
       t.notifications.some(
@@ -456,8 +496,7 @@ describe("text-generation credentials", () => {
     expect(String(t.service.getState().error)).toContain("ANTHROPIC_API_KEY");
 
     t.service.configure({ apiKey: "sk-test" });
-    t.service.process("hi", t.notify);
-    await settled(t.pushed);
+    await t.service.process("hi", t.notify);
 
     expect(t.service.getState().error).toBe("");
     expect(t.service.getState().status).toBe("idle");
@@ -474,7 +513,7 @@ describe("text-generation failure", () => {
     }));
     const t = serviceWith({ serverUrl: api.url, apiKey: "sk-test", stream: false });
 
-    t.service.process("hi", t.notify);
+    await t.service.process("hi", t.notify);
     await settled(t.notifications);
     await new Promise((resolve) => setTimeout(resolve, 20));
 
@@ -489,7 +528,7 @@ describe("text-generation failure", () => {
   it("refuses input it cannot read as a prompt", async () => {
     const t = serviceWith({ apiKey: "sk-test" });
 
-    expect(t.service.process({ unrelated: true }, t.notify)).toBeNull();
+    expect(await t.service.process({ unrelated: true }, t.notify)).toBeNull();
     expect(
       t.notifications.some(
         (n: any) => typeof n?.error === "string" && n.error.includes("messages"),
@@ -500,7 +539,7 @@ describe("text-generation failure", () => {
   it("passes on nothing at all rather than an empty answer", async () => {
     const t = serviceWith({ apiKey: "sk-test" });
 
-    expect(t.service.process(null, t.notify)).toBeNull();
+    expect(await t.service.process(null, t.notify)).toBeNull();
     expect(t.notifications).toEqual([]);
   });
 });
@@ -531,8 +570,7 @@ describe("text-generation server backend", () => {
       maxTokens: 64,
     });
 
-    t.service.process("What colour is the sky?", t.notify);
-    const result = await settled(t.pushed);
+    const result: any = await t.service.process("What colour is the sky?", t.notify);
 
     expect(server.received[0].url).toBe("/v1/chat/completions");
     expect(server.received[0].body).toMatchObject({
@@ -563,8 +601,7 @@ describe("text-generation server backend", () => {
       stream: false,
     });
 
-    t.service.process("hello", t.notify);
-    await settled(t.pushed);
+    await t.service.process("hello", t.notify);
 
     expect(server.received[0].headers.authorization).toBeUndefined();
     expect(JSON.stringify(server.received[0])).not.toContain("sk-ant-secret");
@@ -580,8 +617,9 @@ describe("text-generation server backend", () => {
 
     // The anthropic backend refuses here; a local server is reached by
     // address, so there is nothing to be missing.
-    expect(t.service.process("hello", t.notify)).toBeNull();
-    await settled(t.pushed);
+    expect(await t.service.process("hello", t.notify)).toMatchObject({
+      text: "Blue.",
+    });
     expect(server.received).toHaveLength(1);
   });
 
@@ -608,8 +646,7 @@ describe("text-generation server backend", () => {
       jsonSchema: schema,
     });
 
-    t.service.process("Two rooms at the Mercure", t.notify);
-    const result = await settled(t.pushed);
+    const result: any = await t.service.process("Two rooms at the Mercure", t.notify);
 
     expect(server.received[0].body.response_format).toEqual({
       type: "json_schema",
@@ -643,8 +680,7 @@ describe("text-generation server backend", () => {
       warnings.push({ level, event, data });
     };
 
-    t.service.process("Two rooms at the Mercure", t.notify);
-    const result = await settled(t.pushed);
+    const result: any = await t.service.process("Two rooms at the Mercure", t.notify);
 
     expect(result.json).toBeUndefined();
     expect(result.text).toBe("Three rooms, at the Mercure.");
@@ -662,8 +698,7 @@ describe("text-generation server backend", () => {
     }));
     const t = serviceWith({ backend: "server", serverUrl: server.url });
 
-    t.service.process("What colour is the sky?", t.notify);
-    const result = await settled(t.pushed);
+    const result: any = await t.service.process("What colour is the sky?", t.notify);
 
     expect(server.received[0].body.stream).toBe(true);
     expect(result).toMatchObject({
@@ -690,8 +725,7 @@ describe("text-generation server backend", () => {
       stream: false,
     });
 
-    t.service.process("What colour is the sky?", t.notify);
-    const result = await settled(t.pushed);
+    const result: any = await t.service.process("What colour is the sky?", t.notify);
 
     expect(result.text).toBe("Blue.");
     expect(result.thinking).toBe("Sky is blue.");
@@ -731,8 +765,7 @@ describe("text-generation server address", () => {
       stream: false,
     });
 
-    t.service.process("hello", t.notify);
-    await settled(t.pushed);
+    await t.service.process("hello", t.notify);
 
     expect(server.received[0].url).toBe("/v1/chat/completions");
   });
@@ -747,8 +780,7 @@ describe("text-generation server address", () => {
       stream: false,
     });
 
-    t.service.process("hello", t.notify);
-    await settled(t.pushed);
+    await t.service.process("hello", t.notify);
 
     expect(server.received[0].url).toBe("/api/v1/chat/completions");
   });
@@ -762,8 +794,7 @@ describe("text-generation server address", () => {
       stream: false,
     });
 
-    t.service.process("hello", t.notify);
-    await settled(t.pushed);
+    await t.service.process("hello", t.notify);
 
     expect(server.received[0].headers.authorization).toBe("Bearer hosted-token");
     // Still write-only: what a board configured never comes back out.
@@ -821,8 +852,7 @@ describe("text-generation empty answers", () => {
       stream: false,
     });
 
-    t.service.process("hello", t.notify);
-    const result = await settled(t.pushed);
+    const result: any = await t.service.process("hello", t.notify);
 
     expect(result.text).toBe("Two rooms at the");
     expect(result.finishReason).toBe("length");
@@ -841,8 +871,7 @@ describe("text-generation empty answers", () => {
       stream: false,
     });
 
-    t.service.process("hello", t.notify);
-    const result = await settled(t.pushed);
+    const result: any = await t.service.process("hello", t.notify);
 
     expect(result.finishReason).toBeUndefined();
   });

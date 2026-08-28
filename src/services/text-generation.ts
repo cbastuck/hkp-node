@@ -190,7 +190,7 @@ export class TextGenerationService implements HostedService {
   }
 
   getState(): JsonRecord {
-    return {
+    const state: JsonRecord = {
       backend: this.backend,
       // Write-only: what was configured never comes back out.
       apiKey: "",
@@ -213,6 +213,26 @@ export class TextGenerationService implements HostedService {
       status: this.status,
       error: this.lastError,
     };
+
+    // A setting this service overrides has to say so. `stream` stays whatever
+    // the board set — rewriting it would lose the board author's intent, and
+    // saving would then persist a value they never chose — but a switch reading
+    // "on" over a request that says "off" is the UI telling a lie the service
+    // is the only thing in a position to correct.
+    if (this.jsonSchema) {
+      state.__meta__ = {
+        stream: {
+          type: "boolean",
+          data: {
+            note:
+              "Off while a JSON schema is set: half a JSON object is of no use " +
+              "to anything, so the answer is waited for whole.",
+          },
+        },
+      };
+    }
+
+    return state;
   }
 
   configure(config: JsonRecord): JsonRecord {
@@ -285,15 +305,15 @@ export class TextGenerationService implements HostedService {
   }
 
   /**
-   * Starts the request and stops the synchronous push.
+   * Answers with what the model said.
    *
-   * Generation takes seconds to minutes, and the runtime calls services one
-   * after another without awaiting — so the answer cannot be returned from
-   * here. Returning null stops the push; the rest of the pipeline is called
-   * with the result once it arrives, the same inversion-of-control path
-   * `http-client` takes.
+   * The runtime awaits each service, so generation taking seconds to minutes is
+   * a reason to wait rather than a reason to leave. Returning the answer is
+   * what lets the services after this one be ordinary services — a `join`
+   * merging the answer with the question, a `put-artifact` filing it — instead
+   * of each having to be told which run it belongs to.
    */
-  process(input: unknown, notify: Notify): unknown {
+  async process(input: unknown, notify: Notify): Promise<unknown> {
     if (input === null || input === undefined) {
       return null;
     }
@@ -316,15 +336,7 @@ export class TextGenerationService implements HostedService {
       );
     }
 
-    // Captured while still inside the call this generation belongs to; by the
-    // time the answer arrives the pass has long returned.
-    void this.generate(
-      messages,
-      key,
-      notify,
-      this.host?.currentContext() ?? undefined,
-    );
-    return null;
+    return this.generate(messages, key, notify);
   }
 
   destroy(): void {
@@ -383,8 +395,7 @@ export class TextGenerationService implements HostedService {
     messages: Message[],
     apiKey: string,
     notify: Notify,
-    context?: ProcessContext,
-  ): Promise<void> {
+  ): Promise<unknown> {
     const controller = new AbortController();
     const timer = setTimeout(
       () => controller.abort(),
@@ -407,11 +418,10 @@ export class TextGenerationService implements HostedService {
 
       if (!response.ok) {
         const detail = (await response.text()).slice(0, 400);
-        this.fail(
+        return this.fail(
           notify,
           `${server ? "server" : "API"} returned HTTP ${response.status}: ${detail}`,
         );
-        return;
       }
 
       const message = this.streaming()
@@ -429,19 +439,18 @@ export class TextGenerationService implements HostedService {
       // its work at the end would mark the item done having produced nothing.
       // Stopping here leaves it exactly where a failed run should leave it.
       if (!result.text && result.json === undefined) {
-        this.fail(
+        return this.fail(
           notify,
           result.finishReason === "length"
             ? `the model used all ${this.maxTokens} tokens without answering — ` +
               "raise maxTokens, or set thinking: false if it reasons first"
             : "the model returned an empty answer",
         );
-        return;
       }
 
       this.setStatus(notify, "idle");
       notify(result);
-      this.push(result, notify, context);
+      return result;
     } catch (err) {
       // A connection that never opened, as distinct from anything else that
       // went wrong in here: fetch reports those as a TypeError carrying the
@@ -450,12 +459,11 @@ export class TextGenerationService implements HostedService {
       if (server && err instanceof TypeError && (err as Error).cause) {
         // "fetch failed" says nothing about what to do; a board pointed at a
         // server nobody started is by far the likeliest way to get here.
-        this.fail(
+        return this.fail(
           notify,
           `no OpenAI-compatible server reachable at ${this.endpoint()} — start one, e.g.: ` +
             `llama-server -m model.gguf --port ${port(this.endpoint())}`,
         );
-        return;
       }
       const reason =
         err instanceof Error && err.name === "AbortError"
@@ -463,7 +471,7 @@ export class TextGenerationService implements HostedService {
           : err instanceof Error
             ? err.message
             : String(err);
-      this.fail(notify, `generation failed: ${reason}`);
+      return this.fail(notify, `generation failed: ${reason}`);
     } finally {
       clearTimeout(timer);
     }
@@ -902,26 +910,6 @@ export class TextGenerationService implements HostedService {
     }
 
     return parts;
-  }
-
-  /**
-   * Runs the rest of the pipeline with the result, then emits the runtime's
-   * output. A service that produces data outside the push has to emit it
-   * itself; nothing else will.
-   */
-  private push(result: Result, notify: Notify, context?: ProcessContext): void {
-    if (!this.host) {
-      return;
-    }
-    const output = this.host.processFrom(
-      this.uuid,
-      result,
-      (n: RuntimeNotification) => notify(n.payload, n.instanceId),
-      context,
-    );
-    if (output !== null && output !== undefined) {
-      this.host.emitResult(output);
-    }
   }
 
   private setStatus(notify: Notify, status: string, detail?: string): void {

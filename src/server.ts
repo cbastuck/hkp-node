@@ -10,6 +10,8 @@ import { WebSocketServer, WebSocket } from "ws";
 import { MapService, mapDescriptor } from "./services/map";
 import { MonitorService, monitorDescriptor } from "./services/monitor";
 import { SubService, subServiceDescriptor } from "./services/sub-service";
+import { IteratorService, iteratorDescriptor } from "./services/iterator";
+import { JoinService, joinDescriptor } from "./services/join";
 import {
   HttpServerSubservicesService,
   httpServerSubservicesDescriptor,
@@ -250,6 +252,21 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
         descriptor: subServiceDescriptor,
         create: (config, createService) =>
           new SubService(config, createService),
+      },
+    ],
+    [
+      iteratorDescriptor.serviceId,
+      {
+        descriptor: iteratorDescriptor,
+        create: (config, createService) =>
+          new IteratorService(config, createService),
+      },
+    ],
+    [
+      joinDescriptor.serviceId,
+      {
+        descriptor: joinDescriptor,
+        create: (config, createService) => new JoinService(config, createService),
       },
     ],
     [
@@ -666,7 +683,7 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
     res.json(serializeRuntime(runtime));
   });
 
-  expressApp.post("/runtimes/:runtimeId", (req, res) => {
+  expressApp.post("/runtimes/:runtimeId", async (req, res) => {
     const runtime = getRuntimeOr404(req, res, req.params.runtimeId);
     if (!runtime) {
       return;
@@ -678,7 +695,7 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
 
     // No context: an external HTTP caller is not continuing a run, it is
     // starting one.
-    const result = runtime.process(req.body, () => {
+    const result = await runtime.process(req.body, () => {
       // Notifications are broadcast through runtime notification targets.
     });
     res.json(result);
@@ -828,7 +845,7 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
    */
   expressApp.post(
     "/runtimes/:runtimeId/services/:instanceId/process",
-    (req, res) => {
+    async (req, res) => {
       const runtime = getRuntimeOr404(req, res, req.params.runtimeId);
       if (!runtime) {
         return;
@@ -844,7 +861,7 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
 
       // No context: an external caller is not continuing a run, it is starting
       // one — the same reasoning as POST /runtimes/:runtimeId.
-      const result = runtime.processAt(
+      const result = await runtime.processAt(
         req.params.instanceId,
         req.body,
         () => {
@@ -1018,7 +1035,7 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
         }
       });
 
-      socket.on("message", (raw) => {
+      socket.on("message", async (raw) => {
         let message: WsInboundMessage;
         try {
           message = JSON.parse(raw.toString());
@@ -1035,7 +1052,7 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
           if (!runtime) {
             return;
           }
-          const result = runtime.process(
+          const result = await runtime.process(
             message.params,
             () => {
               // Notifications are broadcast through runtime notification targets.

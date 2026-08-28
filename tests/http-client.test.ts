@@ -56,7 +56,7 @@ function hostSpy() {
   const pushed: unknown[] = [];
   const emitted: unknown[] = [];
   const host: RuntimeHost = {
-    processFrom: (_uuid, data, _onNotification) => {
+    processFrom: async (_uuid, data, _onNotification) => {
       pushed.push(data);
       return data;
     },

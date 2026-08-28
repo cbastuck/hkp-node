@@ -520,7 +520,7 @@ export class HttpServerSubservicesService implements HostedService {
       }
       processInput = request;
       answeredBySubservices = this.hasSubservices();
-      output = this.processSessionInput(processInput, runContext);
+      output = await this.processSessionInput(processInput, runContext);
     }
 
     // What the nested pipeline produced, before the outer runtime sees it.
@@ -533,7 +533,7 @@ export class HttpServerSubservicesService implements HostedService {
     if (this.host) {
       // No-op: the runtime already fans these out to its notification targets.
       // Re-notifying through the host would deliver every one twice.
-      output = this.host.processFrom(this.uuid, output, () => {}, runContext);
+      output = await this.host.processFrom(this.uuid, output, () => {}, runContext);
       this.host.emitResult(output);
     }
 
@@ -558,17 +558,17 @@ export class HttpServerSubservicesService implements HostedService {
    * while data from the outer chain arrives mid-call and descends from whatever
    * that call is running as.
    */
-  private processSessionInput(
+  private async processSessionInput(
     input: unknown,
     parent?: ProcessContext | null,
-  ): unknown {
+  ): Promise<unknown> {
     if (!this.pipeline || this.pipeline.listServices().length === 0) {
       return input;
     }
 
     // No-op: the nested runtime fans these out to the target registered in
     // rebuild(). Forwarding them here as well would deliver every one twice.
-    return this.pipeline.process(
+    return await this.pipeline.process(
       input,
       () => {},
       childRun(parent ?? this.host?.currentContext() ?? null),

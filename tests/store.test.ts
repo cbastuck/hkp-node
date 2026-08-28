@@ -40,7 +40,7 @@ function hostFor(scope: RuntimeScope) {
   const pushed: unknown[] = [];
   const emitted: unknown[] = [];
   const host: RuntimeHost = {
-    processFrom: (_uuid, data) => {
+    processFrom: async (_uuid, data) => {
       pushed.push(data);
       return data;
     },

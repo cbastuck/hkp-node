@@ -20,6 +20,8 @@ import { textGenerationDescriptor } from "../src/services/text-generation";
 import { storeDescriptor } from "../src/services/store";
 import { sqlDescriptor } from "../src/services/sql";
 import { conversationsDescriptor } from "../src/services/conversations";
+import { iteratorDescriptor } from "../src/services/iterator";
+import { joinDescriptor } from "../src/services/join";
 import { documentExtractDescriptor } from "../src/services/document-extract";
 
 describe("hkp-node runtime server", () => {
@@ -54,6 +56,8 @@ describe("hkp-node runtime server", () => {
       monitorDescriptor,
       mapDescriptor,
       subServiceDescriptor,
+      iteratorDescriptor,
+      joinDescriptor,
       httpServerSubservicesDescriptor,
       timerDescriptor,
       peerServerDescriptor,

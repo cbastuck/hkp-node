@@ -287,7 +287,7 @@ export class StoreService implements HostedService {
       }
       this.lastError = "";
       notify(result);
-      this.push(result, notify, context);
+      await this.push(result, notify, context);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       this.fail(notify, `store failed: ${message}`);
@@ -523,7 +523,7 @@ export class StoreService implements HostedService {
       released += 1;
       // Leased, not deleted: nothing removes it until something acknowledges
       // the work, so a pipeline that fails leaves it recoverable.
-      this.push(described(leased), notify, context);
+      await this.push(described(leased), notify, context);
     }
     this.lastCount = released;
     notify({ released, requested: keys.length });
@@ -584,11 +584,15 @@ export class StoreService implements HostedService {
     notify({ error });
   }
 
-  private push(result: JsonRecord, notify: Notify, context?: ProcessContext): void {
+  private async push(
+    result: JsonRecord,
+    notify: Notify,
+    context?: ProcessContext,
+  ): Promise<void> {
     if (!this.host) {
       return;
     }
-    const output = this.host.processFrom(
+    const output = await this.host.processFrom(
       this.uuid,
       result,
       (n: RuntimeNotification) => notify(n.payload, n.instanceId),

@@ -506,7 +506,7 @@ export class ImapEmailService implements HostedService {
         text,
       };
 
-      this._push(email);
+      await this._push(email);
     }
   }
 
@@ -519,12 +519,12 @@ export class ImapEmailService implements HostedService {
     );
   }
 
-  private _push(data: unknown): void {
+  private async _push(data: unknown): Promise<void> {
     if (!this.runtimeHost) return;
     // Whatever the rest of the board does with an email, failing at it is not a
     // reason to lose the connection that delivered it.
     try {
-      const result = this.runtimeHost.processFrom(
+      const result = await this.runtimeHost.processFrom(
         this.uuid,
         data,
         (n: RuntimeNotification) =>

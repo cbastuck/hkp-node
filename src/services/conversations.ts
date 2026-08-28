@@ -13,7 +13,8 @@
  *                            nothing at all when the message is already known
  *     thread              -> { conversationId, emails, count }
  *     transition          -> { conversationId, state, previous, updatedAt }
- *     actionable          -> null; one pass per conversation, pushed
+ *     actionable          -> { conversations, count } — pair with `iterator` to
+ *                            act on them one at a time
  *     put-artifact        -> the artifact
  *     list-artifacts      -> { artifacts, count }
  *     set-artifact-status -> the artifact
@@ -54,13 +55,10 @@
 import {
   HostedService,
   JsonRecord,
-  ProcessContext,
   RuntimeHost,
-  RuntimeNotification,
   ServiceConfiguration,
   ServiceRegistryEntry,
 } from "../types";
-import { newRun } from "../runtime";
 import { Database, DatabaseStore, SqlValue } from "./database";
 import { normalizeMessageId, normalizeReferences } from "./imap-email";
 
@@ -669,10 +667,10 @@ export class ConversationsService implements HostedService {
   /**
    * The conversations something should now be doing something about.
    *
-   * One pass each, rather than one pass carrying a list: what acts on a
-   * conversation acts on a single one — it reads the thread, decides, and
-   * writes back — and a service that had to loop over a list itself would be
-   * doing what the pipeline after it is already shaped to do.
+   * Says what it found and nothing more. Acting on them one at a time is
+   * iteration, which is `iterator`'s job — a service that looped over its own
+   * results would be building that into whichever service needed it first, and
+   * every other service producing a list would then need it too.
    *
    * `idleSeconds` is what stops a poll from picking the same conversation up
    * every tick while the last decision is still being carried out.
@@ -704,14 +702,10 @@ export class ConversationsService implements HostedService {
     this.lastCount = rows.length;
     this.lastError = "";
 
-    for (const row of rows) {
-      // A run of its own per conversation, so that whatever finishes at the far
-      // end — a transition, an artifact — is attributable to the one it acted
-      // on rather than to the poll that found them all.
-      this.push(describedConversation(row), notify, newRun());
-    }
-    notify({ actionable: rows.length });
-    return null;
+    const conversations = rows.map(describedConversation);
+    const result = { conversations, count: conversations.length };
+    notify(result);
+    return result;
   }
 
   /**
@@ -861,25 +855,6 @@ export class ConversationsService implements HostedService {
       return input;
     }
     return "";
-  }
-
-  private push(
-    result: JsonRecord,
-    notify: Notify,
-    context?: ProcessContext,
-  ): void {
-    if (!this.host) {
-      return;
-    }
-    const output = this.host.processFrom(
-      this.uuid,
-      result,
-      (n: RuntimeNotification) => notify(n.payload, n.instanceId),
-      context,
-    );
-    if (output !== null && output !== undefined) {
-      this.host.emitResult(output);
-    }
   }
 
   /** Reports a failure and produces nothing, so the pipeline stops here. */

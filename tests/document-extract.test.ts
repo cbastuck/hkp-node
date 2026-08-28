@@ -40,7 +40,7 @@ afterEach(() => {
 function hostSpy() {
   const pushed: unknown[] = [];
   const host: RuntimeHost = {
-    processFrom: (_uuid, data) => {
+    processFrom: async (_uuid, data) => {
       pushed.push(data);
       return data;
     },

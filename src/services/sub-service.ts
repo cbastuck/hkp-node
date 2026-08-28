@@ -43,13 +43,15 @@ export class SubService implements HostedService {
   readonly capabilities = subServiceDescriptor.capabilities;
   readonly uuid: string;
 
-  private bypass = false;
+  // Protected, not private: an Iterator is a sub-service that runs its pipeline
+  // once per item rather than once, and needs these to do it.
+  protected bypass = false;
   private pipelineConfig: ServiceConfiguration[] = [];
-  private pipeline: HostedRuntime | null = null;
+  protected pipeline: HostedRuntime | null = null;
   private releasePipelineNotifications: (() => void) | null = null;
   private releasePipelineLogs: (() => void) | null = null;
   private readonly createService: ServiceCreator;
-  private host: RuntimeHost | null = null;
+  protected host: RuntimeHost | null = null;
 
   constructor(config: ServiceConfiguration, createService: ServiceCreator) {
     this.uuid = config.uuid;
@@ -151,10 +153,10 @@ export class SubService implements HostedService {
     return state;
   }
 
-  process(
+  async process(
     input: unknown,
     _notify: (payload: unknown, instanceId?: string) => void,
-  ): unknown {
+  ): Promise<unknown> {
     if (
       this.bypass ||
       !this.pipeline ||
