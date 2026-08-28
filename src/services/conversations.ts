@@ -6,12 +6,12 @@
  * Modes: ingest | thread | transition | actionable
  *        put-artifact | list-artifacts | set-artifact-status
  * Key Config: mode, states, initialState, direction, state, stateFrom,
- *             conversationFrom, inState, idleSeconds, limit,
+ *             conversationFrom, idFrom, inState, idleSeconds, limit,
  *             kind, status, payloadFrom
  * IO: in=an email envelope (ingest) or a conversation id (everything else)
  *     ingest              -> { conversationId, state, isNew, email }, or
  *                            nothing at all when the message is already known
- *     thread              -> { conversationId, emails, count }
+ *     thread              -> { conversationId, emails, count, lastInbound }
  *     transition          -> { conversationId, state, previous, updatedAt }
  *     actionable          -> { conversations, count } — pair with `iterator` to
  *                            act on them one at a time
@@ -291,6 +291,7 @@ export class ConversationsService implements HostedService {
   private state = "";
   private stateFrom = "state";
   private conversationFrom = "";
+  private idFrom = "";
   private inState: string[] = [];
   private idleSeconds = 0;
   private limit = DEFAULT_LIMIT;
@@ -325,6 +326,7 @@ export class ConversationsService implements HostedService {
       state: this.state,
       stateFrom: this.stateFrom,
       conversationFrom: this.conversationFrom,
+      idFrom: this.idFrom,
       inState: [...this.inState],
       idleSeconds: this.idleSeconds,
       limit: this.limit,
@@ -354,6 +356,9 @@ export class ConversationsService implements HostedService {
     }
     if (typeof config.stateFrom === "string") {
       this.stateFrom = config.stateFrom;
+    }
+    if (typeof config.idFrom === "string") {
+      this.idFrom = config.idFrom;
     }
     if (typeof config.conversationFrom === "string") {
       this.conversationFrom = config.conversationFrom;
@@ -609,7 +614,23 @@ export class ConversationsService implements HostedService {
       .map(describedEmail);
     this.lastCount = emails.length;
     this.lastError = "";
-    const result = { conversationId, emails, count: emails.length };
+    // Who wrote in last, separately from the list.
+    //
+    // A reply goes to the last person who wrote *to us*, and the restricted
+    // expression dialect a board composes with has no way to search a list for
+    // that. Taking the last email instead is right only until we have sent one
+    // ourselves — at which point a board would quietly address its reply to
+    // its own sending address.
+    const lastInbound =
+      [...emails].reverse().find((email) => email.direction === "inbound") ??
+      null;
+
+    const result = {
+      conversationId,
+      emails,
+      count: emails.length,
+      lastInbound,
+    };
     notify(result);
     return result;
   }
@@ -808,7 +829,13 @@ export class ConversationsService implements HostedService {
     notify: Notify,
   ): unknown {
     const record = asRecord(input);
-    const id = text(record.id) || (typeof input === "string" ? input : "");
+    // A pass that has just done something to a conversation carries what it
+    // did, not the artifact it did it about, so the board says where to look.
+    const found = this.idFrom ? valueAt(input, this.idFrom) : undefined;
+    const id =
+      (typeof found === "string" ? found : "") ||
+      text(record.id) ||
+      (typeof input === "string" ? input : "");
     if (!id) {
       return this.fail(notify, "set-artifact-status needs an artifact id");
     }

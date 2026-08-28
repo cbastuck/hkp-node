@@ -11,6 +11,10 @@ import { MapService, mapDescriptor } from "./services/map";
 import { MonitorService, monitorDescriptor } from "./services/monitor";
 import { SubService, subServiceDescriptor } from "./services/sub-service";
 import { IteratorService, iteratorDescriptor } from "./services/iterator";
+import {
+  CommunicationDispatcherService,
+  communicationDispatcherDescriptor,
+} from "./services/communication-dispatcher";
 import { JoinService, joinDescriptor } from "./services/join";
 import {
   HttpServerSubservicesService,
@@ -261,6 +265,14 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
         descriptor: iteratorDescriptor,
         create: (config, createService) =>
           new IteratorService(config, createService),
+      },
+    ],
+    [
+      communicationDispatcherDescriptor.serviceId,
+      {
+        descriptor: communicationDispatcherDescriptor,
+        create: (config, createService) =>
+          new CommunicationDispatcherService(config, createService),
       },
     ],
     [
