@@ -67,6 +67,7 @@ import {
   TextGenerationService,
   textGenerationDescriptor,
 } from "./services/text-generation";
+import { InjectorService, injectorDescriptor } from "./services/injector";
 import {
   contextFromWire,
   HostedRuntime,
@@ -380,6 +381,13 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
       {
         descriptor: documentExtractDescriptor,
         create: (config, _createService) => new DocumentExtractService(config),
+      },
+    ],
+    [
+      injectorDescriptor.serviceId,
+      {
+        descriptor: injectorDescriptor,
+        create: (config, _createService) => new InjectorService(config),
       },
     ],
   ]);

@@ -23,6 +23,7 @@ import { conversationsDescriptor } from "../src/services/conversations";
 import { iteratorDescriptor } from "../src/services/iterator";
 import { joinDescriptor } from "../src/services/join";
 import { documentExtractDescriptor } from "../src/services/document-extract";
+import { injectorDescriptor } from "../src/services/injector";
 
 describe("hkp-node runtime server", () => {
   const server = createRuntimeServer({ externalHost: "127.0.0.1" });
@@ -73,6 +74,7 @@ describe("hkp-node runtime server", () => {
       sqlDescriptor,
       conversationsDescriptor,
       documentExtractDescriptor,
+      injectorDescriptor,
     ]);
     expect(response.body.runtimes).toHaveLength(1);
     expect(response.body.runtimes[0]).toMatchObject({
