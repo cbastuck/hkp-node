@@ -483,6 +483,13 @@ export class HostedRuntime implements RuntimeHost {
   setScope(scope: RuntimeScope): void {
     this.owner = scope.owner;
     this.boardName = scope.boardName;
+    // Down, however deep it goes. A service holding a pipeline passes this to
+    // its own runtime, whose services pass it on again — which is what makes a
+    // `conversations` inside a `join` inside an `iterator` answer to the board
+    // it is actually part of rather than to the anonymous default.
+    for (const service of this.services.values()) {
+      service.setScope?.(scope);
+    }
   }
 
   setLogLevel(level: LogLevel): void {

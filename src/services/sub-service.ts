@@ -17,6 +17,7 @@ import {
   HostedService,
   JsonRecord,
   RuntimeHost,
+  RuntimeScope,
   ServiceConfiguration,
   ServiceCreator,
   ServiceRegistryEntry,
@@ -68,6 +69,18 @@ export class SubService implements HostedService {
     // ask, so what the board records reaches it here rather than never.
     this.applyLogSettings();
     this.applyScope();
+  }
+
+  /**
+   * Passes the scope on to the nested pipeline.
+   *
+   * The runtime calls this when its own scope is set, which is how a pipeline
+   * nested more than one level deep hears about it at all: `setHost` runs while
+   * this service is being built, and at that moment the runtime holding it does
+   * not know its scope either.
+   */
+  setScope(scope: RuntimeScope): void {
+    this.pipeline?.setScope(scope);
   }
 
   /** Hands the board's log settings to the nested pipeline, if there is one. */

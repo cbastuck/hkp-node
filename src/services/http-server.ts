@@ -37,6 +37,7 @@ import {
   JsonRecord,
   ProcessContext,
   RuntimeHost,
+  RuntimeScope,
   ServiceConfiguration,
   ServiceCreator,
   ServiceRegistryEntry,
@@ -293,6 +294,11 @@ export class HttpServerSubservicesService implements HostedService {
       pipeline: this.getPipelineState(),
     };
     return state;
+  }
+
+  /** Passes the scope on to the nested pipeline; see SubService.setScope. */
+  setScope(scope: RuntimeScope): void {
+    this.pipeline?.setScope(scope);
   }
 
   setHost(host: RuntimeHost): void {

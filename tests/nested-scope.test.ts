@@ -18,6 +18,12 @@ import { storeDescriptor } from "../src/services/store";
  *
  * Both hosts have to hand the scope down, so both are pinned here — the bug
  * was found in `http-server-subservices` after `sub-service` already did it.
+ *
+ * Handing it down **once** is not enough, which is the third case below. A
+ * runtime hears its scope after the services inside it were built, so a
+ * pipeline two levels deep was told the scope its parent had at construction:
+ * the anonymous owner and an empty board name. Not a lookup that misses — a
+ * table every tenant shares.
  */
 
 type Server = ReturnType<typeof createRuntimeServer>;
@@ -100,6 +106,42 @@ describe("a nested pipeline belongs to the board around it", () => {
 
     const stored = await records.list({ owner: "anonymous", boardName: BOARD });
     expect(stored.map((r) => r.key)).toEqual(["from-nested"]);
+  });
+
+  it("hands the scope all the way down, not one level", async () => {
+    // `conversations` inside a `join` inside an `iterator` is the shape the SYN
+    // board uses, and it was reading a database keyed on the anonymous owner
+    // and an empty board name — one file, shared by everyone.
+    const { server, records } = await runtimeWith({
+      serviceId: subServiceDescriptor.serviceId,
+      uuid: "outer",
+      state: {
+        pipeline: [
+          {
+            instanceId: "inner",
+            serviceId: subServiceDescriptor.serviceId,
+            state: { pipeline: [nestedStore] },
+          },
+        ],
+      },
+    });
+
+    await request(server.httpServer)
+      .post("/runtimes/rt-1")
+      .send({ enquiry: true })
+      .expect(200);
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    expect(
+      (await records.list({ owner: "anonymous", boardName: BOARD })).map(
+        (r) => r.key,
+      ),
+    ).toEqual(["from-nested"]);
+    // And nothing landed in the shared nowhere it used to.
+    expect(await records.list({ owner: "anonymous", boardName: "" })).toEqual(
+      [],
+    );
   });
 
   it("stores against the board when the pipeline is inside a sub-service", async () => {

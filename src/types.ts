@@ -101,6 +101,17 @@ export interface HostedService {
     notify: (payload: unknown, instanceId?: string) => void,
   ): unknown;
   setHost?(host: RuntimeHost): void;
+  /**
+   * The tenant and board this service now answers to.
+   *
+   * Only a service holding a pipeline of its own needs this: its nested runtime
+   * was built before anything knew the scope, and being told once at `setHost`
+   * only reaches one level down. A scope that stops propagating is not a
+   * cosmetic problem — a nested runtime's default owner is the anonymous one,
+   * so a service that never heard the real scope reads and writes what every
+   * tenant shares.
+   */
+  setScope?(scope: RuntimeScope): void;
   destroy?(): void;
 }
 

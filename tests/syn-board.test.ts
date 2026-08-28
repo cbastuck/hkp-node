@@ -40,14 +40,23 @@ beforeAll(() => {
   board = JSON.parse(fs.readFileSync(BOARD, "utf8")) as Board;
 });
 
-/** A model that answers the extraction, so the board can be driven offline. */
+/**
+ * A model that answers whichever turn is asking, so the board can be driven
+ * offline. The board makes two model calls with different schemas — an
+ * extraction and a drafted reply — and the schema is what tells them apart.
+ */
 async function startModel(answer: Record<string, unknown>) {
-  const seen: unknown[] = [];
+  const seen: any[] = [];
   const server = http.createServer((req, res) => {
     let body = "";
     req.on("data", (chunk) => (body += chunk));
     req.on("end", () => {
-      seen.push(JSON.parse(body || "{}"));
+      const asked = JSON.parse(body || "{}");
+      seen.push(asked);
+      const drafting =
+        asked.response_format?.json_schema?.schema?.properties?.subject !==
+        undefined;
+      const said = drafting ? DRAFT : answer;
       res.writeHead(200, { "content-type": "application/json" });
       res.end(
         JSON.stringify({
@@ -55,7 +64,7 @@ async function startModel(answer: Record<string, unknown>) {
           choices: [
             {
               finish_reason: "stop",
-              message: { role: "assistant", content: JSON.stringify(answer) },
+              message: { role: "assistant", content: JSON.stringify(said) },
             },
           ],
           usage: { prompt_tokens: 10, completion_tokens: 20 },
@@ -183,13 +192,19 @@ const ANSWER = {
   language: "de",
 };
 
+const DRAFT = {
+  subject: "Rückfrage zu Ihrer Anfrage",
+  body: "Guten Tag,\n\nwie viele Zimmer benötigen Sie?\n\nIhr Buchungsteam",
+  language: "de",
+};
+
 const ENQUIRY =
   "Ich benötige Zimmer in Ost Berlin für zwei Nächte. Ich würde am " +
   "17.10.2026 anreisen. Es soll ein ruhiges Zimmer für maximal 200€ sein, " +
   "mit Frühstück.";
 
 describe("the board as a whole", () => {
-  it("carries a test enquiry from typed text to an extraction waiting for approval", async () => {
+  it("carries an enquiry from typed text to a follow-up email awaiting approval", async () => {
     const { model, at } = await loadBoard(ANSWER);
 
     // 1. What the facade's "File a test enquiry" button does.
@@ -215,15 +230,13 @@ describe("the board as a whole", () => {
       "numberOfRooms",
     );
 
-    // 3. What the review panel reads.
-    const drafts = await at("review", "drafts", {});
-    expect(drafts.status).toBe(200);
-    const listed = drafts.said("drafts");
-    expect(listed.count).toBe(1);
-    expect(listed.artifacts[0]).toMatchObject({
+    // 3. The extraction is data, not a request for anyone's attention.
+    const recorded = (await at("review", "extractions", {})).said("extractions");
+    expect(recorded.count).toBe(1);
+    expect(recorded.artifacts[0]).toMatchObject({
       conversationId,
       kind: "extraction",
-      status: "pending",
+      status: "recorded",
       // The extraction survived the trip past a service that replaces its
       // input — which is what `join` is in the board for.
       payload: {
@@ -234,16 +247,57 @@ describe("the board as a whole", () => {
       },
     });
 
-    const conversations = await at("review", "all-conversations", {});
-    const overview = conversations.said("all-conversations");
-    expect(overview.conversations).toHaveLength(1);
-    expect(overview.conversations[0]).toMatchObject({
+    // Something required is missing, so the conversation says what it needs
+    // rather than sitting in a state that means "a person must look".
+    const afterExtract = (
+      await at("review", "all-conversations", {})
+    ).said("all-conversations");
+    expect(afterExtract.conversations[0]).toMatchObject({
+      conversationId,
+      state: "needs-follow-up",
+    });
+    // Nothing is waiting on a person yet.
+    expect((await at("review", "drafts", {})).said("drafts").count).toBe(0);
+
+    // 4. What "2 · Draft follow-up" does: a second model turn writes the reply.
+    await at("followup", "poll-followup", {});
+
+    expect(model.seen).toHaveLength(2);
+    const drafting = model.seen[1] as any;
+    expect(
+      drafting.response_format?.json_schema?.schema?.properties,
+    ).toHaveProperty("subject");
+
+    // It was told what is missing — read back out of the extraction that the
+    // first turn recorded, by a `list-artifacts` nested two levels deep. That
+    // lookup silently found nothing until the runtime handed the board's scope
+    // all the way down, and the prompt then said "(unknown)".
+    const prompt = String(
+      drafting.messages[drafting.messages.length - 1].content,
+    );
+    expect(prompt).toContain('Still missing: ["numberOfRooms"]');
+    expect(prompt).not.toContain("(unknown)");
+
+    // 5. *This* one waits for a person, and says so.
+    const awaiting = (await at("review", "drafts", {})).said("drafts");
+    expect(awaiting.count).toBe(1);
+    expect(awaiting.artifacts[0]).toMatchObject({
+      conversationId,
+      kind: "follow-up",
+      status: "pending",
+      payload: { subject: DRAFT.subject, language: "de" },
+    });
+
+    const afterDraft = (
+      await at("review", "all-conversations", {})
+    ).said("all-conversations");
+    expect(afterDraft.conversations[0]).toMatchObject({
       conversationId,
       state: "waiting-approval",
     });
 
-    // 4. What "Approve selected" does.
-    const artifactId = listed.artifacts[0].id;
+    // 6. What "Approve selected" does.
+    const artifactId = awaiting.artifacts[0].id;
     const approved = await at("approve", "approve-each", { ids: [artifactId] });
     expect(approved.said("mark-approved")).toMatchObject({
       id: artifactId,
@@ -254,6 +308,44 @@ describe("the board as a whole", () => {
       results: 1,
       failed: 0,
     });
+  });
+
+  it("asks for nothing when the enquiry already said everything", async () => {
+    // The other branch of the same decision: a complete enquiry needs no
+    // follow-up, so no draft is written and nobody is asked to approve one.
+    const { model, at } = await loadBoard({
+      numberOfRooms: 2,
+      dateOfArrival: "2026-10-17",
+      dateOfDeparture: "2026-10-19",
+      missing: [],
+      language: "de",
+    });
+
+    await at("test", "compose", { text: ENQUIRY });
+    await at("dispatch", "poll", {});
+
+    const overview = (
+      await at("review", "all-conversations", {})
+    ).said("all-conversations");
+    expect(overview.conversations[0]).toMatchObject({ state: "ready" });
+
+    // The drafting poll selects `needs-follow-up`, so this one is not its work.
+    await at("followup", "poll-followup", {});
+    expect(model.seen).toHaveLength(1);
+    expect((await at("review", "drafts", {})).said("drafts").count).toBe(0);
+  });
+
+  it("files the demo enquiry the Injector holds", async () => {
+    // What the facade's "File demo enquiry" button does: the text lives in the
+    // board, so the loop can be driven with one press and no typing.
+    const { at } = await loadBoard(ANSWER);
+
+    const filed = await at("test", "demo-enquiry", {});
+    const conversation = filed.said("file-test-mail");
+
+    expect(conversation).toMatchObject({ state: "init", isNew: true });
+    expect(conversation.email.body).toContain("Ost Berlin");
+    expect(conversation.email.body).toContain("Christoph");
   });
 
   it("does not extract the same conversation twice", async () => {
@@ -332,7 +424,7 @@ describe("the board as a whole", () => {
     await at("dispatch", "poll", {});
 
     expect(model.seen).toHaveLength(3);
-    const listed = (await at("review", "drafts", {})).said("drafts");
+    const listed = (await at("review", "extractions", {})).said("extractions");
     expect(listed.count).toBe(3);
     // Three conversations, three separate extractions, all of them filed.
     expect(
