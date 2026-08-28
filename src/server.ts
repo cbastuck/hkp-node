@@ -49,6 +49,10 @@ import {
 import { StoreService, storeDescriptor } from "./services/store";
 import { SqlService, sqlDescriptor } from "./services/sql";
 import {
+  ConversationsService,
+  conversationsDescriptor,
+} from "./services/conversations";
+import {
   DatabaseStore,
   createFileDatabaseStore,
   createMemoryDatabaseStore,
@@ -195,13 +199,9 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
   const externalHost = options.externalHost ?? options.host ?? "127.0.0.1";
   const externalSecure = options.externalSecure ?? false;
   const quotas = options.quotas ?? {};
-  // One store for the whole server; it is the scope handed to each call, not a
-  // store per board, that keeps one board's records out of another's.
-  // An empty path is how "keep nothing on disk" is said, and must not be read
-  // as a root — which would be the working directory.
-  // Databases follow records: one store for the server, scoped per call, and
-  // an empty path saying "keep nothing on disk" rather than naming the working
-  // directory as a root.
+  // Databases follow records below: one store for the whole server, scoped per
+  // call, and an empty path saying "keep nothing on disk" rather than naming
+  // the working directory as a root.
   const databases: DatabaseStore =
     typeof options.database === "string"
       ? options.database
@@ -209,6 +209,10 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
         : createMemoryDatabaseStore()
       : createMemoryDatabaseStore();
 
+  // One store for the whole server; it is the scope handed to each call, not a
+  // store per board, that keeps one board's records out of another's.
+  // An empty path is how "keep nothing on disk" is said, and must not be read
+  // as a root — which would be the working directory.
   const records: RecordStore =
     typeof options.recordStore === "string"
       ? options.recordStore
@@ -344,6 +348,14 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
       {
         descriptor: sqlDescriptor,
         create: (config, _createService) => new SqlService(config, databases),
+      },
+    ],
+    [
+      conversationsDescriptor.serviceId,
+      {
+        descriptor: conversationsDescriptor,
+        create: (config, _createService) =>
+          new ConversationsService(config, databases),
       },
     ],
     [

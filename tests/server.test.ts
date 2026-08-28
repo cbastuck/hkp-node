@@ -19,6 +19,7 @@ import { holdDescriptor } from "../src/services/hold";
 import { textGenerationDescriptor } from "../src/services/text-generation";
 import { storeDescriptor } from "../src/services/store";
 import { sqlDescriptor } from "../src/services/sql";
+import { conversationsDescriptor } from "../src/services/conversations";
 import { documentExtractDescriptor } from "../src/services/document-extract";
 
 describe("hkp-node runtime server", () => {
@@ -66,6 +67,7 @@ describe("hkp-node runtime server", () => {
       textGenerationDescriptor,
       storeDescriptor,
       sqlDescriptor,
+      conversationsDescriptor,
       documentExtractDescriptor,
     ]);
     expect(response.body.runtimes).toHaveLength(1);
