@@ -18,6 +18,7 @@ import { smtpEmailDescriptor } from "../src/services/smtp-email";
 import { holdDescriptor } from "../src/services/hold";
 import { textGenerationDescriptor } from "../src/services/text-generation";
 import { storeDescriptor } from "../src/services/store";
+import { sqlDescriptor } from "../src/services/sql";
 import { documentExtractDescriptor } from "../src/services/document-extract";
 
 describe("hkp-node runtime server", () => {
@@ -64,6 +65,7 @@ describe("hkp-node runtime server", () => {
       holdDescriptor,
       textGenerationDescriptor,
       storeDescriptor,
+      sqlDescriptor,
       documentExtractDescriptor,
     ]);
     expect(response.body.runtimes).toHaveLength(1);

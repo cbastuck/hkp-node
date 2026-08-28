@@ -79,6 +79,10 @@ async function main() {
     recordStore:
       process.env.HKP_STORE_DIR ??
       path.join(os.homedir(), ".hkp", "node", "store"),
+    // Where a board's SQL tables live. Persisted for the same reason records
+    // are: HKP_DB_DIR="" keeps them in memory instead.
+    database:
+      process.env.HKP_DB_DIR ?? path.join(os.homedir(), ".hkp", "node", "db"),
     quotas: {
       maxRuntimesPerUser: readInteger(process.env.HKP_MAX_RUNTIMES_PER_USER, 0),
       maxServicesPerRuntime: readInteger(
@@ -211,6 +215,21 @@ async function main() {
   );
   console.log(`hkp-node listening on ${address.baseUrl}`);
 }
+
+/**
+ * One runtime hosts every board on this machine, so a stray asynchronous failure
+ * inside one service — a socket error nobody listened for, a promise nobody
+ * awaited — must not be the end of all the others. Report it and keep serving.
+ * Anything a caller can actually be told about is still handled where it happens;
+ * this is only the floor under the cases that reach the process.
+ */
+process.on("uncaughtException", (error) => {
+  console.error("[hkp-node] Uncaught exception — continuing:", error);
+});
+
+process.on("unhandledRejection", (reason) => {
+  console.error("[hkp-node] Unhandled rejection — continuing:", reason);
+});
 
 void main().catch((error) => {
   console.error(error);

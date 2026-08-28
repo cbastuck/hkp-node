@@ -47,6 +47,12 @@ import {
   RecordStore,
 } from "./services/recordStore";
 import { StoreService, storeDescriptor } from "./services/store";
+import { SqlService, sqlDescriptor } from "./services/sql";
+import {
+  DatabaseStore,
+  createFileDatabaseStore,
+  createMemoryDatabaseStore,
+} from "./services/database";
 import {
   DocumentExtractService,
   documentExtractDescriptor,
@@ -128,6 +134,11 @@ type CreateRuntimeServerOptions = {
    */
   recordStore?: RecordStore | string;
   /**
+   * Where SQL databases live, one file per board. Absent or empty means memory:
+   * a runtime nobody told where to persist keeps them for as long as it runs.
+   */
+  database?: string;
+  /**
    * Keys the derivation of public mount addresses; see MountRegistry.
    *
    * Absent draws one per process, so endpoints work but change on restart.
@@ -188,6 +199,16 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
   // store per board, that keeps one board's records out of another's.
   // An empty path is how "keep nothing on disk" is said, and must not be read
   // as a root — which would be the working directory.
+  // Databases follow records: one store for the server, scoped per call, and
+  // an empty path saying "keep nothing on disk" rather than naming the working
+  // directory as a root.
+  const databases: DatabaseStore =
+    typeof options.database === "string"
+      ? options.database
+        ? createFileDatabaseStore(options.database)
+        : createMemoryDatabaseStore()
+      : createMemoryDatabaseStore();
+
   const records: RecordStore =
     typeof options.recordStore === "string"
       ? options.recordStore
@@ -316,6 +337,13 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
       {
         descriptor: storeDescriptor,
         create: (config, _createService) => new StoreService(config, records),
+      },
+    ],
+    [
+      sqlDescriptor.serviceId,
+      {
+        descriptor: sqlDescriptor,
+        create: (config, _createService) => new SqlService(config, databases),
       },
     ],
     [
