@@ -213,6 +213,27 @@ describe("text-generation request", () => {
     expect(text).toEqual({ type: "text", text: "What is this?" });
   });
 
+  it("sends temperature without top_p, which this API refuses alongside it", async () => {
+    const api = await endpoint(() => ({ json: ANSWER }));
+    const t = serviceWith({
+      serverUrl: api.url,
+      apiKey: "sk-test",
+      stream: false,
+      temperature: 0.3,
+      topP: 0.95,
+      topK: 20,
+    });
+
+    await t.service.process("decide", t.notify);
+
+    const body = api.received[0].body;
+    expect(body.temperature).toBe(0.3);
+    expect(body.top_k).toBe(20);
+    expect(body.top_p).toBeUndefined();
+    // The board keeps what it configured; only the request leaves it out.
+    expect(t.service.getState().topP).toBe(0.95);
+  });
+
   it("leaves sampling alone while the model is reasoning", async () => {
     // Sampling is fixed during extended thinking and sending any of the three
     // is rejected outright, so they have to be absent rather than defaulted.
@@ -365,9 +386,20 @@ describe("text-generation streaming is off under a schema", () => {
   });
 
   it("says nothing when there is nothing to explain", () => {
-    const t = serviceWith({ stream: true });
+    // A backend that takes the whole configuration as written has nothing to
+    // account for, so the panel is left to show it as it is.
+    const t = serviceWith({ stream: true, backend: "server" });
 
     expect(t.service.getState().__meta__).toBeUndefined();
+  });
+
+  it("says nothing about streaming until a schema turns it off", () => {
+    const t = serviceWith({ stream: true });
+    const meta = t.service.getState().__meta__ as any;
+
+    expect(meta?.stream).toBeUndefined();
+    // The Claude API's own refusal of temperature-with-top_p still stands.
+    expect(meta?.topP?.data?.note).toContain("top_p");
   });
 });
 

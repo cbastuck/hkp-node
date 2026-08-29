@@ -10,6 +10,9 @@
  * IO: in=the exchange so far (JSON) -> out={ ...input, action, params, reason,
  *     result, state } — or nothing at all when there is nothing to do and
  *     nothing to change
+ * Notifies: { decidePrompt, decideAnswer } — the question put to the decide
+ *     pipeline and what came back, every pass, for reading a decision that
+ *     went wrong; `lastAnswer` keeps an abbreviated copy in state
  * Arrays: treated as one context, not iterated (pair with `iterator`)
  * Binary: not accepted
  * MixedData: not native in runtime
@@ -95,6 +98,18 @@ const DEFAULT_INSTRUCTION =
   "' when the right thing to do is nothing — when the exchange is waiting on " +
   "someone else.";
 
+/**
+ * How much of an answer is kept, and how much is sent.
+ *
+ * The state figure is the one that matters: state is what the frontend writes
+ * back into the board when it saves, so anything kept here is kept forever.
+ * Enough to see the shape of what came back; the notification carries enough
+ * to read it.
+ */
+const ANSWER_STATE_CHARS = 600;
+/** Also the cap on the question, which goes the same way and is far longer. */
+const ANSWER_NOTIFY_CHARS = 8_000;
+
 type DeclaredState = { name: string; describe: string };
 
 type Action = {
@@ -126,6 +141,7 @@ export class CommunicationDispatcherService implements HostedService {
   private lastReason = "";
   private lastNext = "";
   private lastError = "";
+  private lastAnswer = "";
 
   constructor(config: ServiceConfiguration, createService: ServiceCreator) {
     this.uuid = config.uuid;
@@ -170,6 +186,10 @@ export class CommunicationDispatcherService implements HostedService {
       lastAction: this.lastAction,
       lastReason: this.lastReason,
       lastNext: this.lastNext,
+      // Kept short and kept here, unlike the question: a decision that did not
+      // parse is unreadable without the thing that failed to parse, and this
+      // is the one part small enough to live in state a board writes to disk.
+      lastAnswer: this.lastAnswer,
       error: this.lastError,
     };
   }
@@ -314,23 +334,72 @@ export class CommunicationDispatcherService implements HostedService {
     });
   }
 
+  /**
+   * What the decide pipeline's own services are reporting, if anything.
+   *
+   * A pipeline that produced nothing has already been told why by whatever
+   * failed inside it — an address that refused, a key that was not accepted —
+   * and that sits in the failing service's state, one level down from anything
+   * a board shows. Reading it out here is the difference between "it did not
+   * work" and knowing what to fix.
+   */
+  private decideErrors(): string {
+    const reported: string[] = [];
+    for (const service of this.decide.services()) {
+      const state = service.state;
+      if (isJsonRecord(state) && typeof state.error === "string" && state.error) {
+        reported.push(`${service.uuid}: ${preview(state.error, 300)}`);
+      }
+    }
+    return reported.join("; ");
+  }
+
   /** Puts the question to the decide pipeline and reads the answer back. */
   private async ask(
     input: unknown,
     offered: Action[],
     notify: (payload: unknown, instanceId?: string) => void,
   ): Promise<{ action: string; reason: string; next: string; params: JsonRecord } | null> {
+    const prompt = this.prompt(input, offered);
     const answer = await this.decide.process(
-      { prompt: this.prompt(input, offered) },
+      { prompt },
       this.host?.currentContext() ?? null,
     );
+
+    // What was asked and what came back, verbatim, every pass — a decision is
+    // a model's, so the only way to see why it went the way it did is to read
+    // the exchange that produced it. Sent rather than stored: the question
+    // carries the whole conversation, and a board that saved it would write
+    // that conversation into itself.
+    this.lastAnswer = preview(answer, ANSWER_STATE_CHARS);
+    notify({
+      decidePrompt: preview(prompt, ANSWER_NOTIFY_CHARS),
+      decideAnswer: preview(answer, ANSWER_NOTIFY_CHARS),
+      lastAnswer: this.lastAnswer,
+    });
+
+    // Nothing came back at all, which is a service in the pipeline failing
+    // rather than a model answering badly — a different thing to go and look
+    // at, and the service that failed has already said what went wrong.
+    if (answer === null || answer === undefined) {
+      const reported = this.decideErrors();
+      return this.failNull(
+        notify,
+        reported
+          ? `the decide pipeline produced nothing — ${reported}`
+          : "the decide pipeline produced nothing, and none of its services " +
+            "reported why — something in it returned null and stopped the run",
+      );
+    }
 
     const record = isJsonRecord(answer) ? answer : null;
     const decision = record && isJsonRecord(record.json) ? record.json : null;
     if (!decision) {
+      const reported = this.decideErrors();
       return this.failNull(
         notify,
-        "the decide pipeline did not answer in the required shape",
+        `the decide pipeline did not answer in the required shape — ${describeAnswer(answer)}` +
+          (reported ? `; ${reported}` : ""),
       );
     }
 
@@ -567,6 +636,47 @@ export class CommunicationDispatcherService implements HostedService {
     this.fail(notify, message);
     return null;
   }
+}
+
+/** A value as text, short enough to put in a message. */
+function preview(value: unknown, max: number): string {
+  let text: string;
+  try {
+    text = typeof value === "string" ? value : (JSON.stringify(value) ?? String(value));
+  } catch {
+    text = String(value);
+  }
+  return max > 0 && text.length > max ? `${text.slice(0, max)}…` : text;
+}
+
+/**
+ * Why an answer was not a decision, in the terms of the thing that produced it.
+ *
+ * "Not the required shape" says a pipeline whose services are all fine, whose
+ * model answered, and whose board is one setting away from working — which of
+ * those it is decides where to look, and only what came back can say.
+ */
+function describeAnswer(answer: unknown): string {
+  if (!isJsonRecord(answer)) {
+    return `it produced a ${typeof answer}: ${preview(answer, 200)}`;
+  }
+
+  const keys = Object.keys(answer);
+  if (keys.length === 1 && keys[0] === "prompt") {
+    return (
+      "the question came back unchanged, so nothing in the pipeline answered " +
+      "it — every service in it is bypassed, or it passes its input through"
+    );
+  }
+  if (typeof answer.text === "string" && answer.json === undefined) {
+    return (
+      "it answered with text but no `json`, so the answer was not JSON " +
+      "matching the schema — the model wrote prose or was cut off, or the " +
+      "server ignored the schema it was sent. It said: " +
+      preview(answer.text, 300)
+    );
+  }
+  return `it produced [${keys.join(", ")}], with no \`json\` object: ${preview(answer, 300)}`;
 }
 
 function declaredStates(value: unknown): DeclaredState[] {

@@ -214,22 +214,34 @@ export class TextGenerationService implements HostedService {
       error: this.lastError,
     };
 
-    // A setting this service overrides has to say so. `stream` stays whatever
-    // the board set — rewriting it would lose the board author's intent, and
-    // saving would then persist a value they never chose — but a switch reading
-    // "on" over a request that says "off" is the UI telling a lie the service
-    // is the only thing in a position to correct.
+    // A setting this service overrides has to say so. The values stay whatever
+    // the board set — rewriting them would lose the board author's intent, and
+    // saving would then persist a value they never chose — but a field reading
+    // one way over a request that says another is the UI telling a lie the
+    // service is the only thing in a position to correct.
+    const meta: JsonRecord = {};
     if (this.jsonSchema) {
-      state.__meta__ = {
-        stream: {
-          type: "boolean",
-          data: {
-            note:
-              "Off while a JSON schema is set: half a JSON object is of no use " +
-              "to anything, so the answer is waited for whole.",
-          },
+      meta.stream = {
+        type: "boolean",
+        data: {
+          note:
+            "Off while a JSON schema is set: half a JSON object is of no use " +
+            "to anything, so the answer is waited for whole.",
         },
       };
+    }
+    if (this.backend === "anthropic") {
+      meta.topP = {
+        type: "number",
+        data: {
+          note:
+            "Not sent to this backend, which rejects a request carrying both " +
+            "temperature and top_p. Temperature is the one sent.",
+        },
+      };
+    }
+    if (Object.keys(meta).length > 0) {
+      state.__meta__ = meta;
     }
 
     return state;
@@ -514,8 +526,11 @@ export class TextGenerationService implements HostedService {
       // Sampling is fixed while reasoning: sending any of the three is an
       // error, so they are left out rather than sent and ignored.
     } else {
+      // Not `top_p` as well: this API rejects a request carrying both it and
+      // `temperature`, and temperature is the one a board that touched either
+      // is far more likely to have meant. `top_p` is left to the backends
+      // that accept the pair.
       body.temperature = this.temperature;
-      body.top_p = this.topP;
       body.top_k = this.topK;
     }
     if (this.jsonSchema) {

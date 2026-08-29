@@ -43,7 +43,16 @@ function fakeService(config: ServiceConfiguration): HostedService {
     process(input: unknown) {
       seen.push({ uuid: config.uuid, input, scope: host?.scope() });
       if (state.answer !== undefined) {
-        return { text: "", json: state.answer };
+        return { text: JSON.stringify(state.answer), json: state.answer };
+      }
+      // A model that answered, but not in JSON: what text-generation hands on
+      // when the answer did not parse against the schema.
+      if (typeof state.answerText === "string") {
+        return { text: state.answerText };
+      }
+      // A pipeline that answered nothing, so the question comes back.
+      if (state.passThrough) {
+        return input;
       }
       if (state.produceNothing) {
         return null;
@@ -293,6 +302,102 @@ describe("what the model is not allowed to say", () => {
 
     expect(await t.run({ conversationId: "c1", state: "init" })).toBeNull();
     expect(t.service.getState().error).toContain("required shape");
+  });
+
+  it("says what came back instead, when the answer was not JSON", async () => {
+    const t = dispatcher(undefined, {
+      // A model that wrote prose: text, and nothing the schema asked for.
+      decide: [
+        {
+          serviceId: "fake",
+          uuid: "brain",
+          state: { jsonSchema: null, answerText: "I think we should follow up." },
+        },
+      ],
+    });
+
+    expect(await t.run({ conversationId: "c1", state: "init" })).toBeNull();
+    const error = String(t.service.getState().error);
+    expect(error).toContain("text but no `json`");
+    expect(error).toContain("I think we should follow up.");
+  });
+
+  it("says so when nothing in the pipeline answered the question", async () => {
+    const t = dispatcher(undefined, {
+      decide: [
+        {
+          serviceId: "fake",
+          uuid: "brain",
+          state: { jsonSchema: null, passThrough: true },
+        },
+      ],
+    });
+
+    expect(await t.run({ conversationId: "c1", state: "init" })).toBeNull();
+    expect(String(t.service.getState().error)).toContain("came back unchanged");
+  });
+});
+
+describe("what it reports about the decision", () => {
+  it("names the service that failed when the pipeline produced nothing", async () => {
+    const t = dispatcher(undefined, {
+      decide: [
+        {
+          serviceId: "text-generation",
+          uuid: "decide-llm",
+          state: {
+            jsonSchema: null,
+            produceNothing: true,
+            error: "server returned HTTP 401: invalid api key",
+          },
+        },
+      ],
+    });
+
+    expect(await t.run({ conversationId: "c1", state: "init" })).toBeNull();
+    expect(String(t.service.getState().error)).toContain(
+      "decide-llm: server returned HTTP 401: invalid api key",
+    );
+  });
+
+  it("says so plainly when nothing came back and nothing said why", async () => {
+    const t = dispatcher(undefined, {
+      decide: [
+        {
+          serviceId: "text-generation",
+          uuid: "decide-llm",
+          state: { jsonSchema: null, produceNothing: true },
+        },
+      ],
+    });
+
+    expect(await t.run({ conversationId: "c1", state: "init" })).toBeNull();
+    expect(String(t.service.getState().error)).toContain("returned null");
+  });
+
+  it("notifies the question it asked and the answer it got", async () => {
+    const t = dispatcher({ action: "extract", reason: "nothing read yet", next: "init" });
+
+    await t.run({ conversationId: "c1", state: "init" });
+
+    const asked = t.notifications.find((entry) => entry.decidePrompt !== undefined);
+    expect(String(asked?.decidePrompt)).toContain("ACTIONS YOU MAY TAKE NOW:");
+    expect(String(asked?.decideAnswer)).toContain('"action":"extract"');
+  });
+
+  it("keeps the last answer in state, so a failed pass can be read afterwards", async () => {
+    const t = dispatcher(undefined, {
+      decide: [
+        {
+          serviceId: "fake",
+          uuid: "brain",
+          state: { jsonSchema: null, answerText: "no" },
+        },
+      ],
+    });
+
+    await t.run({ conversationId: "c1", state: "init" });
+    expect(String(t.service.getState().lastAnswer)).toContain('"text":"no"');
   });
 });
 
