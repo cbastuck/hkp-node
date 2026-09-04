@@ -4,7 +4,7 @@
  * Service Name: SQL
  * Runtime: hkp-node
  * Modes: query | run | exec
- * Key Config: statement, schema, mode
+ * Key Config: statement, schema, mode, database
  * IO: in=JSON (the statement's named parameters) -> out=JSON
  *     query -> { rows, count }
  *     run   -> { changes, lastInsertRowid }
@@ -16,10 +16,16 @@
  * domain — conversations, say — is a second service over the same module
  * (`database.ts`), not a mode of this one.
  *
- * The database is the board's, chosen by the runtime's scope rather than by
- * configuration, so a board cannot widen its reach by asking. Two `sql`
- * services on one board see the same tables without being told to; two boards
- * never do.
+ * The tenant is the board's, and comes from the runtime's scope rather than
+ * from configuration: no board can reach another owner's tables by asking.
+ *
+ * Which file inside that tenant is the board's to say. `database` names it,
+ * and two services naming the same file share its tables — within one board,
+ * which is the ordinary case, or deliberately across boards, which is
+ * occasionally the point. Left empty the name is derived from the board's
+ * title, which is what every board did before the field existed: convenient,
+ * and the reason two boards that happen to share a title also share their
+ * tables. A board that means to be alone with its data says so.
  *
  * **Parameters come from the input, named by the statement.** A statement
  * mentioning `$conversationId` is given the input's `conversationId`, and a
@@ -110,6 +116,8 @@ export class SqlService implements HostedService {
   private lastError = "";
   /** Boards whose schema this instance has already applied. */
   private prepared = new Set<string>();
+  /** The file this board keeps its tables in. Empty derives one; see docs. */
+  private database = "";
 
   constructor(
     config: ServiceConfiguration,
@@ -128,6 +136,7 @@ export class SqlService implements HostedService {
   getState(): JsonRecord {
     return {
       mode: this.mode,
+      database: this.database,
       statement: this.statement,
       schema: this.schema,
       lastCount: this.lastCount,
@@ -145,6 +154,11 @@ export class SqlService implements HostedService {
     if (typeof config.schema === "string" && config.schema !== this.schema) {
       this.schema = config.schema;
       // A changed schema is a different set of tables to bring into being.
+      this.prepared.clear();
+    }
+    if (typeof config.database === "string" && config.database !== this.database) {
+      this.database = config.database.trim();
+      // Another file is another set of tables, whatever this one already made.
       this.prepared.clear();
     }
     return this.getState();
@@ -168,7 +182,9 @@ export class SqlService implements HostedService {
 
     let db: Database;
     try {
-      db = this.databases.open(scope);
+      db = this.database
+        ? this.databases.openNamed(scope.owner, this.database)
+        : this.databases.open(scope);
       this.applySchema(db, scope);
     } catch (err) {
       return this.fail(notify, `could not open the board's database: ${reason(err)}`);
@@ -198,7 +214,7 @@ export class SqlService implements HostedService {
    * and no way to know which board's database the tables belong in.
    */
   private applySchema(db: Database, scope: RuntimeScope): void {
-    const key = `${scope.owner} ${scope.boardName}`;
+    const key = `${scope.owner} ${this.database || scope.boardName}`;
     if (!this.schema.trim() || this.prepared.has(key)) {
       return;
     }

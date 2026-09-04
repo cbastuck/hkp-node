@@ -7,7 +7,7 @@
  *        put-artifact | list-artifacts | set-artifact-status
  * Key Config: mode, states, initialState, direction, state, stateFrom,
  *             conversationFrom, idFrom, inState, idleSeconds, limit,
- *             kind, status, payloadFrom
+ *             kind, status, payloadFrom, database
  * IO: in=an email envelope (ingest) or a conversation id (everything else)
  *     ingest              -> { conversationId, state, isNew, email }, or
  *                            nothing at all when the message is already known
@@ -23,6 +23,12 @@
  * what a conversation is — that mail arrives in threads, that a thread is in
  * some state, and that work produced along the way has to be found again — and
  * owns the three tables that say so.
+ *
+ * Which file it keeps them in is the board's to say, through `database`, and a
+ * board that leaves it empty gets one derived from its title — which is what
+ * every board did before the field existed, and the reason two boards sharing
+ * a title also share their conversations. The tenant is never the board's to
+ * choose: that comes from the runtime's scope.
  *
  * It reaches the database through `database.ts` directly, not through the `sql`
  * service. Two services, one module: a service instance wrapping another
@@ -298,6 +304,8 @@ export class ConversationsService implements HostedService {
   private kind = "";
   private status = "";
   private payloadFrom = "";
+  /** The file this board keeps its conversations in. Empty derives one. */
+  private database = "";
   private lastCount = 0;
   private lastError = "";
   /** Boards whose tables this instance has already created. */
@@ -333,6 +341,7 @@ export class ConversationsService implements HostedService {
       kind: this.kind,
       status: this.status,
       payloadFrom: this.payloadFrom,
+      database: this.database,
       lastCount: this.lastCount,
       error: this.lastError,
     };
@@ -381,6 +390,11 @@ export class ConversationsService implements HostedService {
     if (typeof config.payloadFrom === "string") {
       this.payloadFrom = config.payloadFrom;
     }
+    if (typeof config.database === "string" && config.database !== this.database) {
+      this.database = config.database.trim();
+      // Another file is another set of tables, whatever this one already made.
+      this.prepared.clear();
+    }
     return this.getState();
   }
 
@@ -400,8 +414,10 @@ export class ConversationsService implements HostedService {
 
     let db: Database;
     try {
-      db = this.databases.open(scope);
-      const key = `${scope.owner} ${scope.boardName}`;
+      db = this.database
+        ? this.databases.openNamed(scope.owner, this.database)
+        : this.databases.open(scope);
+      const key = `${scope.owner} ${this.database || scope.boardName}`;
       if (!this.prepared.has(key)) {
         db.exec(SCHEMA);
         this.prepared.add(key);
