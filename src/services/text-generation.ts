@@ -49,7 +49,7 @@
  * ANTHROPIC_API_KEY in the runtime's environment, which is how a deployed board
  * avoids carrying a credential at all.
  */
-import { referencedSecrets } from "../secrets";
+import { resolveCredential } from "../secrets";
 import {
   HostedService,
   JsonRecord,
@@ -347,7 +347,18 @@ export class TextGenerationService implements HostedService {
       );
     }
 
-    const { value: key, problem } = this.resolveKey();
+    // The environment's key belongs to the hosted API. A `server` board names
+    // its own address, so falling back there would hand that credential to
+    // whatever is listening — the key is used only if a board set one.
+    const configured =
+      this.backend === "server"
+        ? this.apiKey
+        : this.apiKey || process.env.ANTHROPIC_API_KEY || "";
+    const { value: key, problem } = resolveCredential(
+      this.host?.secrets?.(),
+      configured,
+      this.endpoint(),
+    );
     // A credential that was named and could not be produced is a failure
     // whichever backend asked for it: the request would go out unauthenticated
     // and fail somewhere far away instead.
@@ -384,51 +395,6 @@ export class TextGenerationService implements HostedService {
       return true;
     }
     return this.backend !== "server" && !!process.env.ANTHROPIC_API_KEY;
-  }
-
-  /**
-   * The key for one request, resolved against the endpoint it is going to.
-   *
-   * A reference resolves through the runtime's secrets — the runtime around
-   * this one where this service sits in a nested pipeline, which is the same
-   * vault by delegation. Anything else is used as written, which is what a
-   * runtime configured from a file holds, and what the environment supplies.
-   */
-  private resolveKey(): { value: string; problem: string } {
-    // The environment's key belongs to the hosted API. A `server` board names
-    // its own address, so falling back here would hand that credential to
-    // whatever is listening there — the key is used only if a board set one.
-    const configured =
-      this.backend === "server"
-        ? this.apiKey
-        : this.apiKey || process.env.ANTHROPIC_API_KEY || "";
-
-    const references = referencedSecrets(configured);
-    if (!references.length) {
-      return { value: configured, problem: "" };
-    }
-
-    const vault = this.host?.secrets?.();
-    if (!vault) {
-      return {
-        value: "",
-        problem: `no secrets available to resolve ${references.join(", ")}`,
-      };
-    }
-
-    const { value, missing, refused } = vault.resolve(configured, {
-      to: this.endpoint(),
-    });
-    if (refused.length) {
-      return {
-        value: "",
-        problem: `${refused[0].alias} may not be sent to ${refused[0].to}`,
-      };
-    }
-    if (missing.length) {
-      return { value: "", problem: `no value stored for ${missing.join(", ")}` };
-    }
-    return { value, problem: "" };
   }
 
   /**

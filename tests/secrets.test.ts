@@ -5,6 +5,7 @@ import {
   destinationHost,
   readSecretsPayload,
   referencedSecrets,
+  resolveCredential,
 } from "../src/secrets";
 
 /**
@@ -159,5 +160,63 @@ describe("naming what a board asks for", () => {
     expect(destinationHost("imap.example.com:993")).toBe("imap.example.com");
     expect(destinationHost("API.Example.COM")).toBe("api.example.com");
     expect(destinationHost("")).toBe(null);
+  });
+});
+
+describe("a credential that is part of something larger", () => {
+  /**
+   * The case the whole arrangement exists for: a credential is not always a
+   * field of its own. `http-client` carries one as an entry in a free-form
+   * header map, inside a larger string — and reports that map verbatim, which
+   * is what used to write a resolved token into the next saved board.
+   */
+
+  it("resolves inside a header without disturbing the rest", () => {
+    const { value, problem } = resolveCredential(
+      vaultOf({ api: { value: "sk-1" } }),
+      { Authorization: "Bearer {{secret.api}}", Accept: "application/json" },
+      "https://api.example.com/v1",
+    );
+
+    expect(problem).toBe("");
+    expect(value).toEqual({
+      Authorization: "Bearer sk-1",
+      Accept: "application/json",
+    });
+  });
+
+  it("resolves nothing at all when one entry may not go there", () => {
+    // Not a half-filled map: a caller handed one might send it anyway.
+    const { value, problem } = resolveCredential(
+      vaultOf({ api: { value: "sk-1", audience: ["api.example.com"] } }),
+      { Authorization: "Bearer {{secret.api}}", Accept: "application/json" },
+      "https://evil.example/",
+    );
+
+    expect(value).toBeUndefined();
+    expect(problem).toBe("api may not be sent to evil.example");
+  });
+
+  it("hands back a literal unchanged, with no vault needed", () => {
+    // What a runtime configured from a file holds.
+    const { value, problem } = resolveCredential(
+      null,
+      { Authorization: "Bearer literal" },
+      "https://api.example.com",
+    );
+
+    expect(problem).toBe("");
+    expect(value).toEqual({ Authorization: "Bearer literal" });
+  });
+
+  it("refuses to send a reference as its own text when there is no vault", () => {
+    const { value, problem } = resolveCredential(
+      null,
+      "Bearer {{secret.api}}",
+      "https://api.example.com",
+    );
+
+    expect(value).toBeUndefined();
+    expect(problem).toBe("no secrets available to resolve api");
   });
 });

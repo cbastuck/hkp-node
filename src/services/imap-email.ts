@@ -11,7 +11,7 @@
 
 import { ImapFlow, MailboxObject } from "imapflow";
 import { simpleParser } from "mailparser";
-import { referencedSecrets } from "../secrets";
+import { referencedSecrets, resolveCredential } from "../secrets";
 import {
   HostedService,
   JsonRecord,
@@ -129,36 +129,6 @@ export class ImapEmailService implements HostedService {
     if (config.state) {
       this.configure(config.state);
     }
-  }
-
-  /**
-   * The password for one connection attempt, from whatever the state holds.
-   *
-   * A reference resolves against the runtime's vault; anything else is used as
-   * written, which is what a runtime configured from a file rather than from a
-   * board still does. Without a host there is no vault, so a reference cannot
-   * resolve and says so rather than being sent as itself.
-   */
-  private _resolvePassword(): {
-    value: string;
-    missing: string[];
-    refused: Array<{ alias: string; to: string }>;
-  } {
-    const vault = this.runtimeHost?.secrets?.();
-    if (!vault) {
-      // No vault to ask. A literal password is still usable — that is what a
-      // runtime configured from a file holds — but a reference is not, and
-      // must not be sent as its own text.
-      const references = referencedSecrets(this.state.password);
-      return {
-        value: references.length ? "" : this.state.password,
-        missing: references,
-        refused: [],
-      };
-    }
-    return vault.resolve(this.state.password, {
-      to: `${this.state.host}:${this.state.port}`,
-    });
   }
 
   setHost(host: RuntimeHost): void {
@@ -295,21 +265,20 @@ export class ImapEmailService implements HostedService {
     // nowhere else. It is resolved against the host being dialled, so a
     // credential the vault binds to one server cannot be sent to another by
     // reconfiguring this service.
-    const { value: password, missing, refused } = this._resolvePassword();
-    if (!password) {
+    const { value: password, problem } = resolveCredential(
+      this.runtimeHost?.secrets?.(),
+      this.state.password,
+      `${this.state.host}:${this.state.port}`,
+    );
+    if (problem) {
       this.state.enabled = false;
       this.state.running = false;
       this.state.status = "disconnected";
-      this.state.error = refused.length
-        ? `${refused[0].alias} may not be sent to ${refused[0].to}`
-        : missing.length
-          ? `no value stored for ${missing.join(", ")}`
-          : "host, username and password are required";
+      this.state.error = problem;
       this._notifyState();
       return;
     }
 
-    console.log("COnnecting", this.state.username, password);
     const client = new ImapFlow({
       host: this.state.host,
       port: this.state.port,

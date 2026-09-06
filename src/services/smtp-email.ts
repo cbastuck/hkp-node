@@ -33,7 +33,7 @@
 import nodemailer, { Transporter } from "nodemailer";
 
 import { normalizeMessageId, normalizeReferences } from "./imap-email";
-import { referencedSecrets } from "../secrets";
+import { resolveCredential } from "../secrets";
 import {
   HostedService,
   JsonRecord,
@@ -236,43 +236,6 @@ export class SmtpEmailService implements HostedService {
   }
 
   /** Hands the message to the transport, and says what was sent. */
-  /**
-   * The password for one send, from whatever the state holds.
-   *
-   * A reference resolves against the runtime's secrets; anything else is used
-   * as written, which is what a runtime configured from a file holds. Without
-   * a host there is no vault, so a reference cannot resolve and says so rather
-   * than being sent as its own text.
-   */
-  private resolvePassword(): { value: string; problem: string } {
-    const references = referencedSecrets(this._state.password);
-    if (!references.length) {
-      return { value: this._state.password, problem: "" };
-    }
-
-    const vault = this._host?.secrets?.();
-    if (!vault) {
-      return {
-        value: "",
-        problem: `no secrets available to resolve ${references.join(", ")}`,
-      };
-    }
-
-    const { value, missing, refused } = vault.resolve(this._state.password, {
-      to: `${this._state.host}:${this._state.port}`,
-    });
-    if (refused.length) {
-      return {
-        value: "",
-        problem: `${refused[0].alias} may not be sent to ${refused[0].to}`,
-      };
-    }
-    if (missing.length) {
-      return { value: "", problem: `no value stored for ${missing.join(", ")}` };
-    }
-    return { value, problem: "" };
-  }
-
   private async send(
     message: Message,
     notify: (payload: unknown, instanceId?: string) => void,
@@ -304,7 +267,11 @@ export class SmtpEmailService implements HostedService {
     // The password exists from here to the end of this send and nowhere else.
     // It is resolved against the server being dialled, so a credential bound
     // to one host cannot be sent to another by reconfiguring this service.
-    const { value: password, problem } = this.resolvePassword();
+    const { value: password, problem } = resolveCredential(
+      this._host?.secrets?.(),
+      this._state.password,
+      `${this._state.host}:${this._state.port}`,
+    );
     if (problem) {
       return this.fail(notify, problem);
     }

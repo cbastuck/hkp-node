@@ -15,6 +15,10 @@ import {
   ServiceConfiguration,
   ServiceRegistryEntry,
 } from "../types";
+import { resolveCredential } from "../secrets";
+
+/** The only address either telegram service sends its token to. */
+const TELEGRAM_API = "https://api.telegram.org";
 
 export const telegramSenderDescriptor: ServiceRegistryEntry = {
   serviceId: "telegram-sender",
@@ -53,13 +57,16 @@ export class TelegramSenderService implements HostedService {
 
   getState(): JsonRecord {
     // Secrets are write-only: never echo the bot token back to clients.
-    const { botToken, ...rest } = this._state;
-    return { ...rest, botToken: "", botTokenConfigured: botToken.length > 0 };
+    // Nothing to hide: `botToken` holds the reference it was configured with,
+    // never a value, so what a board saves is what it already said.
+    return { ...this._state };
   }
 
   configure(config: JsonRecord): JsonRecord {
-    // Empty string means "no change" (what masked getState() round-trips back).
-    if (typeof config.botToken === "string" && config.botToken !== "") {
+    // A `{{secret.<alias>}}` reference, kept as written and resolved when a
+    // request is made. Empty is a real value here — it clears the field —
+    // because nothing masks this any more, so nothing round-trips as blank.
+    if (typeof config.botToken === "string") {
       this._state.botToken = config.botToken;
     }
     if (typeof config.chatId === "string") {
@@ -89,8 +96,20 @@ export class TelegramSenderService implements HostedService {
       return;
     }
 
+    // The token exists from here to the end of this request and nowhere else.
+    const { value: botToken, problem } = resolveCredential(
+      this._host?.secrets?.(),
+      this._state.botToken,
+      TELEGRAM_API,
+    );
+    if (problem) {
+      this._state.error = problem;
+      this._notify({ error: this._state.error });
+      return;
+    }
+
     try {
-      const url = `https://api.telegram.org/bot${this._state.botToken}/sendMessage`;
+      const url = `${TELEGRAM_API}/bot${botToken}/sendMessage`;
       const res = await fetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },

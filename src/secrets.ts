@@ -119,6 +119,55 @@ export class SecretVault {
   }
 }
 
+/**
+ * One credential, resolved for one use, or the reason there is none.
+ *
+ * What a service holds is either a reference or a literal, and either may be
+ * absent; the caller wants a value it can send or a sentence it can report.
+ * Separating those two outcomes here keeps every service that takes a
+ * credential from writing the same four branches.
+ *
+ * A literal is returned as it stands, which is what a runtime configured from
+ * a file holds. A reference needs a vault, and without one it resolves to
+ * nothing rather than being sent as its own text — a caller handed
+ * `{{secret.…}}` would offer it as a credential and fail somewhere far away.
+ *
+ * Takes a whole structure as readily as one string, because a credential is
+ * not always a field of its own: it can be one entry in a map of headers, or
+ * part of a larger string around it.
+ */
+export function resolveCredential<T>(
+  vault: SecretVault | null | undefined,
+  held: T,
+  to: string,
+): { value: T; problem: string } {
+  const references = referencedSecrets(held);
+  if (!references.length) {
+    return { value: held, problem: "" };
+  }
+  // Nothing resolved on a failure: the caller gets a problem to report, and
+  // never a half-filled structure it might send anyway.
+  const none = { value: undefined as unknown as T };
+  if (!vault) {
+    return {
+      ...none,
+      problem: `no secrets available to resolve ${references.join(", ")}`,
+    };
+  }
+
+  const { value, missing, refused } = vault.resolve(held, { to });
+  if (refused.length) {
+    return {
+      ...none,
+      problem: `${refused[0].alias} may not be sent to ${refused[0].to}`,
+    };
+  }
+  if (missing.length) {
+    return { ...none, problem: `no value stored for ${missing.join(", ")}` };
+  }
+  return { value, problem: "" };
+}
+
 /** Every alias a value refers to, however deeply it is nested. */
 export function referencedSecrets(value: unknown): string[] {
   const found = new Set<string>();

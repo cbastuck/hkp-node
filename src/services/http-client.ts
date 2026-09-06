@@ -35,6 +35,7 @@ import {
   ServiceRegistryEntry,
 } from "../types";
 import { MOUNT_FIELD, parseMountRef } from "../coordinator/mount";
+import { resolveCredential } from "../secrets";
 
 export const httpClientDescriptor: ServiceRegistryEntry = {
   serviceId: "http-client",
@@ -234,7 +235,21 @@ export class HttpClientService implements HostedService {
 
     try {
       const request = this.requestBody(input);
-      const headers: Record<string, string> = { ...this.headers };
+      // Headers are a free-form map, and a credential is as likely to be part
+      // of one — `Bearer <token>` — as to be a field of its own. Resolved
+      // against the address being called, so a header bound to one host cannot
+      // be sent to another by repointing this service.
+      const { value: resolvedHeaders, problem } = resolveCredential(
+        this.host?.secrets?.(),
+        this.headers,
+        url,
+      );
+      if (problem) {
+        notify({ requesting: false, url, error: problem });
+        this.inFlight -= 1;
+        return;
+      }
+      const headers: Record<string, string> = { ...resolvedHeaders };
       if (request?.contentType && !headers["content-type"]) {
         headers["content-type"] = request.contentType;
       }
