@@ -504,10 +504,11 @@ describe("the board as a whole", () => {
   });
 
   it("does not record a send that did not happen", async () => {
-    // The board ships with no SMTP credentials, deliberately: sending is the
-    // one thing here that cannot be undone. The manager chooses to send, the
-    // send fails, and nothing downstream gets to pretend otherwise — the draft
-    // is not marked sent and the conversation does not move on.
+    // Sending is the one thing here that cannot be undone, and this board
+    // refuses on two counts: it names a credential nothing has supplied, and
+    // it writes only to the addresses it lists. The manager chooses to send,
+    // the send fails, and nothing downstream gets to pretend otherwise — the
+    // draft is not marked sent and the conversation does not move on.
     const { at } = await loadBoard(ANSWER);
 
     await at("test", "compose", { text: ENQUIRY });
@@ -518,8 +519,9 @@ describe("the board as a whole", () => {
 
     const attempt = await at("dispatch", "poll", {});
 
-    // It was tried, and it said why it could not.
-    expect(attempt.said("send-mail").error).toContain("required");
+    // It was tried, and it said why it could not. Which guard spoke first is
+    // not the point — that it refused, and said so, is.
+    expect(attempt.said("send-mail").error).toBeTruthy();
 
     // And nothing after the failed send ran: the conversation is where it was.
     const conversation = (

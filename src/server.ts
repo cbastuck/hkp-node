@@ -688,17 +688,23 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
   /**
    * Values for the references this runtime's services hold.
    *
-   * Provisioning carries them already; this is for the two moments it cannot
-   * cover — an entry edited while a board is running, and a re-push after a
-   * restart, where the services survived but the vault did not. It merges, so
-   * a client sending one entry does not strip the rest.
+   * Provisioning carries them already; this is for the moments it cannot cover
+   * — a board being built a service at a time, an entry edited while a board
+   * is running, and a re-push after a restart where the services survived but
+   * the vault did not. It merges, so a client sending one entry does not strip
+   * the rest.
+   *
+   * POST rather than PUT: this merges rather than replaces, and every other
+   * mutation this server takes is a POST — the CORS allowlist says so, and a
+   * lone PUT is a method each runtime implementation would have to remember to
+   * allow separately.
    *
    * There is deliberately no GET. The values go one way: in, and then only to
    * a service resolving a reference for a call it is making. What is held can
    * be *named* — the response says which aliases the runtime now has — because
    * a client needs to show whether a credential is configured.
    */
-  expressApp.put("/runtimes/:runtimeId/secrets", (req, res) => {
+  expressApp.post("/runtimes/:runtimeId/secrets", (req, res) => {
     const runtime = getRuntimeOr404(req, res, req.params.runtimeId);
     if (!runtime) {
       return;

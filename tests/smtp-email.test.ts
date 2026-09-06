@@ -248,15 +248,20 @@ describe("who it may write to", () => {
 });
 
 describe("the password", () => {
-  it("is never echoed back, and survives a round-trip through the UI", () => {
-    const t = smtp({ ...CREDENTIALS, to: "ops@hotel.example" });
+  it("reports the reference it was configured with, and round-trips unchanged", () => {
+    // Nothing is masked, because nothing resolved is held: what comes back is
+    // the name of the secret, which is what a board should carry. A client
+    // configuring with the state it was given therefore changes nothing.
+    const t = smtp({
+      ...CREDENTIALS,
+      password: "{{secret.smtp}}",
+      to: "ops@hotel.example",
+    });
 
     const state = t.service.getState();
-    expect(state.password).toBe("");
-    expect(state.passwordConfigured).toBe(true);
+    expect(state.password).toBe("{{secret.smtp}}");
 
-    // What a client sends back is the masked state; that must not erase it.
     t.service.configure(state);
-    expect(t.service.getState().passwordConfigured).toBe(true);
+    expect(t.service.getState().password).toBe("{{secret.smtp}}");
   });
 });

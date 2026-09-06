@@ -261,7 +261,11 @@ export class ImapEmailService implements HostedService {
 
     this._abandonClient();
 
-    if (!this.state.host || !this.state.username || !this.state.password.trim()) {
+    if (
+      !this.state.host ||
+      !this.state.username ||
+      !this.state.password.trim()
+    ) {
       this.state.enabled = false;
       this.state.running = false;
       this.state.status = "disconnected";
@@ -305,6 +309,7 @@ export class ImapEmailService implements HostedService {
       return;
     }
 
+    console.log("COnnecting", this.state.username, password);
     const client = new ImapFlow({
       host: this.state.host,
       port: this.state.port,
@@ -322,7 +327,9 @@ export class ImapEmailService implements HostedService {
     // ImapFlow is an EventEmitter: without a listener here, a socket error —
     // ECONNRESET when a laptop lid closes — is an unhandled 'error' event and
     // takes the whole runtime process down with it.
-    client.on("error", (err: unknown) => this._onConnectionLost(generation, err));
+    client.on("error", (err: unknown) =>
+      this._onConnectionLost(generation, err),
+    );
     client.on("close", () => this._onConnectionLost(generation, null));
 
     this.client = client;
