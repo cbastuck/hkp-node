@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import { MapService } from "../src/services/map";
 import { RuntimeHost, RuntimeNotification } from "../src/types";
+import { SecretVault } from "../src/secrets";
 
 function createMap(state?: Record<string, unknown>) {
   return new MapService({ serviceId: "map", uuid: "map-1", state });
@@ -31,6 +32,7 @@ function createHost(): RecordingHost {
     currentContext() {
       return null;
     },
+    secrets: () => new SecretVault(),
     log() {},
     forwardLog() {},
     logSettings() {

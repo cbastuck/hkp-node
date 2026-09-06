@@ -1,4 +1,5 @@
 import { MountHandle, MountHandlers } from "./mounts";
+import { SecretVault } from "./secrets";
 
 export type JsonRecord = Record<string, unknown>;
 
@@ -35,6 +36,21 @@ export type RuntimeConfiguration = {
    * to connect to it.
    */
   garbageCollected?: boolean;
+  /**
+   * Values for the `{{secret.<alias>}}` references this runtime's services
+   * carry, by alias.
+   *
+   * They ride with the create payload because provisioning is one call: the
+   * services in it are constructed *and* configured before it returns, and a
+   * service that opens a connection on configure needs its credential by then.
+   * Sending them later would be too late for exactly the services that have
+   * one.
+   *
+   * They are unpacked into the runtime's vault and go no further — never into
+   * a service's state, never into a serialized runtime, never back out over
+   * the wire.
+   */
+  secrets?: Record<string, { value: string; audience?: string[] }>;
   /**
    * Whether this runtime records anything at all.
    *
@@ -285,4 +301,13 @@ export interface RuntimeHost {
     handlers: MountHandlers,
     options?: { mountName?: string },
   ): MountHandle | null;
+  /**
+   * The runtime's secrets, for a service that has a credential to send.
+   *
+   * A service holds the reference it was configured with and asks here for the
+   * value, naming where it is about to send it. What comes back is used and
+   * dropped: assigning it to state would put it back on the path a board is
+   * saved from, which is the whole thing this arrangement exists to prevent.
+   */
+  secrets(): SecretVault;
 }

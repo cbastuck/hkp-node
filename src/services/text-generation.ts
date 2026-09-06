@@ -49,6 +49,7 @@
  * ANTHROPIC_API_KEY in the runtime's environment, which is how a deployed board
  * avoids carrying a credential at all.
  */
+import { referencedSecrets } from "../secrets";
 import {
   HostedService,
   JsonRecord,
@@ -153,6 +154,12 @@ export class TextGenerationService implements HostedService {
 
   private host: RuntimeHost | null = null;
   private backend = "anthropic";
+  /**
+   * A `{{secret.<alias>}}` reference, or a literal key for a runtime
+   * configured from a file. Never a value resolved from a reference: it is
+   * reported as it stands, so a board saved from this service names its
+   * credential rather than carrying it.
+   */
   private apiKey = "";
   /** Empty means the backend's own address; see DEFAULT_URLS. */
   private serverUrl = "";
@@ -192,9 +199,11 @@ export class TextGenerationService implements HostedService {
   getState(): JsonRecord {
     const state: JsonRecord = {
       backend: this.backend,
-      // Write-only: what was configured never comes back out.
-      apiKey: "",
-      apiKeyConfigured: this.resolveKey().length > 0,
+      // Reported as configured. Where that is a reference it names a secret
+      // and holds nothing, and where it is a literal key it is one the board
+      // already carried; either way there is nothing here to hide.
+      apiKey: this.apiKey,
+      apiKeyConfigured: this.hasKey(),
       serverUrl: this.serverUrl,
       // Read-only, and the point of it: which address this configuration
       // actually reaches, without having to know how a backend spells one.
@@ -251,9 +260,9 @@ export class TextGenerationService implements HostedService {
     if (typeof config.backend === "string" && BACKENDS.includes(config.backend)) {
       this.backend = config.backend;
     }
-    // An empty string is how a UI sends back the masked field it was given, so
-    // it must not be read as "clear the key".
-    if (typeof config.apiKey === "string" && config.apiKey) {
+    // Nothing masks this any more, so an empty string is not something a UI
+    // round-trips back — it means what it says, and clears the key.
+    if (typeof config.apiKey === "string") {
       this.apiKey = config.apiKey;
     }
     if (typeof config.serverUrl === "string") {
@@ -338,7 +347,13 @@ export class TextGenerationService implements HostedService {
       );
     }
 
-    const key = this.resolveKey();
+    const { value: key, problem } = this.resolveKey();
+    // A credential that was named and could not be produced is a failure
+    // whichever backend asked for it: the request would go out unauthenticated
+    // and fail somewhere far away instead.
+    if (problem) {
+      return this.fail(notify, problem);
+    }
     // A server next door is reached by address, not by credential — only the
     // hosted API has one to be missing.
     if (!key && this.backend === "anthropic") {
@@ -357,15 +372,63 @@ export class TextGenerationService implements HostedService {
 
   // ── Private ───────────────────────────────────────────────────────────────
 
-  /** The configured key, or the environment's when none was configured. */
-  private resolveKey(): string {
+  /**
+   * Whether a key is available at all, without producing one.
+   *
+   * Answering "is this configured" must not resolve a secret: it is asked
+   * every time state is reported, and a value produced to compute a boolean is
+   * a value that existed for no reason.
+   */
+  private hasKey(): boolean {
+    if (this.apiKey) {
+      return true;
+    }
+    return this.backend !== "server" && !!process.env.ANTHROPIC_API_KEY;
+  }
+
+  /**
+   * The key for one request, resolved against the endpoint it is going to.
+   *
+   * A reference resolves through the runtime's secrets — the runtime around
+   * this one where this service sits in a nested pipeline, which is the same
+   * vault by delegation. Anything else is used as written, which is what a
+   * runtime configured from a file holds, and what the environment supplies.
+   */
+  private resolveKey(): { value: string; problem: string } {
     // The environment's key belongs to the hosted API. A `server` board names
     // its own address, so falling back here would hand that credential to
     // whatever is listening there — the key is used only if a board set one.
-    if (this.backend === "server") {
-      return this.apiKey;
+    const configured =
+      this.backend === "server"
+        ? this.apiKey
+        : this.apiKey || process.env.ANTHROPIC_API_KEY || "";
+
+    const references = referencedSecrets(configured);
+    if (!references.length) {
+      return { value: configured, problem: "" };
     }
-    return this.apiKey || process.env.ANTHROPIC_API_KEY || "";
+
+    const vault = this.host?.secrets?.();
+    if (!vault) {
+      return {
+        value: "",
+        problem: `no secrets available to resolve ${references.join(", ")}`,
+      };
+    }
+
+    const { value, missing, refused } = vault.resolve(configured, {
+      to: this.endpoint(),
+    });
+    if (refused.length) {
+      return {
+        value: "",
+        problem: `${refused[0].alias} may not be sent to ${refused[0].to}`,
+      };
+    }
+    if (missing.length) {
+      return { value: "", problem: `no value stored for ${missing.join(", ")}` };
+    }
+    return { value, problem: "" };
   }
 
   /**

@@ -69,6 +69,7 @@ export class SubService implements HostedService {
     // ask, so what the board records reaches it here rather than never.
     this.applyLogSettings();
     this.applyScope();
+    this.applySecrets();
   }
 
   /**
@@ -101,6 +102,21 @@ export class SubService implements HostedService {
    * belongs to — and outside its tenant, which is worse. Nesting changes where
    * a service sits, not who it answers to.
    */
+  /**
+   * Points the nested pipeline at this service's own secrets.
+   *
+   * Nothing provisions a nested runtime, so its vault is always empty: a
+   * service inside the pipeline holds the same `{{secret.…}}` reference as one
+   * at the top level and would have nothing to resolve it against. The host is
+   * read on each lookup rather than now, both because a value may be pushed
+   * after the board is running and because a pipeline nested deeper reaches
+   * its own host the same way — so the chain composes to whichever runtime was
+   * actually given something.
+   */
+  private applySecrets(): void {
+    this.pipeline?.delegateSecrets(() => this.host?.secrets?.() ?? null);
+  }
+
   private applyScope(): void {
     const scope = this.host?.scope();
     if (scope && this.pipeline) {
@@ -255,7 +271,8 @@ export class SubService implements HostedService {
     );
 
     this.applyLogSettings();
-    this.applyScope();
+this.applyScope();
+    this.applySecrets();
   }
 
   private getPipelineState(): SubServiceState["pipeline"] {

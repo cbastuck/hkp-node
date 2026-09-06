@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { HttpClientService } from "../src/services/http-client";
 import { RuntimeHost, RuntimeNotification } from "../src/types";
+import { SecretVault } from "../src/secrets";
 
 type Recorded = {
   method: string;
@@ -62,6 +63,7 @@ function hostSpy() {
     },
     notify: () => {},
     currentContext: () => null,
+    secrets: () => new SecretVault(),
     log: () => {},
     forwardLog: () => {},
     logSettings: () => ({ logging: false, logData: false, logLevel: "info" as const }),

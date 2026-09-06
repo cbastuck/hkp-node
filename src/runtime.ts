@@ -17,6 +17,7 @@ import {
   ServiceConfiguration,
   ServiceDescriptor,
 } from "./types";
+import { SecretVault } from "./secrets";
 import { ANONYMOUS_SUB } from "./auth";
 import { MountHandle, MountHandlers } from "./mounts";
 
@@ -122,6 +123,16 @@ export class HostedRuntime implements RuntimeHost {
   private logging = false;
   /** The least severe level recorded; see RuntimeConfiguration.logLevel. */
   private logLevel: LogLevel = "info";
+  /**
+   * Values for the references this runtime's services carry. Held apart from
+   * every service's state, and reachable only through `secrets()`.
+   */
+  private readonly vault = new SecretVault();
+  /**
+   * Where this runtime's secrets actually come from, when they are not its
+   * own; see `delegateSecrets`.
+   */
+  private secretsFrom: (() => SecretVault | null) | null = null;
 
   constructor(
     config: RuntimeConfiguration,
@@ -144,6 +155,12 @@ export class HostedRuntime implements RuntimeHost {
     }
     this.createService = createService;
     this.mounts = mounts;
+
+    // Before any service is built, because a service that opens a connection
+    // while being configured asks for its credential during `addService`.
+    if (config.secrets) {
+      this.vault.replace(config.secrets);
+    }
 
     for (const serviceConfig of config.services) {
       this.addService(serviceConfig);
@@ -470,6 +487,38 @@ export class HostedRuntime implements RuntimeHost {
 
   scope(): RuntimeScope {
     return { owner: this.owner, boardName: this.boardName };
+  }
+
+  secrets(): SecretVault {
+    return this.secretsFrom?.() ?? this.vault;
+  }
+
+  /**
+   * Take secrets from somewhere else rather than from this runtime's own vault.
+   *
+   * A nested pipeline is a runtime nobody provisions: no create payload reaches
+   * it, so its own vault stays empty and a service inside it could never
+   * resolve a reference. What it does have is the runtime around it, which was
+   * provisioned — so it asks that one instead.
+   *
+   * Asked for each time rather than copied, so that a value pushed after a
+   * board is running reaches a nested service as immediately as a top-level
+   * one, and so that nesting composes: each level delegates outward until it
+   * reaches the runtime that was actually given something.
+   */
+  delegateSecrets(source: () => SecretVault | null): void {
+    this.secretsFrom = source;
+  }
+
+  /**
+   * Takes in values for references this runtime's services already hold.
+   *
+   * Merges rather than replaces, because this is what a client editing one
+   * entry sends, and what a client re-pushes after a restart. Replacing on a
+   * partial push would strip credentials from services nobody touched.
+   */
+  setSecrets(entries: Record<string, { value: string; audience?: string[] }>): void {
+    this.vault.merge(entries);
   }
 
   /**

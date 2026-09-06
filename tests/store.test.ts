@@ -11,6 +11,7 @@ import {
 } from "../src/services/recordStore";
 import { StoreService } from "../src/services/store";
 import { RuntimeHost, RuntimeScope } from "../src/types";
+import { SecretVault } from "../src/secrets";
 
 /**
  * What a board remembers, and whose it is.
@@ -46,6 +47,7 @@ function hostFor(scope: RuntimeScope) {
     },
     notify: () => {},
     currentContext: () => null,
+    secrets: () => new SecretVault(),
     log: () => {},
     forwardLog: () => {},
     logSettings: () => ({ logging: false, logData: false, logLevel: "info" as const }),

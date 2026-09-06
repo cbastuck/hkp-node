@@ -6,6 +6,7 @@ import {
   XBERG_INSTALL_HINT,
 } from "../src/services/document-extract";
 import { RuntimeHost } from "../src/types";
+import { SecretVault } from "../src/secrets";
 
 /**
  * What comes out of a document, and what a board can branch on.
@@ -46,6 +47,7 @@ function hostSpy() {
     },
     notify: () => {},
     currentContext: () => null,
+    secrets: () => new SecretVault(),
     log: () => {},
     forwardLog: () => {},
     logSettings: () => ({ logging: false, logData: false, logLevel: "info" as const }),

@@ -98,6 +98,7 @@ import {
   RuntimeNotification,
   ServiceConfiguration,
 } from "./types";
+import { readSecretsPayload } from "./secrets";
 
 /**
  * Per-tenant limits. Runtimes, services and timers all consume resources on a
@@ -684,6 +685,29 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
     res.json({ token });
   });
 
+  /**
+   * Values for the references this runtime's services hold.
+   *
+   * Provisioning carries them already; this is for the two moments it cannot
+   * cover — an entry edited while a board is running, and a re-push after a
+   * restart, where the services survived but the vault did not. It merges, so
+   * a client sending one entry does not strip the rest.
+   *
+   * There is deliberately no GET. The values go one way: in, and then only to
+   * a service resolving a reference for a call it is making. What is held can
+   * be *named* — the response says which aliases the runtime now has — because
+   * a client needs to show whether a credential is configured.
+   */
+  expressApp.put("/runtimes/:runtimeId/secrets", (req, res) => {
+    const runtime = getRuntimeOr404(req, res, req.params.runtimeId);
+    if (!runtime) {
+      return;
+    }
+    const entries = readSecretsPayload(req.body);
+    runtime.setSecrets(entries);
+    res.json({ aliases: runtime.secrets().aliases() });
+  });
+
   expressApp.post("/runtimes/:runtimeId/rearrange", (req, res) => {
     const runtime = getRuntimeOr404(req, res, req.params.runtimeId);
     if (!runtime) {
@@ -1182,6 +1206,10 @@ function validateRuntimeConfiguration(
         : undefined,
     // Absent means allowed; see RuntimeConfiguration.logData.
     logData: !(isJsonRecord(value.state) && value.state.logData === false),
+    // Values for the references the services carry. Read out of the payload
+    // here and handed to the runtime's vault; they are never put back into any
+    // service's state, and never appear in a serialized runtime.
+    secrets: readSecretsPayload(value.secrets),
     services,
   };
 }

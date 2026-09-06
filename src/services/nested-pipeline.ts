@@ -54,6 +54,7 @@ export class NestedPipeline {
     this.host = host;
     this.applyLogSettings();
     this.applyScope();
+    this.applySecrets();
   }
 
   /** True while there is nothing to run. */
@@ -195,6 +196,7 @@ export class NestedPipeline {
 
     this.applyLogSettings();
     this.applyScope();
+    this.applySecrets();
   }
 
   private applyLogSettings(): void {
@@ -211,6 +213,19 @@ export class NestedPipeline {
     if (scope && this.runtime) {
       this.runtime.setScope(scope);
     }
+  }
+
+  /**
+   * Points the nested runtime at the surrounding one's secrets.
+   *
+   * Nothing provisions a nested runtime, so its own vault is always empty: a
+   * service inside a pipeline holds the same `{{secret.…}}` reference as one
+   * at the top level and would have nothing to resolve it against. The host is
+   * read on each lookup rather than now, because the pipeline is attached
+   * before a value has necessarily been pushed.
+   */
+  private applySecrets(): void {
+    this.runtime?.delegateSecrets(() => this.host?.secrets?.() ?? null);
   }
 
   /** Reads live state back into the configuration before it is rebuilt from. */

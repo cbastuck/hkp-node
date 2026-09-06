@@ -118,6 +118,7 @@ import {
   normalizeMessageId,
   normalizeReferences,
 } from "../src/services/imap-email";
+import { SecretVault } from "../src/secrets";
 
 const CONFIG = {
   host: "imap.example.com",
@@ -131,9 +132,14 @@ type Harness = {
   service: InstanceType<typeof ImapEmailService>;
   /** Subjects handed to the rest of the board, in order. */
   pushed: string[];
+  /** The runtime's secrets, as the service sees them. */
+  vault: SecretVault;
 };
 
-function makeService(state: Record<string, unknown>): Harness {
+function makeService(
+  state: Record<string, unknown>,
+  vault: SecretVault = new SecretVault(),
+): Harness {
   const pushed: string[] = [];
   const service = new ImapEmailService({
     uuid: "imap-1",
@@ -150,8 +156,9 @@ function makeService(state: Record<string, unknown>): Harness {
     currentContext: () => null,
     log: () => {},
     forwardLog: () => {},
+    secrets: () => vault,
   } as never);
-  return { service, pushed };
+  return { service, pushed, vault };
 }
 
 /** Let the connect/idle chain run to where it waits. */
@@ -336,5 +343,71 @@ describe("threading headers", () => {
       "a@x",
       "b@y",
     ]);
+  });
+});
+
+describe("imap-email credentials", () => {
+  beforeEach(() => {
+    fake.store.length = 0;
+    fake.clients.length = 0;
+    fake.state.refuseConnections = false;
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /**
+   * The password the service holds is a name; the value belongs to the runtime.
+   * What matters is that the name is what survives — a board saved from this
+   * service says which secret it needs and not what it is.
+   */
+  it("connects with a value it never holds, and still reports the reference", async () => {
+    const vault = new SecretVault();
+    vault.replace({ "mail.pass": { value: "hunter2" } });
+    const { service } = makeService(
+      { ...CONFIG, password: "{{secret.mail.pass}}", connect: true },
+      vault,
+    );
+    await settle();
+
+    expect(latest().options.auth).toMatchObject({ user: "user", pass: "hunter2" });
+    expect(service.getState()).toMatchObject({
+      status: "connected",
+      password: "{{secret.mail.pass}}",
+    });
+  });
+
+  it("will not send a credential to a host it is not bound to", async () => {
+    const vault = new SecretVault();
+    vault.replace({
+      "mail.pass": { value: "hunter2", audience: ["imap.gmail.com"] },
+    });
+    const { service } = makeService(
+      { ...CONFIG, password: "{{secret.mail.pass}}", connect: true },
+      vault,
+    );
+    await settle();
+
+    expect(fake.clients).toHaveLength(0);
+    expect(service.getState()).toMatchObject({
+      status: "disconnected",
+      error: "mail.pass may not be sent to imap.example.com",
+    });
+  });
+
+  it("says which secret it is missing rather than sending its name", async () => {
+    const { service } = makeService({
+      ...CONFIG,
+      password: "{{secret.absent}}",
+      connect: true,
+    });
+    await settle();
+
+    expect(fake.clients).toHaveLength(0);
+    expect(service.getState()).toMatchObject({
+      error: "no value stored for absent",
+    });
   });
 });

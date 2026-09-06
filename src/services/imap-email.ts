@@ -11,6 +11,7 @@
 
 import { ImapFlow, MailboxObject } from "imapflow";
 import { simpleParser } from "mailparser";
+import { referencedSecrets } from "../secrets";
 import {
   HostedService,
   JsonRecord,
@@ -130,6 +131,36 @@ export class ImapEmailService implements HostedService {
     }
   }
 
+  /**
+   * The password for one connection attempt, from whatever the state holds.
+   *
+   * A reference resolves against the runtime's vault; anything else is used as
+   * written, which is what a runtime configured from a file rather than from a
+   * board still does. Without a host there is no vault, so a reference cannot
+   * resolve and says so rather than being sent as itself.
+   */
+  private _resolvePassword(): {
+    value: string;
+    missing: string[];
+    refused: Array<{ alias: string; to: string }>;
+  } {
+    const vault = this.runtimeHost?.secrets?.();
+    if (!vault) {
+      // No vault to ask. A literal password is still usable — that is what a
+      // runtime configured from a file holds — but a reference is not, and
+      // must not be sent as its own text.
+      const references = referencedSecrets(this.state.password);
+      return {
+        value: references.length ? "" : this.state.password,
+        missing: references,
+        refused: [],
+      };
+    }
+    return vault.resolve(this.state.password, {
+      to: `${this.state.host}:${this.state.port}`,
+    });
+  }
+
   setHost(host: RuntimeHost): void {
     this.runtimeHost = host;
     // A board that was saved (or deployed) while listening starts listening
@@ -140,10 +171,9 @@ export class ImapEmailService implements HostedService {
   }
 
   getState(): JsonRecord {
-    // Secrets are write-only: never echo the stored password back to clients.
-    // Expose a boolean so UIs can show "configured" without revealing it.
-    const { password, ...rest } = this.state;
-    return { ...rest, password: "", passwordConfigured: password.length > 0 };
+    // Nothing to hide: `password` holds the reference it was configured with,
+    // never a value, so what a board saves is what it already said.
+    return { ...this.state };
   }
 
   configure(config: JsonRecord): JsonRecord {
@@ -156,9 +186,10 @@ export class ImapEmailService implements HostedService {
     if (typeof config.username === "string") {
       this.state.username = config.username;
     }
-    // Empty string means "no change" — this is what a masked getState() round-trips
-    // back as, so it must not wipe a previously stored password.
-    if (typeof config.password === "string" && config.password !== "") {
+    // A `{{secret.<alias>}}` reference, kept as written and resolved when the
+    // connection is opened. Empty is a real value here — it clears the field —
+    // because nothing masks this any more, so nothing round-trips as blank.
+    if (typeof config.password === "string") {
       this.state.password = config.password;
     }
     if (typeof config.tls === "boolean") {
@@ -230,7 +261,7 @@ export class ImapEmailService implements HostedService {
 
     this._abandonClient();
 
-    if (!this.state.host || !this.state.username || !this.state.password) {
+    if (!this.state.host || !this.state.username || !this.state.password.trim()) {
       this.state.enabled = false;
       this.state.running = false;
       this.state.status = "disconnected";
@@ -245,13 +276,42 @@ export class ImapEmailService implements HostedService {
       this.state.reconnectAttempts > 0 ? "reconnecting" : "connecting";
     this._notifyState();
 
+    // A service is constructed and configured before it is given a host, so a
+    // board that was listening starts its first connection with no vault to
+    // ask. Wait rather than fail: `enabled` stays set, and `setHost` opens the
+    // connection as soon as there is something to resolve against.
+    if (!this.runtimeHost && referencedSecrets(this.state.password).length) {
+      this.state.running = false;
+      this.state.status = "connecting";
+      this._notifyState();
+      return;
+    }
+
+    // The password exists from here to the end of this connection attempt and
+    // nowhere else. It is resolved against the host being dialled, so a
+    // credential the vault binds to one server cannot be sent to another by
+    // reconfiguring this service.
+    const { value: password, missing, refused } = this._resolvePassword();
+    if (!password) {
+      this.state.enabled = false;
+      this.state.running = false;
+      this.state.status = "disconnected";
+      this.state.error = refused.length
+        ? `${refused[0].alias} may not be sent to ${refused[0].to}`
+        : missing.length
+          ? `no value stored for ${missing.join(", ")}`
+          : "host, username and password are required";
+      this._notifyState();
+      return;
+    }
+
     const client = new ImapFlow({
       host: this.state.host,
       port: this.state.port,
       secure: this.state.tls,
       auth: {
         user: this.state.username,
-        pass: this.state.password,
+        pass: password,
       },
       // Own the IDLE cycle: the loop below has to know when IDLE ends to fetch
       // what arrived, which it cannot if the client also idles on its own.

@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { TextGenerationService } from "../src/services/text-generation";
 import { RuntimeHost } from "../src/types";
+import { SecretVault } from "../src/secrets";
 
 /**
  * What the service puts on the wire, and what it hands the rest of the board.
@@ -95,6 +96,7 @@ function hostSpy() {
     },
     notify: () => {},
     currentContext: () => null,
+    secrets: () => new SecretVault(),
     log: () => {},
     forwardLog: () => {},
     logSettings: () => ({ logging: false, logData: false, logLevel: "info" as const }),
@@ -465,24 +467,25 @@ describe("text-generation schema", () => {
 });
 
 describe("text-generation credentials", () => {
-  it("never gives the key back", async () => {
-    const t = serviceWith({ apiKey: "sk-secret" });
+  it("reports the reference it was configured with", async () => {
+    // Nothing is masked, because nothing resolved is held: what comes back is
+    // the name of the secret, which is what a board should carry.
+    const t = serviceWith({ apiKey: "{{secret.anthropic}}" });
 
     const state = t.service.getState();
-    expect(state.apiKey).toBe("");
+    expect(state.apiKey).toBe("{{secret.anthropic}}");
     expect(state.apiKeyConfigured).toBe(true);
   });
 
-  it("keeps the key when a UI sends the masked field back", async () => {
-    // The state a client holds has apiKey: "", and it configures with what it
-    // holds. Reading that as "clear it" would log the board out on any edit.
-    const api = await endpoint(() => ({ json: ANSWER }));
-    const t = serviceWith({ serverUrl: api.url, apiKey: "sk-test", stream: false });
+  it("clears the key when configured with an empty one", async () => {
+    // With nothing masked, a client no longer round-trips a blank field back,
+    // so an empty string can mean what it says.
+    const t = serviceWith({ apiKey: "{{secret.anthropic}}" });
 
-    t.service.configure({ apiKey: "", temperature: 0.1 });
-    await t.service.process("hi", t.notify);
+    t.service.configure({ apiKey: "" });
 
-    expect(api.received[0].headers["x-api-key"]).toBe("sk-test");
+    expect(t.service.getState().apiKey).toBe("");
+    expect(t.service.getState().apiKeyConfigured).toBe(false);
   });
 
   it("takes the key from the environment when the board carries none", async () => {
@@ -829,8 +832,9 @@ describe("text-generation server address", () => {
     await t.service.process("hello", t.notify);
 
     expect(server.received[0].headers.authorization).toBe("Bearer hosted-token");
-    // Still write-only: what a board configured never comes back out.
-    expect(t.service.getState().apiKey).toBe("");
+    // A literal key configured by a board is reported as the board already
+    // holds it; only a reference keeps a value out of the board entirely.
+    expect(t.service.getState().apiKey).toBe("hosted-token");
     expect(t.service.getState().apiKeyConfigured).toBe(true);
   });
 });

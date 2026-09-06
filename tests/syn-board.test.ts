@@ -205,7 +205,21 @@ async function loadBoard(
       : pointedAt(board.services[runtime.id], model.url);
     const response = await request(server.httpServer)
       .post("/runtimes")
-      .send({ id: runtime.id, name: runtime.name, services });
+      .send({
+        id: runtime.id,
+        name: runtime.name,
+        services,
+        // The board names its credentials rather than carrying them, so the
+        // values arrive here — the way a browser sends them from its vault.
+        // The model services holding `{{secret.hetzner.token}}` sit inside
+        // sub-pipelines, so this also says a nested service resolves what the
+        // runtime around it was given.
+        // Only what this test drives. The mailbox's `{{secret.gmail.imap}}` is
+        // deliberately absent: with no value for it the service reports the
+        // alias as unavailable and never opens a connection, which is why this
+        // suite no longer dials a real IMAP server to be refused by it.
+        secrets: { "hetzner.token": { value: "stub-token" } },
+      });
     expect(
       response.status,
       `creating runtime '${runtime.id}': ${JSON.stringify(response.body)}`,
