@@ -162,6 +162,8 @@ type HttpServerSubservicesState = JsonRecord & {
    *  name: generic board machinery reads and rewrites it (see the frontend's
    *  runtime/board/mount). */
   __hkpMount: string;
+  /** Which request headers reach the pipeline; see the field on the service. */
+  forwardHeaders: string[] | null;
   pipeline: Array<{
     serviceId: string;
     instanceId: string;
@@ -183,6 +185,17 @@ export class HttpServerSubservicesService implements HostedService {
    * file too — so an address only changes when a board deliberately renames it.
    */
   private mountName = "";
+  /**
+   * Which of a request's headers the pipeline is shown, or null for all.
+   *
+   * Headers are where a caller puts a credential, and `meta` goes wherever the
+   * pipeline takes it — including into a board, if a service is wired to write
+   * it there. Naming the ones a board actually reads is how it stops carrying
+   * the ones it does not: an empty list forwards none, and no list at all
+   * forwards everything, which is what a board that has not thought about it
+   * gets.
+   */
+  private forwardHeaders: string[] | null = null;
   private latestData: unknown = null;
 
   private mount: MountHandle | null = null;
@@ -214,6 +227,15 @@ export class HttpServerSubservicesService implements HostedService {
     // port. Older boards still carry the field, and rejecting it would fail
     // them on load for a setting that no longer means anything.
 
+    // An array is a decision, including an empty one. Anything else — absent,
+    // null, a string — leaves the default of forwarding all of them.
+    if (config.forwardHeaders !== undefined) {
+      this.forwardHeaders = Array.isArray(config.forwardHeaders)
+        ? config.forwardHeaders
+            .filter((name): name is string => typeof name === "string")
+            .map((name) => name.toLowerCase())
+        : null;
+    }
     if (typeof config.mountName === "string") {
       // Renaming rotates this endpoint's address, so an already-claimed mount
       // is released and claimed again under the new name rather than left
@@ -291,6 +313,7 @@ export class HttpServerSubservicesService implements HostedService {
       mode: this.mode,
       mountName: this.mountName,
       __hkpMount: this.mount?.url ?? "",
+      forwardHeaders: this.forwardHeaders,
       pipeline: this.getPipelineState(),
     };
     return state;
@@ -420,6 +443,7 @@ export class HttpServerSubservicesService implements HostedService {
       method: req.method ?? "GET",
       path: url.pathname,
       query,
+      headers: this.requestHeaders(req),
     };
     if (contentType) {
       meta.contentType = contentType;
@@ -439,6 +463,27 @@ export class HttpServerSubservicesService implements HostedService {
       return { meta, body };
     }
     return binary.length > 0 ? { meta, binary } : { meta };
+  }
+
+  /**
+   * The headers this pipeline is shown, lower-cased as HTTP names compare.
+   *
+   * A caller that has to prove who it is does so in a header — a shared secret,
+   * a signature, a bearer token — so a pipeline that cannot see them cannot
+   * check one. What a board does not name, it does not receive.
+   */
+  private requestHeaders(req: IncomingMessage): JsonRecord {
+    const headers: JsonRecord = {};
+    for (const [name, value] of Object.entries(req.headers)) {
+      if (value === undefined) {
+        continue;
+      }
+      if (this.forwardHeaders && !this.forwardHeaders.includes(name)) {
+        continue;
+      }
+      headers[name] = Array.isArray(value) ? value.join(", ") : value;
+    }
+    return headers;
   }
 
   /**
