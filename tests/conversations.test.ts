@@ -370,3 +370,43 @@ describe("what a board can reach", () => {
     expect(theirs.count).toBe(0);
   });
 });
+
+describe("which database it keeps conversations in", () => {
+  it("keeps a board that names its own file apart from one that does not", async () => {
+    const databases = createMemoryDatabaseStore();
+    const derived = serviceWith({ mode: "ingest" }, databases);
+    const named = serviceWith({ mode: "ingest", database: "booking-a1b2c3" }, databases);
+
+    await derived.run(mail());
+    // The same message id, filed by a board that named its own file: a
+    // separate table, so this is a first sighting rather than a repeat.
+    expect(await named.run(mail())).toMatchObject({ isNew: true });
+  });
+
+  it("puts two boards with the same title in the same file when neither names one", async () => {
+    // The old behaviour, kept: a board that says nothing gets a file derived
+    // from its title, and two of them share it.
+    const databases = createMemoryDatabaseStore();
+    const first = serviceWith({ mode: "ingest" }, databases, {
+      owner: "tester",
+      boardName: "SYN",
+    });
+    const second = serviceWith({ mode: "ingest" }, databases, {
+      owner: "tester",
+      boardName: "SYN",
+    });
+
+    await first.run(mail());
+
+    // Filed once already, by what is nominally another board.
+    expect(await second.run(mail())).toBeNull();
+  });
+
+  it("says so when the name is not one a board may use", async () => {
+    const databases = createMemoryDatabaseStore();
+    const service = serviceWith({ mode: "ingest", database: "../escape" }, databases);
+
+    expect(await service.run(mail())).toBeNull();
+    expect(String(service.service.getState().error)).toContain("not a database name");
+  });
+});

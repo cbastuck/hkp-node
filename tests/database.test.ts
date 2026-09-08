@@ -146,3 +146,61 @@ describe("databases as files", () => {
     expect(files).toHaveLength(2);
   });
 });
+
+describe("a database a board names for itself", () => {
+  it("keeps two boards apart that would otherwise share a title", () => {
+    const store = createMemoryDatabaseStore();
+    const one = store.openNamed("tester", "booking-a1b2c3");
+    const two = store.openNamed("tester", "booking-d4e5f6");
+
+    one.exec("CREATE TABLE t (v TEXT)");
+    one.run("INSERT INTO t VALUES ('mine')");
+    two.exec("CREATE TABLE t (v TEXT)");
+
+    expect(two.query("SELECT * FROM t")).toEqual([]);
+  });
+
+  it("lets two boards share one deliberately", () => {
+    const store = createMemoryDatabaseStore();
+    store.openNamed("tester", "shop").exec("CREATE TABLE t (v TEXT)");
+    store.openNamed("tester", "shop").run("INSERT INTO t VALUES ('ours')");
+
+    expect(store.openNamed("tester", "shop").query("SELECT * FROM t")).toEqual([
+      { v: "ours" },
+    ]);
+  });
+
+  it("still keeps one owner out of another's", () => {
+    const store = createMemoryDatabaseStore();
+    store.openNamed("tester", "shop").exec("CREATE TABLE t (v TEXT)");
+    const theirs = store.openNamed("somebody-else", "shop");
+
+    // Same name, different owner: the name is the board's to choose, the owner
+    // is not.
+    expect(() => theirs.query("SELECT * FROM t")).toThrow();
+  });
+
+  it("refuses a name that could mean somewhere else on disk", () => {
+    const store = createMemoryDatabaseStore();
+
+    for (const name of ["../escape", "a/b", ".hidden", "", "x".repeat(65)]) {
+      expect(() => store.openNamed("tester", name)).toThrow();
+    }
+  });
+
+  it("refuses the name the runtime keeps for itself", () => {
+    const store = createMemoryDatabaseStore();
+
+    // `shared` is where messages between boards live.
+    expect(() => store.openNamed("tester", "shared")).toThrow(/reserved/);
+  });
+
+  it("is not the same database as the one derived from a board title", () => {
+    const store = createMemoryDatabaseStore();
+    store.open({ owner: "tester", boardName: "shop" }).exec("CREATE TABLE t (v TEXT)");
+    const named = store.openNamed("tester", "shop");
+
+    // A board that names `shop` is not reaching for whatever "shop" hashed to.
+    expect(() => named.query("SELECT * FROM t")).toThrow();
+  });
+});

@@ -54,6 +54,7 @@ import {
 } from "./services/recordStore";
 import { StoreService, storeDescriptor } from "./services/store";
 import { SqlService, sqlDescriptor } from "./services/sql";
+import { QueueService, queueDescriptor } from "./services/queue";
 import {
   ConversationsService,
   conversationsDescriptor,
@@ -387,6 +388,13 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
         descriptor: conversationsDescriptor,
         create: (config, _createService) =>
           new ConversationsService(config, databases),
+      },
+    ],
+    [
+      queueDescriptor.serviceId,
+      {
+        descriptor: queueDescriptor,
+        create: (config, _createService) => new QueueService(config, databases),
       },
     ],
     [
