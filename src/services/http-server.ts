@@ -30,12 +30,14 @@
 import { IncomingMessage, ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
 
-import { HostedRuntime } from "../runtime";
+import { childRun, HostedRuntime, newRun } from "../runtime";
 import { MountContext, MountHandle } from "../mounts";
 import {
   HostedService,
   JsonRecord,
+  ProcessContext,
   RuntimeHost,
+  RuntimeScope,
   ServiceConfiguration,
   ServiceCreator,
   ServiceRegistryEntry,
@@ -154,10 +156,14 @@ function filenameFromDisposition(
 type HttpServerSubservicesState = JsonRecord & {
   bypass: boolean;
   mode: HttpServerMode;
+  /** Name this endpoint is known by; see the field on the service. */
+  mountName: string;
   /** Public endpoint assigned by the runtime; empty while bypassed. Reserved
    *  name: generic board machinery reads and rewrites it (see the frontend's
    *  runtime/board/mount). */
   __hkpMount: string;
+  /** Which request headers reach the pipeline; see the field on the service. */
+  forwardHeaders: string[] | null;
   pipeline: Array<{
     serviceId: string;
     instanceId: string;
@@ -173,12 +179,30 @@ export class HttpServerSubservicesService implements HostedService {
 
   private bypass = true;
   private mode: HttpServerMode = "process_on_session";
+  /**
+   * What this endpoint is called, which is what its public address is derived
+   * from. Empty falls back to the service's uuid, which is stable in a board
+   * file too — so an address only changes when a board deliberately renames it.
+   */
+  private mountName = "";
+  /**
+   * Which of a request's headers the pipeline is shown, or null for all.
+   *
+   * Headers are where a caller puts a credential, and `meta` goes wherever the
+   * pipeline takes it — including into a board, if a service is wired to write
+   * it there. Naming the ones a board actually reads is how it stops carrying
+   * the ones it does not: an empty list forwards none, and no list at all
+   * forwards everything, which is what a board that has not thought about it
+   * gets.
+   */
+  private forwardHeaders: string[] | null = null;
   private latestData: unknown = null;
 
   private mount: MountHandle | null = null;
   private pipelineConfig: ServiceConfiguration[] = [];
   private pipeline: HostedRuntime | null = null;
   private releasePipelineNotifications: (() => void) | null = null;
+  private releasePipelineLogs: (() => void) | null = null;
   private readonly createService: ServiceCreator;
   private host: RuntimeHost | null = null;
 
@@ -198,12 +222,30 @@ export class HttpServerSubservicesService implements HostedService {
   }
 
   configure(config: JsonRecord): JsonRecord {
-    const previousBypass = this.bypass;
-
     // `port` is accepted and ignored: the endpoint is served by the shared
     // runtime server under an assigned path, so a service no longer picks a
     // port. Older boards still carry the field, and rejecting it would fail
     // them on load for a setting that no longer means anything.
+
+    // An array is a decision, including an empty one. Anything else — absent,
+    // null, a string — leaves the default of forwarding all of them.
+    if (config.forwardHeaders !== undefined) {
+      this.forwardHeaders = Array.isArray(config.forwardHeaders)
+        ? config.forwardHeaders
+            .filter((name): name is string => typeof name === "string")
+            .map((name) => name.toLowerCase())
+        : null;
+    }
+    if (typeof config.mountName === "string") {
+      // Renaming rotates this endpoint's address, so an already-claimed mount
+      // is released and claimed again under the new name rather than left
+      // answering on the old one.
+      const renamed = config.mountName !== this.mountName;
+      this.mountName = config.mountName;
+      if (renamed && this.mount) {
+        this.releaseMount();
+      }
+    }
 
     if (
       config.mode === "process_on_session" ||
@@ -255,7 +297,10 @@ export class HttpServerSubservicesService implements HostedService {
       }
     }
 
-    if (previousBypass && !this.bypass && !this.mount) {
+    // Anything above may have left this without an endpoint it should have —
+    // coming out of bypass, or a rename that released the old address. One
+    // check covers them rather than one per cause.
+    if (!this.bypass && !this.mount) {
       this.claimMount();
     }
 
@@ -266,10 +311,17 @@ export class HttpServerSubservicesService implements HostedService {
     const state: HttpServerSubservicesState = {
       bypass: this.bypass,
       mode: this.mode,
+      mountName: this.mountName,
       __hkpMount: this.mount?.url ?? "",
+      forwardHeaders: this.forwardHeaders,
       pipeline: this.getPipelineState(),
     };
     return state;
+  }
+
+  /** Passes the scope on to the nested pipeline; see SubService.setScope. */
+  setScope(scope: RuntimeScope): void {
+    this.pipeline?.setScope(scope);
   }
 
   setHost(host: RuntimeHost): void {
@@ -280,6 +332,28 @@ export class HttpServerSubservicesService implements HostedService {
     if (!this.bypass && !this.mount) {
       this.claimMount();
     }
+    // A pipeline built in the constructor was built before there was a host to
+    // ask what board it belongs to.
+    this.adoptHostScope();
+  }
+
+  /**
+   * Hands the tenant, board, and log settings down to the nested pipeline.
+   *
+   * A pipeline this service builds knows none of them — it is created with an
+   * id of its own and nothing else — so without this a service inside it that
+   * keeps something durable would store it against an empty board name,
+   * separately from the very same service sitting beside this one. Handling a
+   * request changes where a service runs, not which board it belongs to.
+   */
+  private adoptHostScope(): void {
+    if (!this.pipeline || !this.host) {
+      return;
+    }
+    this.pipeline.setScope(this.host.scope());
+    const settings = this.host.logSettings();
+    this.pipeline.setLogging(settings.logging);
+    this.pipeline.setLogData(settings.logData);
   }
 
   process(
@@ -306,6 +380,8 @@ export class HttpServerSubservicesService implements HostedService {
     this.releaseMount();
     this.releasePipelineNotifications?.();
     this.releasePipelineNotifications = null;
+    this.releasePipelineLogs?.();
+    this.releasePipelineLogs = null;
     // Nested services hold the same things top-level ones do — timers, sockets,
     // mounts — and nothing else will ever reach them once this service is gone.
     this.pipeline?.destroy();
@@ -318,11 +394,15 @@ export class HttpServerSubservicesService implements HostedService {
       return;
     }
 
-    this.mount = this.host.mount(this.uuid, {
-      request: (req, res, context) => {
-        void this.handleRequest(req, res, context);
+    this.mount = this.host.mount(
+      this.uuid,
+      {
+        request: (req, res, context) => {
+          void this.handleRequest(req, res, context);
+        },
       },
-    });
+      { mountName: this.mountName },
+    );
 
     // A board reads the assigned endpoint from here (or from state), since it
     // is not knowable at design time.
@@ -363,6 +443,7 @@ export class HttpServerSubservicesService implements HostedService {
       method: req.method ?? "GET",
       path: url.pathname,
       query,
+      headers: this.requestHeaders(req),
     };
     if (contentType) {
       meta.contentType = contentType;
@@ -382,6 +463,27 @@ export class HttpServerSubservicesService implements HostedService {
       return { meta, body };
     }
     return binary.length > 0 ? { meta, binary } : { meta };
+  }
+
+  /**
+   * The headers this pipeline is shown, lower-cased as HTTP names compare.
+   *
+   * A caller that has to prove who it is does so in a header — a shared secret,
+   * a signature, a bearer token — so a pipeline that cannot see them cannot
+   * check one. What a board does not name, it does not receive.
+   */
+  private requestHeaders(req: IncomingMessage): JsonRecord {
+    const headers: JsonRecord = {};
+    for (const [name, value] of Object.entries(req.headers)) {
+      if (value === undefined) {
+        continue;
+      }
+      if (this.forwardHeaders && !this.forwardHeaders.includes(name)) {
+        continue;
+      }
+      headers[name] = Array.isArray(value) ? value.join(", ") : value;
+    }
+    return headers;
   }
 
   /**
@@ -441,6 +543,13 @@ export class HttpServerSubservicesService implements HostedService {
       return;
     }
 
+    // Serving a request is one run, however many pipelines it passes through:
+    // the nested handler below descends from it, and the outer chain afterwards
+    // continues it. Minting one here rather than letting each leg mint its own
+    // is what keeps a request's trace joined up instead of arriving as two
+    // unrelated runs that happen to share a timestamp.
+    const runContext = newRun();
+
     let output: unknown;
     let processInput: unknown;
     let answeredBySubservices = false;
@@ -462,7 +571,7 @@ export class HttpServerSubservicesService implements HostedService {
       }
       processInput = request;
       answeredBySubservices = this.hasSubservices();
-      output = this.processSessionInput(processInput);
+      output = await this.processSessionInput(processInput, runContext);
     }
 
     // What the nested pipeline produced, before the outer runtime sees it.
@@ -475,7 +584,7 @@ export class HttpServerSubservicesService implements HostedService {
     if (this.host) {
       // No-op: the runtime already fans these out to its notification targets.
       // Re-notifying through the host would deliver every one twice.
-      output = this.host.processFrom(this.uuid, output, () => {});
+      output = await this.host.processFrom(this.uuid, output, () => {}, runContext);
       this.host.emitResult(output);
     }
 
@@ -492,14 +601,29 @@ export class HttpServerSubservicesService implements HostedService {
     return !!this.pipeline && this.pipeline.listServices().length > 0;
   }
 
-  private processSessionInput(input: unknown): unknown {
+  /**
+   * Runs the nested pipeline as a run descended from `parent`.
+   *
+   * Both entry points land here, and they differ only in what they descend
+   * from: a request brings the run its caller minted for the whole exchange,
+   * while data from the outer chain arrives mid-call and descends from whatever
+   * that call is running as.
+   */
+  private async processSessionInput(
+    input: unknown,
+    parent?: ProcessContext | null,
+  ): Promise<unknown> {
     if (!this.pipeline || this.pipeline.listServices().length === 0) {
       return input;
     }
 
     // No-op: the nested runtime fans these out to the target registered in
     // rebuild(). Forwarding them here as well would deliver every one twice.
-    return this.pipeline.process(input, () => {});
+    return await this.pipeline.process(
+      input,
+      () => {},
+      childRun(parent ?? this.host?.currentContext() ?? null),
+    );
   }
 
   private notify(payload: unknown, instanceId?: string): void {
@@ -528,6 +652,7 @@ export class HttpServerSubservicesService implements HostedService {
 
   private rebuild(): void {
     this.releasePipelineNotifications?.();
+    this.releasePipelineLogs?.();
     // The pipeline being replaced is about to become unreachable; its services
     // keep running until told otherwise. State worth carrying over has already
     // been read into pipelineConfig by syncStates().
@@ -551,6 +676,15 @@ export class HttpServerSubservicesService implements HostedService {
       this.pipeline.registerNotificationTarget((notification) =>
         this.notify(notification.payload, notification.instanceId),
       );
+
+    // A nested pipeline's entries belong to the same board log as everything
+    // else; only the runtime hosting this service can carry them there, since a
+    // nested runtime has no route out of its own.
+    this.releasePipelineLogs = this.pipeline.registerLogTarget((entry) =>
+      this.host?.forwardLog(entry),
+    );
+
+    this.adoptHostScope();
   }
 
   private getPipelineState(): HttpServerSubservicesState["pipeline"] {

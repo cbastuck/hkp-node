@@ -28,12 +28,14 @@
 import {
   HostedService,
   JsonRecord,
+  ProcessContext,
   RuntimeHost,
   RuntimeNotification,
   ServiceConfiguration,
   ServiceRegistryEntry,
 } from "../types";
 import { MOUNT_FIELD, parseMountRef } from "../coordinator/mount";
+import { resolveCredential } from "../secrets";
 
 export const httpClientDescriptor: ServiceRegistryEntry = {
   serviceId: "http-client",
@@ -182,7 +184,10 @@ export class HttpClientService implements HostedService {
       return null;
     }
 
-    void this.send(target, input, notify);
+    // Captured here, while still inside the call this request belongs to. By
+    // the time the response arrives the pass has long returned, so this is the
+    // only moment at which the run that asked for it can still be named.
+    void this.send(target, input, notify, this.host?.currentContext() ?? undefined);
     return null;
   }
 
@@ -221,6 +226,7 @@ export class HttpClientService implements HostedService {
     url: string,
     input: unknown,
     notify: (payload: unknown, instanceId?: string) => void,
+    context?: ProcessContext,
   ): Promise<void> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);
@@ -229,7 +235,21 @@ export class HttpClientService implements HostedService {
 
     try {
       const request = this.requestBody(input);
-      const headers: Record<string, string> = { ...this.headers };
+      // Headers are a free-form map, and a credential is as likely to be part
+      // of one — `Bearer <token>` — as to be a field of its own. Resolved
+      // against the address being called, so a header bound to one host cannot
+      // be sent to another by repointing this service.
+      const { value: resolvedHeaders, problem } = resolveCredential(
+        this.host?.secrets?.(),
+        this.headers,
+        url,
+      );
+      if (problem) {
+        notify({ requesting: false, url, error: problem });
+        this.inFlight -= 1;
+        return;
+      }
+      const headers: Record<string, string> = { ...resolvedHeaders };
       if (request?.contentType && !headers["content-type"]) {
         headers["content-type"] = request.contentType;
       }
@@ -253,7 +273,7 @@ export class HttpClientService implements HostedService {
         status: response.status,
         inFlight: this.inFlight - 1,
       });
-      this.push(result, notify);
+      await this.push(result, notify, context);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       notify({ requesting: false, url, error: message });
@@ -363,17 +383,19 @@ export class HttpClientService implements HostedService {
    * itself; nothing else will, and running the remaining services alone would
    * leave the chain dead from here on.
    */
-  private push(
+  private async push(
     result: JsonRecord,
     notify: (payload: unknown, instanceId?: string) => void,
-  ): void {
+    context?: ProcessContext,
+  ): Promise<void> {
     if (!this.host) {
       return;
     }
-    const output = this.host.processFrom(
+    const output = await this.host.processFrom(
       this.uuid,
       result,
       (n: RuntimeNotification) => notify(n.payload, n.instanceId),
+      context,
     );
     // A downstream service returning null means "stop" — honour it rather than
     // forwarding a dead result to the next runtime.

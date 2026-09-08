@@ -12,11 +12,12 @@
  */
 import { randomUUID } from "node:crypto";
 
-import { HostedRuntime } from "../runtime";
+import { childRun, HostedRuntime } from "../runtime";
 import {
   HostedService,
   JsonRecord,
   RuntimeHost,
+  RuntimeScope,
   ServiceConfiguration,
   ServiceCreator,
   ServiceRegistryEntry,
@@ -43,12 +44,15 @@ export class SubService implements HostedService {
   readonly capabilities = subServiceDescriptor.capabilities;
   readonly uuid: string;
 
-  private bypass = false;
+  // Protected, not private: an Iterator is a sub-service that runs its pipeline
+  // once per item rather than once, and needs these to do it.
+  protected bypass = false;
   private pipelineConfig: ServiceConfiguration[] = [];
-  private pipeline: HostedRuntime | null = null;
+  protected pipeline: HostedRuntime | null = null;
   private releasePipelineNotifications: (() => void) | null = null;
+  private releasePipelineLogs: (() => void) | null = null;
   private readonly createService: ServiceCreator;
-  private host: RuntimeHost | null = null;
+  protected host: RuntimeHost | null = null;
 
   constructor(config: ServiceConfiguration, createService: ServiceCreator) {
     this.uuid = config.uuid;
@@ -61,6 +65,63 @@ export class SubService implements HostedService {
 
   setHost(host: RuntimeHost): void {
     this.host = host;
+    // A pipeline built in the constructor was built before there was a host to
+    // ask, so what the board records reaches it here rather than never.
+    this.applyLogSettings();
+    this.applyScope();
+    this.applySecrets();
+  }
+
+  /**
+   * Passes the scope on to the nested pipeline.
+   *
+   * The runtime calls this when its own scope is set, which is how a pipeline
+   * nested more than one level deep hears about it at all: `setHost` runs while
+   * this service is being built, and at that moment the runtime holding it does
+   * not know its scope either.
+   */
+  setScope(scope: RuntimeScope): void {
+    this.pipeline?.setScope(scope);
+  }
+
+  /** Hands the board's log settings to the nested pipeline, if there is one. */
+  private applyLogSettings(): void {
+    const settings = this.host?.logSettings();
+    if (!settings || !this.pipeline) {
+      return;
+    }
+    this.pipeline.setLogging(settings.logging);
+    this.pipeline.setLogData(settings.logData);
+  }
+
+  /**
+   * Hands the tenant and board down to the nested pipeline.
+   *
+   * A pipeline this service builds knows neither, so a service inside it that
+   * keeps something durable would otherwise store it outside the board it
+   * belongs to — and outside its tenant, which is worse. Nesting changes where
+   * a service sits, not who it answers to.
+   */
+  /**
+   * Points the nested pipeline at this service's own secrets.
+   *
+   * Nothing provisions a nested runtime, so its vault is always empty: a
+   * service inside the pipeline holds the same `{{secret.…}}` reference as one
+   * at the top level and would have nothing to resolve it against. The host is
+   * read on each lookup rather than now, both because a value may be pushed
+   * after the board is running and because a pipeline nested deeper reaches
+   * its own host the same way — so the chain composes to whichever runtime was
+   * actually given something.
+   */
+  private applySecrets(): void {
+    this.pipeline?.delegateSecrets(() => this.host?.secrets?.() ?? null);
+  }
+
+  private applyScope(): void {
+    const scope = this.host?.scope();
+    if (scope && this.pipeline) {
+      this.pipeline.setScope(scope);
+    }
   }
 
   configure(config: JsonRecord): JsonRecord {
@@ -121,10 +182,10 @@ export class SubService implements HostedService {
     return state;
   }
 
-  process(
+  async process(
     input: unknown,
     _notify: (payload: unknown, instanceId?: string) => void,
-  ): unknown {
+  ): Promise<unknown> {
     if (
       this.bypass ||
       !this.pipeline ||
@@ -135,12 +196,21 @@ export class SubService implements HostedService {
 
     // No-op: the nested runtime fans these out to the target registered in
     // rebuild(). Forwarding them here as well would deliver every one twice.
-    return this.pipeline.process(input, () => {});
+    // The nested pipeline runs as a run of its own, descended from the one
+    // calling it, so what happens inside stays attributable to this service
+    // rather than blending into the pipeline around it.
+    return this.pipeline.process(
+      input,
+      () => {},
+      childRun(this.host?.currentContext() ?? null),
+    );
   }
 
   destroy(): void {
     this.releasePipelineNotifications?.();
     this.releasePipelineNotifications = null;
+    this.releasePipelineLogs?.();
+    this.releasePipelineLogs = null;
     // Nested services hold the same things top-level ones do — timers, sockets,
     // mounts — and nothing else will ever reach them once this service is gone.
     this.pipeline?.destroy();
@@ -192,6 +262,17 @@ export class SubService implements HostedService {
       this.pipeline.registerNotificationTarget((notification) =>
         this.host?.notify(notification.payload, notification.instanceId),
       );
+
+    // A nested pipeline's entries belong to the same board log as everything
+    // else; only the runtime hosting this service can carry them there, since a
+    // nested runtime has no route out of its own.
+    this.releasePipelineLogs = this.pipeline.registerLogTarget((entry) =>
+      this.host?.forwardLog(entry),
+    );
+
+    this.applyLogSettings();
+this.applyScope();
+    this.applySecrets();
   }
 
   private getPipelineState(): SubServiceState["pipeline"] {

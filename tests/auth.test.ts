@@ -548,35 +548,55 @@ describe("hkp-node per-tenant quotas", () => {
   });
 });
 
-describe("hkp-node secret redaction", () => {
-  it("never echoes stored email/telegram secrets back through the API", async () => {
+describe("credentials over the API", () => {
+  /**
+   * What a service reports is what a board saves, so nothing it reports may be
+   * a credential. It is the *reference* that survives the round trip: the name
+   * of a secret, which is what a board is allowed to carry. The values arrive
+   * separately, and there is no route back out for them.
+   */
+
+  const board = (extra: Record<string, unknown> = {}) => ({
+    id: "rt-1",
+    name: "Node",
+    services: [
+      {
+        serviceId: "smtp-email",
+        uuid: "smtp-1",
+        state: {
+          host: "mail.example",
+          username: "u",
+          password: "{{secret.smtp}}",
+        },
+      },
+      {
+        serviceId: "telegram-sender",
+        uuid: "tg-1",
+        state: { botToken: "{{secret.telegram}}", chatId: "42" },
+      },
+    ],
+    ...extra,
+  });
+
+  it("reports the reference a board configured, not a value", async () => {
     const { baseUrl } = await startServer({ auth: { mode: "none" } });
     await request(baseUrl)
       .post("/runtimes")
-      .send({
-        id: "rt-1",
-        name: "Node",
-        services: [
-          {
-            serviceId: "smtp-email",
-            uuid: "smtp-1",
-            state: { host: "mail.example", username: "u", password: "hunter2" },
+      .send(
+        board({
+          secrets: {
+            smtp: { value: "hunter2" },
+            telegram: { value: "123:secret" },
           },
-          {
-            serviceId: "telegram-sender",
-            uuid: "tg-1",
-            state: { botToken: "123:secret", chatId: "42" },
-          },
-        ],
-      })
+        }),
+      )
       .expect(200);
 
     await request(baseUrl)
       .get("/runtimes/rt-1/services/smtp-1")
       .expect(200)
       .expect(({ body }) => {
-        expect(body.password).toBe("");
-        expect(body.passwordConfigured).toBe(true);
+        expect(body.password).toBe("{{secret.smtp}}");
         expect(body.host).toBe("mail.example");
       });
 
@@ -584,37 +604,53 @@ describe("hkp-node secret redaction", () => {
       .get("/runtimes/rt-1/services/tg-1")
       .expect(200)
       .expect(({ body }) => {
-        expect(body.botToken).toBe("");
-        expect(body.botTokenConfigured).toBe(true);
+        expect(body.botToken).toBe("{{secret.telegram}}");
         expect(body.chatId).toBe("42");
       });
   });
 
-  it("does not wipe a stored secret when an empty value is configured", async () => {
+  it("gives the values no way back out", async () => {
     const { baseUrl } = await startServer({ auth: { mode: "none" } });
     await request(baseUrl)
       .post("/runtimes")
-      .send({
-        id: "rt-1",
-        name: "Node",
-        services: [
-          {
-            serviceId: "smtp-email",
-            uuid: "smtp-1",
-            state: { host: "mail.example", username: "u", password: "hunter2" },
-          },
-        ],
-      })
+      .send(board({ secrets: { smtp: { value: "hunter2" } }}))
       .expect(200);
 
-    // Re-configuring with a blank password (what a masked round-trip sends) must
-    // leave the stored secret intact.
+    // Not on the service that uses it, not on the runtime, and not on the
+    // route they were delivered to.
+    await request(baseUrl)
+      .get("/runtimes/rt-1/services/smtp-1")
+      .expect(({ text }) => expect(text).not.toContain("hunter2"));
+    await request(baseUrl)
+      .get("/runtimes")
+      .expect(({ text }) => expect(text).not.toContain("hunter2"));
+    await request(baseUrl).get("/runtimes/rt-1/secrets").expect(404);
+  });
+
+  it("says which aliases it holds, and nothing about them", async () => {
+    const { baseUrl } = await startServer({ auth: { mode: "none" } });
+    await request(baseUrl).post("/runtimes").send(board()).expect(200);
+
+    await request(baseUrl)
+      .post("/runtimes/rt-1/secrets")
+      .send({ smtp: { value: "hunter2" } })
+      .expect(200)
+      .expect(({ body }) => expect(body).toEqual({ aliases: ["smtp"] }));
+  });
+
+  it("takes an empty value as clearing the field", async () => {
+    // Nothing is masked, so a client no longer sends a blank field back and an
+    // empty string can mean what it says.
+    const { baseUrl } = await startServer({ auth: { mode: "none" } });
+    await request(baseUrl).post("/runtimes").send(board()).expect(200);
+
     await request(baseUrl)
       .post("/runtimes/rt-1/services/smtp-1")
       .send({ password: "", subject: "hi" })
       .expect(200)
       .expect(({ body }) => {
-        expect(body.passwordConfigured).toBe(true);
+        expect(body.password).toBe("");
+        expect(body.subject).toBe("hi");
       });
   });
 });

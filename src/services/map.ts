@@ -134,7 +134,11 @@ export class MapService implements HostedService {
     }
 
     if (isJsonRecord(config.command)) {
-      this.runCommand(config.command);
+      void this.runCommand(config.command).catch((err) =>
+        this.host?.log("error", "service.failed", {
+          message: `map inject failed: ${err instanceof Error ? err.message : String(err)}`,
+        }),
+      );
     }
 
     return this.getState();
@@ -315,7 +319,7 @@ export class MapService implements HostedService {
     this.notify({ sensingMode: isActive });
   }
 
-  private runCommand(command: JsonRecord): void {
+  private async runCommand(command: JsonRecord): Promise<void> {
     if (command.action !== "inject") {
       return;
     }
@@ -328,7 +332,7 @@ export class MapService implements HostedService {
     // Push the injected result through the rest of the pipeline, the way an
     // autonomously emitting service does — the runtime fans the notifications
     // out to its own targets, so none are re-sent here.
-    const result = this.host.processFrom(this.uuid, output, () => {});
+    const result = await this.host.processFrom(this.uuid, output, () => {});
     this.host.emitResult(result);
   }
 

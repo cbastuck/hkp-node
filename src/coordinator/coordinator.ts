@@ -1,6 +1,8 @@
 import { CloudBoardConfig, BoardSessionInfo } from "./types";
 import { BoardSession } from "./session";
 import { BoardStore, createMemoryBoardStore } from "./boardStore";
+import { LogStore } from "./logStore";
+import { LogEntry, LogLevel } from "../types";
 
 export class BoardCoordinator {
   // userId → boardName → BoardSession
@@ -11,7 +13,20 @@ export class BoardCoordinator {
 
   /** Where the boards themselves are kept; see BoardStore. In memory unless a
    *  caller supplies somewhere that outlives the process. */
-  constructor(private readonly store: BoardStore = createMemoryBoardStore()) {}
+  constructor(
+    private readonly store: BoardStore = createMemoryBoardStore(),
+    /** Where boards' log entries are kept; absent means none are collected. */
+    private readonly logStore?: LogStore,
+  ) {}
+
+  /** Entries this board has recorded; see LogStore.read. */
+  readLog(
+    userId: string,
+    boardName: string,
+    query?: Parameters<LogStore["read"]>[2],
+  ): Promise<LogEntry[]> {
+    return this.logStore?.read(userId, boardName, query) ?? Promise.resolve([]);
+  }
 
   /**
    * Takes back the boards the store holds, as boards that are not running.
@@ -32,6 +47,7 @@ export class BoardCoordinator {
         board.config,
         undefined,
         { createdAt: board.createdAt },
+        this.logStore,
       );
       this.userSessions(board.userId).set(board.boardName, session);
     }
@@ -86,7 +102,14 @@ export class BoardCoordinator {
       await existing.destroy();
     }
 
-    const session = new BoardSession(config.boardName, userId, config, userJwt);
+    const session = new BoardSession(
+      config.boardName,
+      userId,
+      config,
+      userJwt,
+      undefined,
+      this.logStore,
+    );
     await session.start();
 
     for (const bridge of existingBridges) {
@@ -117,6 +140,45 @@ export class BoardCoordinator {
       );
     }
     return session;
+  }
+
+  /**
+   * Turn logging on or off for a board, and remember the answer.
+   *
+   * The session applies it to what is running; the store is told so a restart
+   * does not quietly revert it. Returns the runtimes that did not take it —
+   * a runtime that is unreachable, or one whose server has no such route.
+   */
+  async setBoardLogging(
+    userId: string,
+    boardName: string,
+    enabled: boolean,
+    level: LogLevel = "info",
+  ): Promise<{ unreachable: string[] } | null> {
+    const session = this.getBoard(userId, boardName);
+    if (!session) {
+      return null;
+    }
+
+    const unreachable = await session.setLogging(enabled, level);
+
+    try {
+      await this.store.save({
+        userId,
+        boardName,
+        createdAt: session.createdAt,
+        config: session.config,
+      });
+    } catch (err) {
+      // The running board took the change; only its survival of a restart is in
+      // doubt, which is not worth failing the request over.
+      console.error(
+        `[coordinator] Failed to persist the log setting for "${boardName}":`,
+        err instanceof Error ? err.message : err,
+      );
+    }
+
+    return { unreachable };
   }
 
   /** How many boards this coordinator holds, across every user. */

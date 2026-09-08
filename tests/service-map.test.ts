@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import { MapService } from "../src/services/map";
 import { RuntimeHost, RuntimeNotification } from "../src/types";
+import { SecretVault } from "../src/secrets";
 
 function createMap(state?: Record<string, unknown>) {
   return new MapService({ serviceId: "map", uuid: "map-1", state });
@@ -20,13 +21,25 @@ function createHost(): RecordingHost {
     notifications: [],
     processed: [],
     results: [],
-    processFrom(
+    async processFrom(
       _startAfterUuid: string,
       data: unknown,
       _onNotification: (notification: RuntimeNotification) => void,
     ) {
       host.processed.push(data);
       return data;
+    },
+    currentContext() {
+      return null;
+    },
+    secrets: () => new SecretVault(),
+    log() {},
+    forwardLog() {},
+    logSettings() {
+      return { logging: false, logData: false, logLevel: "info" as const };
+    },
+    scope() {
+      return { owner: "tester", boardName: "Board" };
     },
     notify(payload: unknown, instanceId: string) {
       host.notifications.push({ instanceId, payload });
@@ -214,12 +227,15 @@ describe("MapService — UI-driven behaviour", () => {
     ]);
   });
 
-  it("pushes the mapped result downstream on an inject command", () => {
+  it("pushes the mapped result downstream on an inject command", async () => {
     const map = createMap({ template: { "greeting=": "'hi ' + params.name" } });
     const host = createHost();
     map.setHost(host);
 
     map.configure({ command: { action: "inject", params: { name: "ada" } } });
+    // `configure` answers with the service's state, so the push it started runs
+    // on its own: an inject is a command, not a call anything waits on.
+    await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(host.processed).toEqual([{ greeting: "hi ada" }]);
     expect(host.results).toEqual([{ greeting: "hi ada" }]);

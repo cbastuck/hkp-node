@@ -104,7 +104,7 @@ describe("hkp-node service mounts", () => {
     expect(res.status).toBe(200);
     // A request reaches the pipeline as MixedData: JSON meta plus the body.
     const received = await res.json();
-    expect(received.meta).toEqual({
+    expect(received.meta).toMatchObject({
       method: "GET",
       path: "/hello",
       query: { a: "1" },
@@ -112,6 +112,96 @@ describe("hkp-node service mounts", () => {
     // No body at all, so neither representation is carried.
     expect(received.binary).toBeUndefined();
     expect(received.body).toBeUndefined();
+  });
+
+  /**
+   * A caller that has to prove who it is does so in a header — a shared secret,
+   * a signature, a bearer token — so a pipeline that cannot see them cannot
+   * check one. They are also where a credential arrives, and `meta` goes
+   * wherever the pipeline takes it, so a board can say which ones it reads.
+   */
+  describe("request headers", () => {
+    const mountWith = async (state: Record<string, unknown>) => {
+      const { server } = await startServer({ auth: { mode: "none" } });
+      await request(server.httpServer)
+        .post("/runtimes")
+        .send({
+          id: "rt-1",
+          name: "Node",
+          services: [
+            {
+              serviceId: httpServerSubservicesDescriptor.serviceId,
+              uuid: "http-1",
+              state: { bypass: false, mode: "process_on_session", pipeline: [], ...state },
+            },
+          ],
+        })
+        .expect(200);
+      const { body } = await request(server.httpServer)
+        .get("/runtimes/rt-1/services/http-1")
+        .expect(200);
+      return body.__hkpMount as string;
+    };
+
+    it("reach the pipeline, so a caller can be checked", async () => {
+      const mount = await mountWith({});
+
+      const res = await fetch(`${mount}/hello`, {
+        headers: { authorization: "123", "x-signature": "abc" },
+      });
+      const { meta } = await res.json();
+
+      expect(meta.headers.authorization).toBe("123");
+      expect(meta.headers["x-signature"]).toBe("abc");
+    });
+
+    it("are narrowed to the ones a board names", async () => {
+      const mount = await mountWith({ forwardHeaders: ["X-Signature"] });
+
+      const res = await fetch(`${mount}/hello`, {
+        headers: { authorization: "123", "x-signature": "abc" },
+      });
+      const { meta } = await res.json();
+
+      // Named case-insensitively, as HTTP header names compare.
+      expect(meta.headers).toEqual({ "x-signature": "abc" });
+    });
+
+    it("are withheld entirely by an empty list", async () => {
+      // An empty array is a decision too, and the way to opt out.
+      const mount = await mountWith({ forwardHeaders: [] });
+
+      const res = await fetch(`${mount}/hello`, {
+        headers: { authorization: "123" },
+      });
+      const { meta } = await res.json();
+
+      expect(meta.headers).toEqual({});
+    });
+
+    it("says which it forwards, so a board saves the decision", async () => {
+      const { server } = await startServer({ auth: { mode: "none" } });
+      await request(server.httpServer)
+        .post("/runtimes")
+        .send({
+          id: "rt-1",
+          name: "Node",
+          services: [
+            {
+              serviceId: httpServerSubservicesDescriptor.serviceId,
+              uuid: "http-1",
+              state: { pipeline: [], forwardHeaders: ["Authorization"] },
+            },
+          ],
+        })
+        .expect(200);
+
+      const { body } = await request(server.httpServer)
+        .get("/runtimes/rt-1/services/http-1")
+        .expect(200);
+
+      expect(body.forwardHeaders).toEqual(["authorization"]);
+    });
   });
 
   it("carries a request body and its content type to the pipeline", async () => {

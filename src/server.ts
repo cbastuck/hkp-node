@@ -10,6 +10,12 @@ import { WebSocketServer, WebSocket } from "ws";
 import { MapService, mapDescriptor } from "./services/map";
 import { MonitorService, monitorDescriptor } from "./services/monitor";
 import { SubService, subServiceDescriptor } from "./services/sub-service";
+import { IteratorService, iteratorDescriptor } from "./services/iterator";
+import {
+  CommunicationDispatcherService,
+  communicationDispatcherDescriptor,
+} from "./services/communication-dispatcher";
+import { JoinService, joinDescriptor } from "./services/join";
 import {
   HttpServerSubservicesService,
   httpServerSubservicesDescriptor,
@@ -41,7 +47,37 @@ import {
   smtpEmailDescriptor,
 } from "./services/smtp-email";
 import { HoldService, holdDescriptor } from "./services/hold";
-import { HostedRuntime, RuntimeApp, TenantRuntimes } from "./runtime";
+import {
+  createFileRecordStore,
+  createMemoryRecordStore,
+  RecordStore,
+} from "./services/recordStore";
+import { StoreService, storeDescriptor } from "./services/store";
+import { SqlService, sqlDescriptor } from "./services/sql";
+import {
+  ConversationsService,
+  conversationsDescriptor,
+} from "./services/conversations";
+import {
+  DatabaseStore,
+  createFileDatabaseStore,
+  createMemoryDatabaseStore,
+} from "./services/database";
+import {
+  DocumentExtractService,
+  documentExtractDescriptor,
+} from "./services/document-extract";
+import {
+  TextGenerationService,
+  textGenerationDescriptor,
+} from "./services/text-generation";
+import { InjectorService, injectorDescriptor } from "./services/injector";
+import {
+  contextFromWire,
+  HostedRuntime,
+  RuntimeApp,
+  TenantRuntimes,
+} from "./runtime";
 import { MountRegistry } from "./mounts";
 import {
   AllowedOrigins,
@@ -56,10 +92,13 @@ import {
 import {
   HostedServiceFactory,
   JsonRecord,
+  LogEntry,
+  LogLevel,
   RuntimeConfiguration,
   RuntimeNotification,
   ServiceConfiguration,
 } from "./types";
+import { readSecretsPayload } from "./secrets";
 
 /**
  * Per-tenant limits. Runtimes, services and timers all consume resources on a
@@ -98,6 +137,26 @@ type CreateRuntimeServerOptions = {
   externalSecure?: boolean;
   host?: string;
   name?: string;
+  /**
+   * Where `store` keeps what boards remember, or a store to use as given.
+   *
+   * Absent means memory: a runtime nobody told where to persist keeps records
+   * for as long as it runs and no longer, which is the honest default for a
+   * server that may be running from a checkout.
+   */
+  recordStore?: RecordStore | string;
+  /**
+   * Where SQL databases live, one file per board. Absent or empty means memory:
+   * a runtime nobody told where to persist keeps them for as long as it runs.
+   */
+  database?: string;
+  /**
+   * Keys the derivation of public mount addresses; see MountRegistry.
+   *
+   * Absent draws one per process, so endpoints work but change on restart.
+   * `index.ts` persists one so a webhook configured elsewhere keeps working.
+   */
+  mountSecret?: string;
 };
 
 /** A coordinator session token, bound to the user it was minted for and the
@@ -119,6 +178,8 @@ function tenantKey(owner: string, runtimeId: string): string {
 type WsInboundMessage = {
   type?: string;
   params?: unknown;
+  /** The run this call belongs to, as its caller named it; see ProcessContext. */
+  context?: unknown;
 };
 
 export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
@@ -146,6 +207,26 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
   const externalHost = options.externalHost ?? options.host ?? "127.0.0.1";
   const externalSecure = options.externalSecure ?? false;
   const quotas = options.quotas ?? {};
+  // Databases follow records below: one store for the whole server, scoped per
+  // call, and an empty path saying "keep nothing on disk" rather than naming
+  // the working directory as a root.
+  const databases: DatabaseStore =
+    typeof options.database === "string"
+      ? options.database
+        ? createFileDatabaseStore(options.database)
+        : createMemoryDatabaseStore()
+      : createMemoryDatabaseStore();
+
+  // One store for the whole server; it is the scope handed to each call, not a
+  // store per board, that keeps one board's records out of another's.
+  // An empty path is how "keep nothing on disk" is said, and must not be read
+  // as a root — which would be the working directory.
+  const records: RecordStore =
+    typeof options.recordStore === "string"
+      ? options.recordStore
+        ? createFileRecordStore(options.recordStore)
+        : createMemoryRecordStore()
+      : (options.recordStore ?? createMemoryRecordStore());
 
   /** True when adding one more to `count` would pass the limit (0/unset = no limit). */
   function atQuota(count: number, limit: number | undefined): boolean {
@@ -177,6 +258,29 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
         descriptor: subServiceDescriptor,
         create: (config, createService) =>
           new SubService(config, createService),
+      },
+    ],
+    [
+      iteratorDescriptor.serviceId,
+      {
+        descriptor: iteratorDescriptor,
+        create: (config, createService) =>
+          new IteratorService(config, createService),
+      },
+    ],
+    [
+      communicationDispatcherDescriptor.serviceId,
+      {
+        descriptor: communicationDispatcherDescriptor,
+        create: (config, createService) =>
+          new CommunicationDispatcherService(config, createService),
+      },
+    ],
+    [
+      joinDescriptor.serviceId,
+      {
+        descriptor: joinDescriptor,
+        create: (config, createService) => new JoinService(config, createService),
       },
     ],
     [
@@ -256,23 +360,69 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
         create: (config, _createService) => new HoldService(config),
       },
     ],
+    [
+      textGenerationDescriptor.serviceId,
+      {
+        descriptor: textGenerationDescriptor,
+        create: (config, _createService) => new TextGenerationService(config),
+      },
+    ],
+    [
+      storeDescriptor.serviceId,
+      {
+        descriptor: storeDescriptor,
+        create: (config, _createService) => new StoreService(config, records),
+      },
+    ],
+    [
+      sqlDescriptor.serviceId,
+      {
+        descriptor: sqlDescriptor,
+        create: (config, _createService) => new SqlService(config, databases),
+      },
+    ],
+    [
+      conversationsDescriptor.serviceId,
+      {
+        descriptor: conversationsDescriptor,
+        create: (config, _createService) =>
+          new ConversationsService(config, databases),
+      },
+    ],
+    [
+      documentExtractDescriptor.serviceId,
+      {
+        descriptor: documentExtractDescriptor,
+        create: (config, _createService) => new DocumentExtractService(config),
+      },
+    ],
+    [
+      injectorDescriptor.serviceId,
+      {
+        descriptor: injectorDescriptor,
+        create: (config, _createService) => new InjectorService(config),
+      },
+    ],
   ]);
 
   // Public service endpoints. Declared before the runtime app because runtimes
   // hand mounts to their services as they are created.
-  const mounts = new MountRegistry((mountPath) => {
-    const address = httpServer.address();
-    if (!address || typeof address === "string") {
-      return undefined;
-    }
-    return externalSecure
-      ? `https://${externalHost}${mountPath}`
-      : `http://${externalHost}:${address.port}${mountPath}`;
-  });
+  const mounts = new MountRegistry(
+    (mountPath) => {
+      const address = httpServer.address();
+      if (!address || typeof address === "string") {
+        return undefined;
+      }
+      return externalSecure
+        ? `https://${externalHost}${mountPath}`
+        : `http://${externalHost}:${address.port}${mountPath}`;
+    },
+    options.mountSecret,
+  );
 
   const runtimeApp = new RuntimeApp(factories, (owner, runtimeId) => ({
-    mount: (serviceUuid, handlers) =>
-      mounts.register(owner, runtimeId, serviceUuid, handlers),
+    mount: (serviceUuid, handlers, options) =>
+      mounts.register(owner, runtimeId, serviceUuid, handlers, options),
   }));
   const expressApp = express();
   expressApp.use(
@@ -317,6 +467,29 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
 
   function serializeRuntime(runtime: HostedRuntime) {
     return runtime.serialize(runtimeOutputUrl(runtime.id));
+  }
+
+  /**
+   * Carry a log entry to whoever is collecting this runtime's output.
+   *
+   * The same socket a notification takes, and for the same reason: it is the
+   * connection the board's coordinator already holds, authenticated with a
+   * credential minted to outlive the user's session. An entry differs in what
+   * it is for — a notification is for whoever is watching, an entry has to
+   * survive with nobody attached — but not in how it travels.
+   */
+  function sendJsonLog(socketKey: string, entry: LogEntry) {
+    const sockets = runtimeSockets.get(socketKey);
+    if (!sockets || sockets.size === 0) {
+      return;
+    }
+
+    const message = JSON.stringify({ type: "log", entry });
+    for (const socket of sockets) {
+      if (socket.readyState === WebSocket.OPEN) {
+        socket.send(message);
+      }
+    }
   }
 
   function sendJsonNotification(
@@ -454,6 +627,9 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
       runtime.registerNotificationTarget((notification) => {
         sendJsonNotification(socketKey, notification);
       });
+      runtime.registerLogTarget((entry) => {
+        sendJsonLog(socketKey, entry);
+      });
       runtime.registerResultTarget((result) => {
         const sockets = runtimeSockets.get(socketKey);
         if (!sockets) return;
@@ -509,6 +685,35 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
     res.json({ token });
   });
 
+  /**
+   * Values for the references this runtime's services hold.
+   *
+   * Provisioning carries them already; this is for the moments it cannot cover
+   * — a board being built a service at a time, an entry edited while a board
+   * is running, and a re-push after a restart where the services survived but
+   * the vault did not. It merges, so a client sending one entry does not strip
+   * the rest.
+   *
+   * POST rather than PUT: this merges rather than replaces, and every other
+   * mutation this server takes is a POST — the CORS allowlist says so, and a
+   * lone PUT is a method each runtime implementation would have to remember to
+   * allow separately.
+   *
+   * There is deliberately no GET. The values go one way: in, and then only to
+   * a service resolving a reference for a call it is making. What is held can
+   * be *named* — the response says which aliases the runtime now has — because
+   * a client needs to show whether a credential is configured.
+   */
+  expressApp.post("/runtimes/:runtimeId/secrets", (req, res) => {
+    const runtime = getRuntimeOr404(req, res, req.params.runtimeId);
+    if (!runtime) {
+      return;
+    }
+    const entries = readSecretsPayload(req.body);
+    runtime.setSecrets(entries);
+    res.json({ aliases: runtime.secrets().aliases() });
+  });
+
   expressApp.post("/runtimes/:runtimeId/rearrange", (req, res) => {
     const runtime = getRuntimeOr404(req, res, req.params.runtimeId);
     if (!runtime) {
@@ -528,7 +733,7 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
     res.json(serializeRuntime(runtime));
   });
 
-  expressApp.post("/runtimes/:runtimeId", (req, res) => {
+  expressApp.post("/runtimes/:runtimeId", async (req, res) => {
     const runtime = getRuntimeOr404(req, res, req.params.runtimeId);
     if (!runtime) {
       return;
@@ -538,10 +743,45 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
       return;
     }
 
-    const result = runtime.process(req.body, () => {
+    // No context: an external HTTP caller is not continuing a run, it is
+    // starting one.
+    const result = await runtime.process(req.body, () => {
       // Notifications are broadcast through runtime notification targets.
     });
     res.json(result);
+  });
+
+  /**
+   * Change what a running runtime records, without rebuilding it.
+   *
+   * `logData` is a decision a board revisits — switched on to look into
+   * something, off again afterwards — and re-provisioning to carry it would
+   * restart every service in the runtime to change one boolean. Separate from
+   * POST /runtimes/:id, which processes data rather than configuring anything.
+   */
+  expressApp.patch("/runtimes/:runtimeId/state", (req, res) => {
+    const runtime = getRuntimeOr404(req, res, req.params.runtimeId);
+    if (!runtime) {
+      return;
+    }
+    if (!isJsonRecord(req.body)) {
+      res.sendStatus(400);
+      return;
+    }
+    if (typeof req.body.logging === "boolean") {
+      runtime.setLogging(req.body.logging);
+    }
+    if (isLogLevel(req.body.logLevel)) {
+      runtime.setLogLevel(req.body.logLevel);
+    }
+    if (typeof req.body.logData === "boolean") {
+      runtime.setLogData(req.body.logData);
+    }
+    res.json({
+      logging: runtime.getLogging(),
+      logData: runtime.getLogData(),
+      logLevel: runtime.getLogLevel(),
+    });
   });
 
   expressApp.get("/runtimes/:runtimeId/inputs", (req, res) => {
@@ -638,6 +878,48 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
       );
 
       res.json(state);
+    },
+  );
+
+  /**
+   * Run the pipeline starting at one service, with a given payload.
+   *
+   * Distinct from configuring it: configure says what a service *is*, this says
+   * do your job with this. A facade button had only the former, so anything it
+   * needed to cause had to be smuggled in as a config field that a service read
+   * as a command — which is how `store` ended up releasing records from inside
+   * `configure`.
+   *
+   * The service named here runs; it is not skipped the way `processFrom` skips
+   * the caller that is handing work onward.
+   */
+  expressApp.post(
+    "/runtimes/:runtimeId/services/:instanceId/process",
+    async (req, res) => {
+      const runtime = getRuntimeOr404(req, res, req.params.runtimeId);
+      if (!runtime) {
+        return;
+      }
+      if (req.body === undefined) {
+        res.sendStatus(400);
+        return;
+      }
+      if (!runtime.getService(req.params.instanceId)) {
+        res.sendStatus(404);
+        return;
+      }
+
+      // No context: an external caller is not continuing a run, it is starting
+      // one — the same reasoning as POST /runtimes/:runtimeId.
+      const result = await runtime.processAt(
+        req.params.instanceId,
+        req.body,
+        () => {
+          // Notifications are broadcast through runtime notification targets.
+        },
+        contextFromWire((req.body as JsonRecord | undefined)?.__context),
+      );
+      res.json(result ?? null);
     },
   );
 
@@ -803,7 +1085,7 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
         }
       });
 
-      socket.on("message", (raw) => {
+      socket.on("message", async (raw) => {
         let message: WsInboundMessage;
         try {
           message = JSON.parse(raw.toString());
@@ -820,9 +1102,16 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
           if (!runtime) {
             return;
           }
-          const result = runtime.process(message.params, () => {
-            // Notifications are broadcast through runtime notification targets.
-          });
+          const result = await runtime.process(
+            message.params,
+            () => {
+              // Notifications are broadcast through runtime notification targets.
+            },
+            // A peer driving this runtime names the run its call belongs to, so
+            // that a board spanning several runtimes reads as one trace rather
+            // than one per runtime.
+            contextFromWire(message.context),
+          );
           sendJsonResult(socket, result);
         }
       });
@@ -879,6 +1168,13 @@ function isJsonRecord(value: unknown): value is JsonRecord {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+/** Whether a value is one of the levels a runtime understands. */
+function isLogLevel(value: unknown): value is LogLevel {
+  return (
+    value === "debug" || value === "info" || value === "warn" || value === "error"
+  );
+}
+
 function validateRuntimeConfiguration(
   value: unknown,
 ): RuntimeConfiguration | null {
@@ -908,6 +1204,18 @@ function validateRuntimeConfiguration(
       typeof value.boardName === "string" ? value.boardName : undefined,
     // Absent means persist; see RuntimeConfiguration.garbageCollected.
     garbageCollected: value.garbageCollected === true,
+    // Both absent mean off; see RuntimeConfiguration.logging / logData.
+    logging: isJsonRecord(value.state) && value.state.logging === true,
+    logLevel:
+      isJsonRecord(value.state) && isLogLevel(value.state.logLevel)
+        ? value.state.logLevel
+        : undefined,
+    // Absent means allowed; see RuntimeConfiguration.logData.
+    logData: !(isJsonRecord(value.state) && value.state.logData === false),
+    // Values for the references the services carry. Read out of the payload
+    // here and handed to the runtime's vault; they are never put back into any
+    // service's state, and never appear in a serialized runtime.
+    secrets: readSecretsPayload(value.secrets),
     services,
   };
 }

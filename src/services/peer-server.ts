@@ -118,11 +118,13 @@ export class PeerServerService implements HostedService {
     const peerId = client.getId();
     this.connectedPeers = [...this.connectedPeers, peerId];
     this.host?.notify({ connectedPeers: this.connectedPeers }, this.uuid);
-    this.emitEvent({
-      event: "peer-connected",
-      peerId,
-      connectedPeers: this.connectedPeers,
-    });
+    void this.reportFailure(
+      this.emitEvent({
+        event: "peer-connected",
+        peerId,
+        connectedPeers: this.connectedPeers,
+      }),
+    );
   };
 
   private onPeerDisconnected = (client: IClient): void => {
@@ -130,12 +132,31 @@ export class PeerServerService implements HostedService {
     const peerId = client.getId();
     this.connectedPeers = this.connectedPeers.filter((id) => id !== peerId);
     this.host?.notify({ connectedPeers: this.connectedPeers }, this.uuid);
-    this.emitEvent({
-      event: "peer-disconnected",
-      peerId,
-      connectedPeers: this.connectedPeers,
-    });
+    void this.reportFailure(
+      this.emitEvent({
+        event: "peer-disconnected",
+        peerId,
+        connectedPeers: this.connectedPeers,
+      }),
+    );
   };
+
+  /**
+   * A push nothing is waiting on.
+   *
+   * A peer connecting is not a call anyone made, so there is no caller for a
+   * failure to reach. Reported rather than left to surface as an unhandled
+   * rejection, which would take the runtime down over one bad event.
+   */
+  private async reportFailure(work: Promise<void>): Promise<void> {
+    try {
+      await work;
+    } catch (err) {
+      this.host?.log("error", "service.failed", {
+        message: `peer event failed: ${err instanceof Error ? err.message : String(err)}`,
+      });
+    }
+  }
 
   /**
    * Push a peer event through the rest of this runtime and on to the next one.
@@ -145,11 +166,11 @@ export class PeerServerService implements HostedService {
    * updates this runtime, which looks right in a Monitor sitting behind the
    * service but leaves the chain dead from there on.
    */
-  private emitEvent(payload: JsonRecord): void {
+  private async emitEvent(payload: JsonRecord): Promise<void> {
     if (!this.emitEvents || !this.host) {
       return;
     }
-    const output = this.host.processFrom(
+    const output = await this.host.processFrom(
       this.uuid,
       payload,
       (_n: RuntimeNotification) => {},
