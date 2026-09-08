@@ -10,12 +10,7 @@ import {
 import { assertRuntimeUrlAllowed } from "./urlGuard";
 import { LogStore } from "./logStore";
 import { LogEntry, LogLevel } from "../types";
-import {
-  MOUNT_FIELD,
-  formatMountRef,
-  parseMountRef,
-  substituteMounts,
-} from "./mount";
+import { MOUNT_FIELD, collectMountRefs, formatMountRef } from "./mount";
 import {
   BridgeMessage,
   RuntimeSnapshot,
@@ -56,8 +51,9 @@ export class BoardSession {
   // turns a reference into the address it names — no runtime can see far enough
   // to do it for itself.
   private readonly mountAddresses = new Map<string, string>();
-  // What was last handed to each consumer, keyed the same way. Guards against
-  // re-configuring a service with a state it already has.
+  // The address last handed to each consumer, keyed the same way. Guards
+  // against re-configuring a service with what it already has, while still
+  // letting a *changed* address through.
   private readonly pushedStates = new Map<string, string>();
   // What each remote runtime's services last reported, and what that runtime
   // says it can run. This is the board as the coordinator knows it, and what an
@@ -848,9 +844,6 @@ export class BoardSession {
       return;
     }
 
-    const resolve = (ref: string): string | null =>
-      this.mountAddresses.get(ref) ?? null;
-
     await Promise.all(
       this.provisioned.map(async ({ descriptor }) => {
         const services = this.config.services[descriptor.id] ?? [];
@@ -859,25 +852,39 @@ export class BoardSession {
           if (!state) {
             continue;
           }
-          const resolved = substituteMounts(state, resolve);
-          const serialized = JSON.stringify(resolved);
-          // Nothing resolved, or this exact state has already been handed over
-          // — later passes run whenever an address appears, and re-sending a
-          // service its own configuration would be pointless churn.
-          if (serialized === JSON.stringify(state)) {
+          // A reference is written wherever the service names its target, so it
+          // is looked for by scheme rather than read out of one field.
+          const refs = [...collectMountRefs(state)];
+          if (refs.length === 0) {
+            continue;
+          }
+          if (refs.length > 1) {
+            // One address field, so one mount per consumer. A service needing
+            // two should host a pipeline instead.
+            console.warn(
+              `[coordinator] Service "${descriptor.id}/${svc.uuid}" names ${refs.length} mounts; only the first is resolved`,
+            );
+          }
+          const address = this.mountAddresses.get(refs[0]);
+          if (!address) {
+            // The owner has not published yet. Later passes run whenever an
+            // address appears.
             continue;
           }
           const key = formatMountRef({
             runtimeId: descriptor.id,
             serviceUuid: svc.uuid,
           });
-          if (this.pushedStates.get(key) === serialized) {
+          if (this.pushedStates.get(key) === address) {
             continue;
           }
-          this.pushedStates.set(key, serialized);
-          // The board keeps its references. They are what survives being saved
-          // and reopened somewhere else; an address is only true of this run.
-          await this.configureService(descriptor, svc.uuid, resolved);
+          this.pushedStates.set(key, address);
+          // Only the address, and only in the field addresses live in. The
+          // board keeps its reference: that is what survives being saved and
+          // reopened somewhere else, while an address is only true of this run.
+          await this.configureService(descriptor, svc.uuid, {
+            [MOUNT_FIELD]: address,
+          });
         }
       }),
     );

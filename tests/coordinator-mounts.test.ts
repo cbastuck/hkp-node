@@ -131,8 +131,99 @@ describe("coordinator mount resolution", () => {
     expect(call.state.__hkpMount).toMatch(
       new RegExp(`^${ownerUrl}/hosted/[0-9a-f]{32}$`),
     );
-    // Untouched fields travel with it, since the whole state is re-sent.
-    expect(call.state.logToConsole).toBe(false);
+    // Only the address, and only the field addresses live in. What a person
+    // wrote is not re-sent, so nothing the coordinator does can overwrite it —
+    // which is what lets the board keep its reference across a save.
+    expect(Object.keys(call.state)).toEqual(["__hkpMount"]);
+  });
+
+  it("resolves a reference written in the service's own field", async () => {
+    // The field a person writes is the one the service already calls its
+    // target; the reference is found by its scheme, wherever it sits.
+    const ownerUrl = await startOwnerRuntime();
+    const consumer = await startStubRuntime("rt-consumer");
+    cleanups.push(consumer.close);
+
+    const session = new BoardSession("board-1", "user-1", {
+      boardName: "board-1",
+      runtimes: [
+        { id: "rt-owner", name: "Owner", type: "rest", url: ownerUrl },
+        { id: "rt-consumer", name: "Consumer", type: "rest", url: consumer.url },
+      ],
+      services: {
+        "rt-owner": [
+          {
+            uuid: "peer-1",
+            serviceId: peerServerDescriptor.serviceId,
+            state: { bypass: false },
+          },
+        ],
+        "rt-consumer": [
+          {
+            uuid: "consumer-1",
+            serviceId: monitorDescriptor.serviceId,
+            state: { url: "hkp-mount://rt-owner/peer-1" },
+          },
+        ],
+      },
+    });
+    cleanups.push(() => session.destroy());
+
+    await session.start();
+
+    expect(consumer.configured).toHaveLength(1);
+    const [call] = consumer.configured;
+    expect(call.state.__hkpMount).toMatch(
+      new RegExp(`^${ownerUrl}/hosted/[0-9a-f]{32}$`),
+    );
+    // The authored field is left exactly as the board wrote it.
+    expect(call.state.url).toBeUndefined();
+  });
+
+  it("finds a reference nested inside a sub-pipeline", async () => {
+    const ownerUrl = await startOwnerRuntime();
+    const consumer = await startStubRuntime("rt-consumer");
+    cleanups.push(consumer.close);
+
+    const session = new BoardSession("board-1", "user-1", {
+      boardName: "board-1",
+      runtimes: [
+        { id: "rt-owner", name: "Owner", type: "rest", url: ownerUrl },
+        { id: "rt-consumer", name: "Consumer", type: "rest", url: consumer.url },
+      ],
+      services: {
+        "rt-owner": [
+          {
+            uuid: "peer-1",
+            serviceId: peerServerDescriptor.serviceId,
+            state: { bypass: false },
+          },
+        ],
+        "rt-consumer": [
+          {
+            uuid: "consumer-1",
+            serviceId: monitorDescriptor.serviceId,
+            state: {
+              pipeline: [
+                {
+                  instanceId: "inner-1",
+                  serviceId: "http-client",
+                  state: { url: "hkp-mount://rt-owner/peer-1" },
+                },
+              ],
+            },
+          },
+        ],
+      },
+    });
+    cleanups.push(() => session.destroy());
+
+    await session.start();
+
+    expect(consumer.configured).toHaveLength(1);
+    expect(consumer.configured[0].state.__hkpMount).toMatch(
+      new RegExp(`^${ownerUrl}/hosted/[0-9a-f]{32}$`),
+    );
   });
 
   it("leaves a reference alone when nothing on the board owns it", async () => {

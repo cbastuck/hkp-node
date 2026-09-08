@@ -14,13 +14,17 @@
  * and therefore its UI panel. It does not mirror the C++ service's URL
  * templating; this one takes its body from the pipeline.
  *
- * What it adds is `__hkpMount`, which takes precedence over `url` when set: an
- * address, or a `hkp-mount://<runtimeId>/<serviceUuid>` reference to the
- * service that owns the mount. A reference is resolved by the board's
- * coordinator, the only instance that can see across runtimes, and this service
- * is configured with the resulting address before it runs. Seeing a reference
- * here therefore means the owner has not published an address yet — a normal
- * state while a board is still coming up, not an error.
+ * What it adds is the ability to call a mount. `url` may hold a
+ * `hkp-mount://<runtimeId>/<serviceUuid>` reference instead of an address: it
+ * names the service that owns the endpoint, which is what a board can know when
+ * an address is only assigned at load. The board's coordinator — the only
+ * instance that can see across runtimes — resolves it and configures this
+ * service's `__hkpMount` with the address, which then takes precedence.
+ *
+ * So `url` is what a person writes and `__hkpMount` is what the run produced,
+ * and neither overwrites the other. An unresolved reference means the owner has
+ * not published yet: a normal state while a board comes up, and a reason to wait
+ * rather than to dial anything.
  *
  * The response shape mirrors what `http-server-subservices` produces for an
  * incoming request, so a pipeline that handles one handles the other.
@@ -176,9 +180,12 @@ export class HttpClientService implements HostedService {
       // Either nothing is configured, or the mount's owner has not published an
       // address yet. Say so and stop; the next input tries again, by which time
       // the coordinator has usually handed the address over.
+      const pending = [this.mount, this.url].find((value) =>
+        parseMountRef(value),
+      );
       notify({
-        error: parseMountRef(this.mount)
-          ? `Waiting for "${this.mount}" to publish an endpoint`
+        error: pending
+          ? `Waiting for "${pending}" to publish an endpoint`
           : "No target configured",
       });
       return null;
@@ -200,17 +207,26 @@ export class HttpClientService implements HostedService {
   /**
    * The URL to call, or null while there is nothing callable.
    *
-   * A mount takes precedence over a typed URL — a board that names a service is
-   * being explicit about which endpoint it means, and the address is not
-   * knowable when the board is written. An unresolved reference is therefore
-   * "not ready yet" rather than a reason to fall back to `url`, which would
-   * silently call something else.
+   * A resolved mount address wins over a typed URL — a board that names a
+   * service is being explicit about which endpoint it means, and the address is
+   * not knowable when the board is written.
+   *
+   * A reference in either field is "not ready yet" rather than something to
+   * dial: it names a service whose address nobody has published, and falling
+   * back past it would silently call something else. Boards written before the
+   * split put the reference in `__hkpMount`; both read the same way.
    */
   private targetUrl(): string | null {
-    if (this.mount) {
-      return parseMountRef(this.mount) ? null : this.join(this.mount);
+    if (this.mount && !parseMountRef(this.mount)) {
+      return this.join(this.mount);
     }
-    return this.url ? this.join(this.url) : null;
+    if (this.mount && parseMountRef(this.mount)) {
+      return null;
+    }
+    if (!this.url || parseMountRef(this.url)) {
+      return null;
+    }
+    return this.join(this.url);
   }
 
   private join(base: string): string {
