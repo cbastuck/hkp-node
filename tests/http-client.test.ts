@@ -169,6 +169,48 @@ describe("http-client target", () => {
     expect((await nextPush(pushed)).body).toBe("live");
   });
 
+  it("waits while a reference sits in the url it was given", async () => {
+    // The field a person writes is the one the service already calls its
+    // target. A reference there names a service whose address nobody has
+    // published, so there is nothing to call.
+    const { host, pushed } = hostSpy();
+    const notifications: any[] = [];
+
+    const service = new HttpClientService({
+      uuid: "client-1",
+      serviceId: "http-client",
+      state: { url: "hkp-mount://other/peer-1" },
+    } as any);
+    service.setHost(host);
+
+    expect(service.process(undefined, (n) => notifications.push(n))).toBeNull();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(pushed).toEqual([]);
+    expect(notifications[0].error).toContain("hkp-mount://other/peer-1");
+  });
+
+  it("keeps the url it was written with when an address is handed over", async () => {
+    // One job each: the reference is what the board says, the address is what
+    // this run resolved. Neither overwrites the other, so saving the board
+    // writes back the reference rather than an address true of one machine.
+    const target = await endpoint(() => ({ contentType: "text/plain", body: "live" }));
+    const { host, pushed } = hostSpy();
+
+    const service = new HttpClientService({
+      uuid: "client-1",
+      serviceId: "http-client",
+      state: { url: "hkp-mount://other/peer-1" },
+    } as any);
+    service.setHost(host);
+
+    const state = service.configure({ __hkpMount: target.url });
+    expect(state.url).toBe("hkp-mount://other/peer-1");
+    expect(state.__hkpMount).toBe(target.url);
+
+    service.process(undefined, () => {});
+    expect((await nextPush(pushed)).body).toBe("live");
+  });
+
   it("joins the path to the address without doubling the slash", async () => {
     const target = await endpoint(() => ({ body: "ok" }));
     const { host, pushed } = hostSpy();

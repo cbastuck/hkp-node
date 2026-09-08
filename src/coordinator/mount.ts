@@ -2,16 +2,19 @@
  * Mount vocabulary, for the coordinator side.
  *
  * A service that needs to be reachable from outside is assigned a path on its
- * runtime's server and publishes the resulting address in its own state. Both
- * sides use one reserved field:
+ * runtime's server and publishes the resulting address in its own state, in
+ * `__hkpMount`.
  *
- *   __hkpMount says where a mount is.
- *
- * A service that *owns* a mount publishes its address there, as an absolute
- * `http(s)://` URL. A service that *consumes* one points at the owner there, as
- * `hkp-mount://<runtimeId>/<serviceUuid>`. The two forms are told apart by
- * scheme; a bare `<runtimeId>/<serviceUuid>` is not accepted, because it is
+ * A service that *consumes* a mount names the owner with a
+ * `hkp-mount://<runtimeId>/<serviceUuid>` reference, written in whatever field
+ * that service calls its target. References are found by their scheme, wherever
+ * they appear: a bare `<runtimeId>/<serviceUuid>` is not accepted, because it is
  * indistinguishable from a relative URL.
+ *
+ * The coordinator resolves a reference and configures the consumer's
+ * `__hkpMount` with the address — never the field the reference was found in.
+ * One job each: the reference is what a person wrote and what the board keeps,
+ * the address is only true of this run.
  *
  * Resolving one form into the other needs a view of the whole board, which is
  * the coordinator's job — see `session.ts`. This module is only the vocabulary,
@@ -61,9 +64,13 @@ export function formatMountRef(ref: MountRef): string {
 
 /**
  * Every mount reference in a value, replaced by the address `resolve` returns
- * for it. References that resolve to null are left untouched rather than
- * blanked, so a service still describes what it wanted and can be resolved
- * later, once its owner publishes.
+ * for it — in whatever field held it. References that resolve to null are left
+ * untouched rather than blanked, so a service still describes what it wanted and
+ * can be resolved later, once its owner publishes.
+ *
+ * Used where a board is being handed somewhere that has no coordinator to ask
+ * (an export). Configuring a running consumer does *not* go through this: that
+ * writes the address to `__hkpMount` and leaves what the board says alone.
  *
  * Walks the whole value because services nest: a sub-service pipeline carries
  * its own services, each with their own state.
@@ -72,6 +79,9 @@ export function substituteMounts<T>(
   value: T,
   resolve: (ref: string) => string | null,
 ): T {
+  if (typeof value === "string") {
+    return (parseMountRef(value) ? (resolve(value) ?? value) : value) as T;
+  }
   if (Array.isArray(value)) {
     return value.map((item) => substituteMounts(item, resolve)) as T;
   }
@@ -81,21 +91,23 @@ export function substituteMounts<T>(
 
   const out: Record<string, unknown> = {};
   for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
-    if (key === MOUNT_FIELD && typeof item === "string") {
-      out[key] = parseMountRef(item) ? (resolve(item) ?? item) : item;
-      continue;
-    }
     out[key] = substituteMounts(item, resolve);
   }
   return out as T;
 }
 
 /**
- * Every mount reference in a value, as the references themselves. Used to find
- * out which services a board wants pointed at a mount before any of them have
- * been provisioned.
+ * Every mount reference in a value, as the references themselves, found by
+ * scheme wherever they appear. Used to find out which services a board wants
+ * pointed at a mount before any of them have been provisioned.
  */
 export function collectMountRefs(value: unknown, into = new Set<string>()): Set<string> {
+  if (typeof value === "string") {
+    if (parseMountRef(value)) {
+      into.add(value);
+    }
+    return into;
+  }
   if (Array.isArray(value)) {
     for (const item of value) {
       collectMountRefs(item, into);
@@ -105,11 +117,7 @@ export function collectMountRefs(value: unknown, into = new Set<string>()): Set<
   if (!value || typeof value !== "object") {
     return into;
   }
-  for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
-    if (key === MOUNT_FIELD && typeof item === "string" && parseMountRef(item)) {
-      into.add(item);
-      continue;
-    }
+  for (const item of Object.values(value as Record<string, unknown>)) {
     collectMountRefs(item, into);
   }
   return into;
