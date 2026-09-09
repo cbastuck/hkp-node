@@ -308,20 +308,35 @@ docker run -p 8080:8080 --env-file hkp-node.env cbastuck/hkp-node:latest
 
 ## Services
 
-The following services are built in and available to any runtime created on this server.
+Built in and available to any runtime created on this server. Each service's own
+page in `docs/content/services/` is the detail; this is the roster.
 
-| Service ID                | Name                  |
-| ------------------------- | --------------------- |
-| `monitor`                 | Monitor               |
-| `map`                     | Map                   |
-| `timer`                   | Timer                 |
-| `sub-service`             | SubService            |
-| `http-server-subservices` | HttpServerSubservices |
-| `peer-server`             | PeerServer            |
-| `imap-email`              | IMAP Email            |
-| `smtp-email`              | SMTP Email            |
-| `telegram-listener`       | Telegram Listener     |
-| `telegram-sender`         | Telegram Sender       |
+| Service ID | Name | What it does |
+| --- | --- | --- |
+| `communication-dispatcher` | Communication Dispatcher | Decides what happens next about an ongoing conversation |
+| `conversations` | Conversations | Threads of mail, their state, and the work produced along the way |
+| `document-extract` | Document Extract | Turns a document into text a model can read |
+| `hold` | Hold | Keeps the latest value one side produced and replays it to the other |
+| `http-client` | HTTP Client | Issues HTTP requests and emits the response |
+| `http-server-subservices` | HttpServerSubservices | Serves an endpoint, running an inner pipeline per request |
+| `imap-email` | IMAP Email | Pushes each new incoming email into the pipeline |
+| `injector` | Injector | Injects a configured static value into the pipeline |
+| `iterator` | Iterator | Runs a nested pipeline once per item |
+| `join` | Join | Splits off work and returns the answer beside the current value |
+| `map` | Map | Transforms data with a declarative template |
+| `monitor` | Monitor | Logs the current value and passes it through unchanged |
+| `peer-server` | PeerServer | Serves an endpoint for peers to connect to |
+| `queue` | Queue | How one board says something to another |
+| `smtp-email` | SMTP Email | Sends mail, addressed by config or by the current value |
+| `sql` | SQL | A board's own SQL database |
+| `stopper` | Stopper | Stops the pipeline unconditionally |
+| `store` | Store | What a board remembers between runs — keyed and durable |
+| `sub-service` | SubService | Embeds an inner pipeline of services |
+| `telegram-listener` | Telegram Listener | Pushes each incoming Telegram message into the pipeline |
+| `telegram-sender` | Telegram Sender | Sends a Telegram message |
+| `text-generation` | Text Generation | Generates text with a local or hosted language model |
+| `timer` | Timer | Emits periodic or one-shot ticks |
+
 
 ---
 
