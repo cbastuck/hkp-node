@@ -305,12 +305,12 @@ export class SubService implements HostedService {
     // What the nested pipeline emits by itself is this service's output; see
     // emitOutward.
     this.releasePipelineResults?.();
-    this.releasePipelineResults = this.pipeline.registerResultTarget((result) =>
-      void this.emitOutward(result),
+    this.releasePipelineResults = this.pipeline.registerResultTarget(
+      (result) => void this.emitOutward(result),
     );
 
     this.applyLogSettings();
-this.applyScope();
+    this.applyScope();
     this.applySecrets();
   }
 
