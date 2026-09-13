@@ -4,7 +4,8 @@
  * Service Name: HTTP Client
  * Runtime: hkp-node
  * Modes: none (method is configuration, not a mode)
- * Key Config: url, __hkpMount (target), path, method, headers, userAgent, body
+ * Key Config: url, __hkpMount (target), path, query, method, headers, userAgent,
+ *             body
  * IO: in=body to send (string | object | bytes | {meta, body|binary})
  *     out=null immediately; the response is pushed through the rest of the
  *     pipeline when it arrives, shaped {meta, body?, binary?}
@@ -26,8 +27,15 @@
  * not published yet: a normal state while a board comes up, and a reason to wait
  * rather than to dial anything.
  *
+ * `query` holds the request's parameters as a map, encoded onto the target when
+ * it is called — the same shape `http-server-subservices` reports an incoming
+ * request's parameters in, and what a board has instead of escaping them into
+ * `path` by hand.
+ *
  * The response shape mirrors what `http-server-subservices` produces for an
- * incoming request, so a pipeline that handles one handles the other.
+ * incoming request, so a pipeline that handles one handles the other — metadata
+ * including the response headers, then the body in whichever form its content
+ * type explains.
  */
 import {
   HostedService,
@@ -68,6 +76,15 @@ function isTextual(type: string): boolean {
   );
 }
 
+/** Headers as a plain record, lower-cased as HTTP names compare. */
+function headerRecord(headers: Headers): JsonRecord {
+  const record: JsonRecord = {};
+  headers.forEach((value, key) => {
+    record[key.toLowerCase()] = value;
+  });
+  return record;
+}
+
 type RequestBody = { body: BodyInit | Uint8Array; contentType?: string } | null;
 
 export class HttpClientService implements HostedService {
@@ -81,6 +98,7 @@ export class HttpClientService implements HostedService {
   private url = "";
   private mount = "";
   private path = "";
+  private query: Record<string, string> = {};
   private method: HttpMethod = "get";
   private headers: Record<string, string> = {};
   private userAgent = "";
@@ -107,6 +125,7 @@ export class HttpClientService implements HostedService {
       // to call, or a reference to the service that owns it while unresolved.
       [MOUNT_FIELD]: this.mount,
       path: this.path,
+      query: this.query,
       method: this.method,
       headers: this.headers,
       userAgent: this.userAgent,
@@ -125,6 +144,25 @@ export class HttpClientService implements HostedService {
     }
     if (typeof config.path === "string") {
       this.path = config.path;
+    }
+    if (
+      config.query &&
+      typeof config.query === "object" &&
+      !Array.isArray(config.query)
+    ) {
+      const query: Record<string, string> = {};
+      for (const [key, value] of Object.entries(config.query as JsonRecord)) {
+        // A parameter is sent as text whatever it was written as, so a number
+        // or a flag typed in an editor arrives as the value it reads as.
+        if (
+          typeof value === "string" ||
+          typeof value === "number" ||
+          typeof value === "boolean"
+        ) {
+          query[key] = String(value);
+        }
+      }
+      this.query = query;
     }
     if (
       typeof config.method === "string" &&
@@ -218,7 +256,7 @@ export class HttpClientService implements HostedService {
    */
   private targetUrl(): string | null {
     if (this.mount && !parseMountRef(this.mount)) {
-      return this.join(this.mount);
+      return this.requestUrl(this.mount);
     }
     if (this.mount && parseMountRef(this.mount)) {
       return null;
@@ -226,7 +264,12 @@ export class HttpClientService implements HostedService {
     if (!this.url || parseMountRef(this.url)) {
       return null;
     }
-    return this.join(this.url);
+    return this.requestUrl(this.url);
+  }
+
+  /** The address to call: the path joined to the base, then the parameters. */
+  private requestUrl(base: string): string {
+    return this.withQuery(this.join(base));
   }
 
   private join(base: string): string {
@@ -238,6 +281,21 @@ export class HttpClientService implements HostedService {
     return `${stem}${suffix}`;
   }
 
+  /**
+   * Appends the configured parameters, encoded.
+   *
+   * Appended rather than replacing what the target already carries: a url or a
+   * path may have been written with parameters of its own, and a mount address
+   * is not the board's to rewrite.
+   */
+  private withQuery(target: string): string {
+    const params = new URLSearchParams(Object.entries(this.query)).toString();
+    if (!params) {
+      return target;
+    }
+    return `${target}${target.includes("?") ? "&" : "?"}${params}`;
+  }
+
   private async send(
     url: string,
     input: unknown,
@@ -247,7 +305,12 @@ export class HttpClientService implements HostedService {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);
     this.inFlight += 1;
-    notify({ requesting: true, url, inFlight: this.inFlight });
+    notify({
+      requesting: true,
+      method: this.method,
+      url,
+      inFlight: this.inFlight,
+    });
 
     try {
       const request = this.requestBody(input);
@@ -261,7 +324,13 @@ export class HttpClientService implements HostedService {
         url,
       );
       if (problem) {
-        notify({ requesting: false, url, error: problem });
+        notify({
+          requesting: false,
+          method: this.method,
+          url,
+          status: 0,
+          error: problem,
+        });
         this.inFlight -= 1;
         return;
       }
@@ -285,14 +354,26 @@ export class HttpClientService implements HostedService {
       const result = await this.readResponse(url, response);
       notify({
         requesting: false,
+        method: this.method,
         url,
         status: response.status,
+        // Said on every outcome, so what a panel shows is this request's and
+        // not the last failure's still standing.
+        error: "",
         inFlight: this.inFlight - 1,
       });
       await this.push(result, notify, context);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      notify({ requesting: false, url, error: message });
+      // Status 0: there was no response to have one, so the status of the
+      // request before this stops standing as if it were this one's.
+      notify({
+        requesting: false,
+        method: this.method,
+        url,
+        status: 0,
+        error: message,
+      });
       // A failed request produces no result to pass on: the pipeline behind
       // this service is not called, rather than called with a fabricated one.
     } finally {
@@ -366,6 +447,7 @@ export class HttpClientService implements HostedService {
       url,
       status: response.status,
       statusText: response.statusText,
+      headers: headerRecord(response.headers),
     };
     if (contentType) {
       meta.contentType = contentType;

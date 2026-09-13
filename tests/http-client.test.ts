@@ -211,6 +211,44 @@ describe("http-client target", () => {
     expect((await nextPush(pushed)).body).toBe("live");
   });
 
+  it("appends the configured parameters, encoded", async () => {
+    const target = await endpoint(() => ({ body: "ok" }));
+    const { host, pushed } = hostSpy();
+
+    const service = new HttpClientService({
+      uuid: "client-1",
+      serviceId: "http-client",
+      state: {
+        url: target.url,
+        path: "/search",
+        // Written as a number or a flag, sent as the text the wire uses — what
+        // an editor produces is what a board means.
+        query: { q: "a b&c", page: 2, draft: true },
+      },
+    } as any);
+    service.setHost(host);
+    service.process(undefined, () => {});
+    await nextPush(pushed);
+
+    expect(target.received[0].path).toBe("/search?q=a+b%26c&page=2&draft=true");
+  });
+
+  it("keeps the parameters the target already carries", async () => {
+    const target = await endpoint(() => ({ body: "ok" }));
+    const { host, pushed } = hostSpy();
+
+    const service = new HttpClientService({
+      uuid: "client-1",
+      serviceId: "http-client",
+      state: { url: target.url, path: "/search?q=written", query: { page: "2" } },
+    } as any);
+    service.setHost(host);
+    service.process(undefined, () => {});
+    await nextPush(pushed);
+
+    expect(target.received[0].path).toBe("/search?q=written&page=2");
+  });
+
   it("joins the path to the address without doubling the slash", async () => {
     const target = await endpoint(() => ({ body: "ok" }));
     const { host, pushed } = hostSpy();
@@ -321,6 +359,25 @@ describe("http-client response", () => {
     const bytes = await call("/blob");
     expect(bytes.body).toBeUndefined();
     expect([...bytes.binary]).toEqual([1, 2, 3]);
+  });
+
+  it("reports the response headers in meta, as the request shape does", async () => {
+    const target = await endpoint(() => ({
+      contentType: "text/plain",
+      body: "ok",
+    }));
+    const { host, pushed } = hostSpy();
+
+    const service = new HttpClientService({
+      uuid: "client-1",
+      serviceId: "http-client",
+      state: { url: target.url },
+    } as any);
+    service.setHost(host);
+    service.process(undefined, () => {});
+
+    const result = await nextPush(pushed);
+    expect(result.meta.headers["content-type"]).toBe("text/plain");
   });
 
   it("passes a failure status on as a result rather than an error", async () => {
@@ -447,6 +504,59 @@ describe("http-client and the shared http-client contract", () => {
   });
 });
 
+describe("http-client notifications", () => {
+  it("names the method and says there is no error on a request that worked", async () => {
+    const target = await endpoint(() => ({ body: "ok" }));
+    const { host, pushed } = hostSpy();
+    const notifications: any[] = [];
+
+    const service = new HttpClientService({
+      uuid: "client-1",
+      serviceId: "http-client",
+      state: { url: target.url, method: "post" },
+    } as any);
+    service.setHost(host);
+    service.process("payload", (payload) => notifications.push(payload));
+    await nextPush(pushed);
+
+    // A panel showing one of these has to be able to read the whole outcome off
+    // it: which request this was, and that nothing went wrong with it — an
+    // omitted error would leave the last failure's reason standing.
+    expect(notifications[0]).toMatchObject({ requesting: true, method: "post" });
+    const done = notifications.find((n) => n.requesting === false);
+    expect(done).toMatchObject({ method: "post", status: 200, error: "" });
+  });
+
+  it("reports the reason a request failed", async () => {
+    const { host } = hostSpy();
+    const notifications: any[] = [];
+
+    const service = new HttpClientService({
+      uuid: "client-1",
+      serviceId: "http-client",
+      // Nothing listens on port 1, so the request fails rather than answering.
+      state: { url: "http://127.0.0.1:1", method: "get" },
+    } as any);
+    service.setHost(host);
+    service.process(undefined, (payload) => notifications.push(payload));
+
+    const deadline = Date.now() + 2000;
+    while (!notifications.some((n) => n.error)) {
+      if (Date.now() > deadline) {
+        throw new Error("service reported no failure");
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(notifications.find((n) => n.error)).toMatchObject({
+      requesting: false,
+      method: "get",
+      // No response, so the status of the request before this one does not
+      // stand as if it were this one's.
+      status: 0,
+    });
+  });
+});
+
 describe("http-client configuration", () => {
   it("passes input through when bypassed", async () => {
     const { host } = hostSpy();
@@ -477,6 +587,7 @@ describe("http-client configuration", () => {
       url: "",
       __hkpMount: "hkp-mount://node/http-1",
       path: "/upload",
+      query: {},
       // Stored lower case, as hkp-rt's http-client does and the shared UI expects.
       method: "post",
       headers: { "x-token": "abc" },
