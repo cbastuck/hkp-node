@@ -130,6 +130,91 @@ describe("sub-service notifications", () => {
   });
 });
 
+describe("nested autonomous emit", () => {
+  /**
+   * Regression: a nested service that emits without being called — a Timer
+   * tick, an arriving message — hands its output to the nested runtime, whose
+   * output nothing carried outward. The services after the sub-service saw
+   * nothing, while the nested ones plainly ran.
+   */
+  async function boardWithNestedOneShot(server: Server) {
+    await request(server.httpServer)
+      .post("/runtimes")
+      .send({
+        id: "rt-1",
+        name: "Node",
+        services: [
+          {
+            serviceId: subServiceDescriptor.serviceId,
+            uuid: "sub-1",
+            state: {
+              pipeline: [
+                {
+                  serviceId: timerDescriptor.serviceId,
+                  uuid: "timer-1",
+                  state: { periodic: false, oneShotDelay: 0 },
+                },
+              ],
+            },
+          },
+          {
+            serviceId: holdDescriptor.serviceId,
+            uuid: "outer-hold",
+            state: { property: "triggerCount" },
+          },
+        ],
+      })
+      .expect(200);
+  }
+
+  /** The one-shot trigger the service UI sends. */
+  function fireOneShot(server: Server) {
+    return request(server.httpServer)
+      .post("/runtimes/rt-1/services/sub-1")
+      .send({
+        configureService: {
+          instanceId: "timer-1",
+          state: { immediate: true, start: true },
+        },
+      })
+      .expect(200);
+  }
+
+  it("carries a nested tick to the service after the sub-service", async () => {
+    const { server, baseUrl } = await startServer();
+    await boardWithNestedOneShot(server);
+
+    const seen = await collectState(
+      `${baseUrl.replace("http", "ws")}/rt-1`,
+      "outer-hold",
+      (states) => states.some((state) => state.writeCount >= 1),
+      async () => {
+        await fireOneShot(server);
+      },
+    );
+
+    expect(seen[seen.length - 1]).toMatchObject({ held: 1, writeCount: 1 });
+  });
+
+  it("runs the services after a sub-service once per nested emit", async () => {
+    // The other failure mode: a forwarded emit that also travels back as the
+    // value process() returns runs everything behind the sub-service twice.
+    const { server, baseUrl } = await startServer();
+    await boardWithNestedOneShot(server);
+
+    const seen = await collectNotifications(
+      `${baseUrl.replace("http", "ws")}/rt-1`,
+      async () => {
+        await fireOneShot(server);
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      },
+    );
+
+    expect(flowCount(seen, "outer-hold", "call-process")).toBe(1);
+    expect(flowCount(seen, "outer-hold", "call-process-finished")).toBe(1);
+  });
+});
+
 /**
  * Nested teardown is asserted on destroy() reaching the nested services rather
  * than on what stops arriving at the board: a leaked pipeline is unreachable,

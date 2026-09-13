@@ -51,6 +51,7 @@ export class SubService implements HostedService {
   protected pipeline: HostedRuntime | null = null;
   private releasePipelineNotifications: (() => void) | null = null;
   private releasePipelineLogs: (() => void) | null = null;
+  private releasePipelineResults: (() => void) | null = null;
   private readonly createService: ServiceCreator;
   protected host: RuntimeHost | null = null;
 
@@ -211,6 +212,8 @@ export class SubService implements HostedService {
     this.releasePipelineNotifications = null;
     this.releasePipelineLogs?.();
     this.releasePipelineLogs = null;
+    this.releasePipelineResults?.();
+    this.releasePipelineResults = null;
     // Nested services hold the same things top-level ones do — timers, sockets,
     // mounts — and nothing else will ever reach them once this service is gone.
     this.pipeline?.destroy();
@@ -235,6 +238,35 @@ export class SubService implements HostedService {
       }
       return { ...entry, state };
     });
+  }
+
+  /**
+   * Carries what the nested pipeline emitted on its own into the pipeline
+   * around this service.
+   *
+   * A nested service that emits without being called — a Timer tick, an
+   * arriving message, a deferred result from a service that returned null and
+   * came back later — hands its output to its runtime, and a nested runtime's
+   * output is this service's output. Nothing else forwards it: the value
+   * `process` returns is the only route out of a sub-pipeline, and an
+   * autonomous emitter is by definition not answering a `process` call. So the
+   * services after this one are run here, and what they produce leaves the
+   * board the way this service's own output would.
+   */
+  private async emitOutward(result: unknown): Promise<void> {
+    // Null is a nested pipeline saying it has nothing to pass on, and that
+    // answer is this service's answer too — the services after it do not run.
+    if (result === null || result === undefined) {
+      return;
+    }
+    const host = this.host;
+    if (!host) {
+      return;
+    }
+    // No-op: the runtime fans these out to its own targets, and forwarding
+    // them again here would deliver every one twice.
+    const output = await host.processFrom(this.uuid, result, () => {});
+    host.emitResult(output);
   }
 
   private rebuild(): void {
@@ -268,6 +300,13 @@ export class SubService implements HostedService {
     // nested runtime has no route out of its own.
     this.releasePipelineLogs = this.pipeline.registerLogTarget((entry) =>
       this.host?.forwardLog(entry),
+    );
+
+    // What the nested pipeline emits by itself is this service's output; see
+    // emitOutward.
+    this.releasePipelineResults?.();
+    this.releasePipelineResults = this.pipeline.registerResultTarget((result) =>
+      void this.emitOutward(result),
     );
 
     this.applyLogSettings();
