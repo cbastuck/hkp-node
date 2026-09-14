@@ -30,7 +30,11 @@
  * `query` holds the request's parameters as a map, encoded onto the target when
  * it is called — the same shape `http-server-subservices` reports an incoming
  * request's parameters in, and what a board has instead of escaping them into
- * `path` by hand.
+ * the URL by hand. Unlike `path` it applies to every target, because escaping
+ * is a service a map performs and a written URL cannot.
+ *
+ * `path` is the sub-path of a mount, and applies to nothing else: a typed
+ * `url` is a whole URL and carries its own path.
  *
  * The response shape mirrors what `http-server-subservices` produces for an
  * incoming request, so a pipeline that handles one handles the other — metadata
@@ -172,9 +176,7 @@ export class HttpClientService implements HostedService {
     }
     if (config.headers && typeof config.headers === "object") {
       const headers: Record<string, string> = {};
-      for (const [key, value] of Object.entries(
-        config.headers as JsonRecord,
-      )) {
+      for (const [key, value] of Object.entries(config.headers as JsonRecord)) {
         if (typeof value === "string") {
           headers[key] = value;
         }
@@ -232,7 +234,12 @@ export class HttpClientService implements HostedService {
     // Captured here, while still inside the call this request belongs to. By
     // the time the response arrives the pass has long returned, so this is the
     // only moment at which the run that asked for it can still be named.
-    void this.send(target, input, notify, this.host?.currentContext() ?? undefined);
+    void this.send(
+      target,
+      input,
+      notify,
+      this.host?.currentContext() ?? undefined,
+    );
     return null;
   }
 
@@ -256,7 +263,7 @@ export class HttpClientService implements HostedService {
    */
   private targetUrl(): string | null {
     if (this.mount && !parseMountRef(this.mount)) {
-      return this.requestUrl(this.mount);
+      return this.withQuery(this.join(this.mount));
     }
     if (this.mount && parseMountRef(this.mount)) {
       return null;
@@ -264,14 +271,18 @@ export class HttpClientService implements HostedService {
     if (!this.url || parseMountRef(this.url)) {
       return null;
     }
-    return this.requestUrl(this.url);
+    return this.withQuery(this.url);
   }
 
-  /** The address to call: the path joined to the base, then the parameters. */
-  private requestUrl(base: string): string {
-    return this.withQuery(this.join(base));
-  }
-
+  /**
+   * Joins the configured sub-path onto a mount address.
+   *
+   * Only a mount address. A URL is a URL — it carries its own path, and the
+   * field that holds one is the place to write it. `path` exists for the
+   * target whose address is not the board's to write: a mount is assigned by
+   * a runtime and resolved by the coordinator, so naming a sub-path of it
+   * needs a field of its own.
+   */
   private join(base: string): string {
     if (!this.path) {
       return base;
@@ -408,7 +419,11 @@ export class HttpClientService implements HostedService {
     }
 
     if (typeof input === "object") {
-      const mixed = input as { meta?: JsonRecord; body?: unknown; binary?: unknown };
+      const mixed = input as {
+        meta?: JsonRecord;
+        body?: unknown;
+        binary?: unknown;
+      };
       const declared =
         typeof mixed.meta?.contentType === "string"
           ? (mixed.meta.contentType as string)
@@ -421,7 +436,10 @@ export class HttpClientService implements HostedService {
       }
       if (mixed.meta !== undefined && mixed.body !== undefined) {
         return typeof mixed.body === "string"
-          ? { body: mixed.body, contentType: declared ?? "text/plain; charset=utf-8" }
+          ? {
+              body: mixed.body,
+              contentType: declared ?? "text/plain; charset=utf-8",
+            }
           : {
               body: JSON.stringify(mixed.body),
               contentType: declared ?? "application/json",

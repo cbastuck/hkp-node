@@ -440,7 +440,14 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
       allowedHeaders: ["Content-Type", "Authorization"],
     }),
   );
-  expressApp.use(express.json());
+  // Not strict: a JSON `null` is a payload here, and the one that means "no
+  // input". A pipeline is started with it whenever nothing precedes the first
+  // service — a panel's Send button, an external trigger — and the strict
+  // parser rejects a bare `null` before a route sees it, turning that into a
+  // 400. The process routes tell the two apart themselves: no body at all is
+  // `undefined` and refused, `null` runs the pipeline with nothing on its
+  // input. Every other route already checks the shape it needs.
+  expressApp.use(express.json({ strict: false }));
   expressApp.use(authenticator.middleware);
 
   // Mounts are matched before Express so they bypass CORS and the auth

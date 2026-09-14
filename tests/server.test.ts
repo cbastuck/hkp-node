@@ -310,6 +310,53 @@ describe("hkp-node runtime server", () => {
       });
   });
 
+  it("runs with a null payload, which is a run with nothing on the input", async () => {
+    // What the Run entry sends. JSON has no undefined, so `null` is how a
+    // caller says the pipeline starts with nothing — distinct from sending no
+    // body at all, which is a malformed call. A service that answers an empty
+    // input with its own configuration (`http-client` sends its configured
+    // body) depends on the difference.
+    await createRuntime([
+      {
+        serviceId: mapDescriptor.serviceId,
+        uuid: "map-1",
+        state: { mode: "add", template: { ran: "yes" } },
+      },
+    ]);
+
+    await request(server.httpServer)
+      .post("/runtimes/rt-1")
+      .set("content-type", "application/json")
+      .send("null")
+      .expect(200)
+      .expect(({ body }) => {
+        expect(body.ran).toBe("yes");
+      });
+  });
+
+  it("runs from a websocket frame carrying no input", async () => {
+    // The transport a runtime attached in the playground actually uses: the
+    // REST entry point above is the fallback for a socket that is not open.
+    // JSON has no undefined, so `null` is how the frame says "nothing on the
+    // input" — and the key has to be *there*, since a frame without it is a
+    // malformed message rather than a run.
+    const runtime = await createRuntime([
+      { serviceId: monitorDescriptor.serviceId, uuid: "svc-1" },
+    ]);
+
+    // A monitor passes its input through, so the run's result is what the
+    // pipeline started with.
+    expect(await runOverSocket(runtime.outputUrl, null)).toBeNull();
+  });
+
+  it("keeps an empty object a payload of its own over the socket", async () => {
+    const runtime = await createRuntime([
+      { serviceId: monitorDescriptor.serviceId, uuid: "svc-1" },
+    ]);
+
+    expect(await runOverSocket(runtime.outputUrl, {})).toEqual({});
+  });
+
   it("supports sub-service pipelines with append/remove/configure operations", async () => {
     await createRuntime([
       {
@@ -511,6 +558,38 @@ describe("hkp-node runtime server", () => {
     const payload = await innerResponse.json();
     expect(payload).toEqual({ source: "http", path: "/hello", method: "GET" });
   });
+
+  /** Runs a runtime over its output socket and answers with the run's result. */
+  function runOverSocket(outputUrl: string, params: unknown): Promise<unknown> {
+    return new Promise((resolve, reject) => {
+      const socket = new WebSocket(outputUrl);
+      const timeout = setTimeout(() => {
+        socket.close();
+        reject(new Error("Timed out waiting for a result over the socket"));
+      }, 5000);
+
+      socket.on("open", () => {
+        socket.send(JSON.stringify({ type: "readwrite", id: "rt-1" }));
+        socket.send(
+          JSON.stringify({ type: "processRuntime", params, context: null }),
+        );
+      });
+
+      socket.on("message", (raw) => {
+        const message = JSON.parse(raw.toString());
+        if (message.type === "result") {
+          clearTimeout(timeout);
+          socket.close();
+          resolve(message.data);
+        }
+      });
+
+      socket.on("error", (err) => {
+        clearTimeout(timeout);
+        reject(err);
+      });
+    });
+  }
 
   async function createRuntime(services: Array<Record<string, unknown>> = []) {
     const response = await request(server.httpServer)

@@ -101,6 +101,21 @@ describe("processing at one service", () => {
     expect(body.keys).toBeUndefined();
   });
 
+  it("takes a null payload as no input, rather than as a malformed body", async () => {
+    // What a panel's Send button sends: run this service with nothing on its
+    // input. A service that answers an empty input with its own configuration
+    // — `http-client` sends its configured body — is unusable if this is a 400.
+    const server = await serverWith([tag("first", "ran")]);
+
+    const { body } = await request(server.httpServer)
+      .post("/runtimes/rt-1/services/first/process")
+      .set("content-type", "application/json")
+      .send("null")
+      .expect(200);
+
+    expect(body.first).toBe("ran");
+  });
+
   it("says so when there is no such service", async () => {
     const server = await serverWith([tag("first", "ran")]);
 

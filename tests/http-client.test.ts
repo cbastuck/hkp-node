@@ -23,7 +23,11 @@ type Endpoint = {
 
 /** A server that records what it was sent and answers with what it was told to. */
 async function startEndpoint(
-  reply: (path: string) => { status?: number; contentType?: string; body?: Buffer | string },
+  reply: (path: string) => {
+    status?: number;
+    contentType?: string;
+    body?: Buffer | string;
+  },
 ): Promise<Endpoint> {
   const received: Recorded[] = [];
   const server = http.createServer((req, res) => {
@@ -38,8 +42,10 @@ async function startEndpoint(
         body: Buffer.concat(chunks),
       });
       const answer = reply(req.url ?? "");
-      res.writeHead(answer.status ?? 200,
-        answer.contentType ? { "content-type": answer.contentType } : undefined);
+      res.writeHead(
+        answer.status ?? 200,
+        answer.contentType ? { "content-type": answer.contentType } : undefined,
+      );
       res.end(answer.body ?? "");
     });
   });
@@ -66,7 +72,11 @@ function hostSpy() {
     secrets: () => new SecretVault(),
     log: () => {},
     forwardLog: () => {},
-    logSettings: () => ({ logging: false, logData: false, logLevel: "info" as const }),
+    logSettings: () => ({
+      logging: false,
+      logData: false,
+      logLevel: "info" as const,
+    }),
     scope: () => ({ owner: "tester", boardName: "Board" }),
     emitResult: (output) => {
       emitted.push(output);
@@ -150,7 +160,10 @@ describe("http-client target", () => {
   });
 
   it("calls the address once the coordinator hands it over", async () => {
-    const target = await endpoint(() => ({ contentType: "text/plain", body: "live" }));
+    const target = await endpoint(() => ({
+      contentType: "text/plain",
+      body: "live",
+    }));
     const { host, pushed } = hostSpy();
 
     const service = new HttpClientService({
@@ -193,7 +206,10 @@ describe("http-client target", () => {
     // One job each: the reference is what the board says, the address is what
     // this run resolved. Neither overwrites the other, so saving the board
     // writes back the reference rather than an address true of one machine.
-    const target = await endpoint(() => ({ contentType: "text/plain", body: "live" }));
+    const target = await endpoint(() => ({
+      contentType: "text/plain",
+      body: "live",
+    }));
     const { host, pushed } = hostSpy();
 
     const service = new HttpClientService({
@@ -219,8 +235,7 @@ describe("http-client target", () => {
       uuid: "client-1",
       serviceId: "http-client",
       state: {
-        url: target.url,
-        path: "/search",
+        url: `${target.url}/search`,
         // Written as a number or a flag, sent as the text the wire uses — what
         // an editor produces is what a board means.
         query: { q: "a b&c", page: 2, draft: true },
@@ -240,7 +255,10 @@ describe("http-client target", () => {
     const service = new HttpClientService({
       uuid: "client-1",
       serviceId: "http-client",
-      state: { url: target.url, path: "/search?q=written", query: { page: "2" } },
+      state: {
+        url: `${target.url}/search?q=written`,
+        query: { page: "2" },
+      },
     } as any);
     service.setHost(host);
     service.process(undefined, () => {});
@@ -337,7 +355,10 @@ describe("http-client response", () => {
     const target = await endpoint((path) =>
       path === "/json"
         ? { contentType: "application/json", body: '{"n":1}' }
-        : { contentType: "application/octet-stream", body: Buffer.from([1, 2, 3]) },
+        : {
+            contentType: "application/octet-stream",
+            body: Buffer.from([1, 2, 3]),
+          },
     );
 
     const call = async (path: string) => {
@@ -424,13 +445,32 @@ describe("http-client and the shared http-client contract", () => {
     const service = new HttpClientService({
       uuid: "client-1",
       serviceId: "http-client",
-      state: { url: target.url, path: "/plain" },
+      state: { url: `${target.url}/plain` },
     } as any);
     service.setHost(host);
     service.process(undefined, () => {});
     await nextPush(pushed);
 
     expect(target.received[0].path).toBe("/plain");
+  });
+
+  it("ignores path when the target is a typed url", async () => {
+    // `path` is the sub-path of a mount. A url is a whole url and carries its
+    // own path, so appending a second one would call somewhere the board did
+    // not write.
+    const target = await endpoint(() => ({ body: "ok" }));
+    const { host, pushed } = hostSpy();
+
+    const service = new HttpClientService({
+      uuid: "client-1",
+      serviceId: "http-client",
+      state: { url: `${target.url}/written`, path: "/ignored" },
+    } as any);
+    service.setHost(host);
+    service.process(undefined, () => {});
+    await nextPush(pushed);
+
+    expect(target.received[0].path).toBe("/written");
   });
 
   it("lets a mount win over a typed url", async () => {
@@ -522,7 +562,10 @@ describe("http-client notifications", () => {
     // A panel showing one of these has to be able to read the whole outcome off
     // it: which request this was, and that nothing went wrong with it — an
     // omitted error would leave the last failure's reason standing.
-    expect(notifications[0]).toMatchObject({ requesting: true, method: "post" });
+    expect(notifications[0]).toMatchObject({
+      requesting: true,
+      method: "post",
+    });
     const done = notifications.find((n) => n.requesting === false);
     expect(done).toMatchObject({ method: "post", status: 200, error: "" });
   });
