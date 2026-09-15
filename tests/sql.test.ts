@@ -275,3 +275,82 @@ describe("what counts as a parameter", () => {
     });
   });
 });
+
+/**
+ * What a statement hands onward is separate from what it did.
+ *
+ * The case is a board where several statements act on one request in turn — a
+ * booking that may cancel, may insert, and then re-reads the timetable it
+ * changed. Each names its parameters out of the same object, so the first
+ * statement's row count must not become the second one's input: there it would
+ * find none of the names it asked for and bind them all to null.
+ */
+describe("what travels onward", () => {
+  const SCHEMA_BOOKING = `
+    CREATE TABLE IF NOT EXISTS slot (court INTEGER, member TEXT);
+  `;
+
+  it("passes the result on by default", () => {
+    const { service, notify } = serviceWith({
+      mode: "query",
+      statement: "SELECT $court AS court",
+    });
+    expect(service.process({ court: 2 }, notify)).toEqual({
+      rows: [{ court: 2 }],
+      count: 1,
+    });
+  });
+
+  it("passes the input through when asked, so the next statement still sees it", () => {
+    const shared = createMemoryDatabaseStore();
+    const first = serviceWith(
+      {
+        mode: "run",
+        emit: "input",
+        schema: SCHEMA_BOOKING,
+        statement: "INSERT INTO slot (court, member) VALUES ($court, $member)",
+      },
+      shared,
+    );
+    const request = { court: 2, member: "anna@club.example" };
+    const passed = first.service.process(request, first.notify);
+    expect(passed).toBe(request);
+
+    // The second statement is handed what the first was given, and can bind the
+    // same names — which is the whole point of the option.
+    const second = serviceWith(
+      { mode: "query", statement: "SELECT member FROM slot WHERE court = $court" },
+      shared,
+    );
+    expect(second.service.process(passed, second.notify)).toEqual({
+      rows: [{ member: "anna@club.example" }],
+      count: 1,
+    });
+  });
+
+  it("still reports what it did, whatever it passes on", () => {
+    const { service, notify, notifications } = serviceWith(
+      {
+        mode: "run",
+        emit: "input",
+        schema: SCHEMA_BOOKING,
+        statement: "INSERT INTO slot (court, member) VALUES ($court, $member)",
+      },
+      createMemoryDatabaseStore(),
+    );
+    service.process({ court: 1, member: "ben@club.example" }, notify);
+    // A panel showing the row count does not depend on the board passing it on.
+    expect(notifications).toEqual([{ changes: 1, lastInsertRowid: 1 }]);
+  });
+
+  it("reports the choice in its state, so a panel can show it", () => {
+    const { service } = serviceWith({ mode: "run", emit: "input", statement: "SELECT 1" });
+    expect(service.getState().emit).toBe("input");
+  });
+
+  it("ignores an emit it does not know, rather than inventing one", () => {
+    const { service } = serviceWith({ statement: "SELECT 1", emit: "sideways" });
+    expect(service.getState().emit).toBe("result");
+  });
+
+});
