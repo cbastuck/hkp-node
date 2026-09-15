@@ -73,6 +73,7 @@ import {
   textGenerationDescriptor,
 } from "./services/text-generation";
 import { InjectorService, injectorDescriptor } from "./services/injector";
+import { RssService, rssDescriptor } from "./services/rss";
 import {
   contextFromWire,
   HostedRuntime,
@@ -409,6 +410,13 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
       {
         descriptor: injectorDescriptor,
         create: (config, _createService) => new InjectorService(config),
+      },
+    ],
+    [
+      rssDescriptor.serviceId,
+      {
+        descriptor: rssDescriptor,
+        create: (config, _createService) => new RssService(config),
       },
     ],
   ]);
