@@ -32,6 +32,15 @@
  * board writes no parameter list at all. Values are always bound, never
  * interpolated — a subject line containing a quote is a subject line, not a
  * syntax error, and not an injection.
+ *
+ * **What it hands onward is separate from what it did.** By default the result
+ * travels, which is what a service asked a question wants. `emit: "input"`
+ * passes the input through untouched instead, so several statements can act on
+ * one request in turn: each names its parameters out of the same object, and
+ * the last service in the chain still sees what the first was given. Without it
+ * a second statement would be handed the first one's row count and find none of
+ * the parameters it asked for. The result is still reported either way —
+ * what a service says about itself is not what it passes on.
  */
 import {
   HostedService,
@@ -53,6 +62,11 @@ export const sqlDescriptor: ServiceRegistryEntry = {
 type SqlMode = "query" | "run" | "exec";
 
 const MODES: SqlMode[] = ["query", "run", "exec"];
+
+/** Whether the statement's result travels onward, or the input it ran on. */
+type SqlEmit = "result" | "input";
+
+const EMITS: SqlEmit[] = ["result", "input"];
 
 /** `$name`, `:name` and `@name` are all named parameters to SQLite. */
 const NAMED_PARAMETER = /[$:@]([A-Za-z_][A-Za-z0-9_]*)/g;
@@ -118,6 +132,8 @@ export class SqlService implements HostedService {
   private prepared = new Set<string>();
   /** The file this board keeps its tables in. Empty derives one; see docs. */
   private database = "";
+  /** What travels onward: the statement's result, or the input it ran on. */
+  private emit: SqlEmit = "result";
 
   constructor(
     config: ServiceConfiguration,
@@ -136,6 +152,7 @@ export class SqlService implements HostedService {
   getState(): JsonRecord {
     return {
       mode: this.mode,
+      emit: this.emit,
       database: this.database,
       statement: this.statement,
       schema: this.schema,
@@ -147,6 +164,9 @@ export class SqlService implements HostedService {
   configure(config: JsonRecord): JsonRecord {
     if (typeof config.mode === "string" && MODES.includes(config.mode as SqlMode)) {
       this.mode = config.mode as SqlMode;
+    }
+    if (typeof config.emit === "string" && EMITS.includes(config.emit as SqlEmit)) {
+      this.emit = config.emit as SqlEmit;
     }
     if (typeof config.statement === "string") {
       this.statement = config.statement;
@@ -165,7 +185,7 @@ export class SqlService implements HostedService {
   }
 
   /**
-   * Runs the statement and returns what it produced.
+   * Runs the statement and hands onward whatever `emit` says travels.
    *
    * Unlike `store`, this returns rather than pushing: SQLite answers in the
    * same call, so there is nothing to wait for and no reason to stop the
@@ -193,8 +213,11 @@ export class SqlService implements HostedService {
     try {
       const result = this.execute(db, input);
       this.lastError = "";
+      // Reported either way: what the statement did is this service's own news,
+      // and a panel showing it does not depend on the board choosing to pass it
+      // on. Only what travels to the next service is `emit`'s to decide.
       notify(result);
-      return result;
+      return this.emit === "input" ? input : result;
     } catch (err) {
       return this.fail(notify, `${this.mode} failed: ${reason(err)}`);
     }
