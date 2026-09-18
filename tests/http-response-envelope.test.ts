@@ -85,6 +85,25 @@ describe("what a handler answers with", () => {
     expect(await res.json()).toEqual({ error: "no such episode" });
   });
 
+  it("sends the headers it declared", async () => {
+    // A playlist is the case: the type says what it is, and the filename is
+    // what lets the machine opening it hand the file to a media player.
+    const mount = await mountAnswering({
+      meta: {
+        status: 200,
+        contentType: "audio/x-mpegurl; charset=utf-8",
+        headers: { "content-disposition": 'inline; filename="radio.m3u"' },
+      },
+      body: "#EXTM3U\n",
+    });
+
+    const res = await fetch(`${mount}/radio.m3u`);
+
+    expect(res.headers.get("content-type")).toBe("audio/x-mpegurl; charset=utf-8");
+    expect(res.headers.get("content-disposition")).toBe('inline; filename="radio.m3u"');
+    expect(await res.text()).toBe("#EXTM3U\n");
+  });
+
   it("is JSON when nothing said otherwise", async () => {
     // Including an envelope with no status: that is a request passed through,
     // and answering it with the caller's own content type would change what
