@@ -23,6 +23,11 @@
  *   answer. This is the inversion of control the service is built around, and
  *   it is what makes a board able to answer an endpoint at all.
  *
+ * - **In `process_on_data`** neither applies: the document the board handed
+ *   this endpoint is the answer, and the services after it are side effects
+ *   like the ones above. That is what lets a runtime publish more than one
+ *   document — two endpoints in one chain, each answering its own.
+ *
  * Keeping those apart is what makes a nested pipeline worth configuring: having
  * declared a handler, a board author can add services behind this one without
  * silently rewriting an HTTP contract from a distance.
@@ -744,10 +749,19 @@ export class HttpServerSubservicesService implements HostedService {
 
     let output: unknown;
     let processInput: unknown;
-    let answeredBySubservices = false;
+    // Whether the answer is already decided here, or is whatever the rest of
+    // the outer chain makes of what this service emitted.
+    let answeredHere = false;
     if (this.mode === "process_on_data") {
       processInput = this.latestData;
       output = processInput;
+      // The mode's whole contract: what the board handed this endpoint is what
+      // a caller gets back, verbatim. The services after it still run — having
+      // served a request is something a board may want to act on — but what
+      // they make of it is theirs, not the answer. Letting the chain's tail
+      // answer instead would mean an endpoint could only ever be the last
+      // service in its runtime, so a runtime could publish only one document.
+      answeredHere = true;
     } else {
       let request: MixedRequest;
       try {
@@ -762,7 +776,7 @@ export class HttpServerSubservicesService implements HostedService {
         throw error;
       }
       processInput = request;
-      answeredBySubservices = this.hasSubservices();
+      answeredHere = this.hasSubservices();
       output = await this.processSessionInput(processInput, runContext);
     }
 
@@ -780,7 +794,7 @@ export class HttpServerSubservicesService implements HostedService {
       this.host.emitResult(output);
     }
 
-    this.sendAnswer(req, res, answeredBySubservices ? answer : output);
+    this.sendAnswer(req, res, answeredHere ? answer : output);
   }
 
   /**
