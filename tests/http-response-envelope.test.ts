@@ -122,3 +122,66 @@ describe("what a handler answers with", () => {
     });
   });
 });
+
+describe("an endpoint serving what the board handed it", () => {
+  /** A runtime whose chain is: map → endpoint → map. */
+  async function servedByChain(): Promise<{ mount: string; stop: () => Promise<void> }> {
+    const server = createRuntimeServer({ externalHost: "127.0.0.1", auth: { mode: "none" } });
+    servers.push(server);
+    await server.start();
+
+    await request(server.httpServer)
+      .post("/runtimes")
+      .send({
+        id: "rt-1",
+        name: "Node",
+        services: [
+          {
+            serviceId: "map",
+            uuid: "doc",
+            state: {
+              mode: "replace",
+              template: { meta: { status: 200, contentType: "text/plain" }, body: "the document" },
+            },
+          },
+          {
+            serviceId: httpServerSubservicesDescriptor.serviceId,
+            uuid: "http-1",
+            state: { bypass: false, mode: "process_on_data", pipeline: [] },
+          },
+          // Whatever a board does after serving — here, something that would be
+          // a perfectly good answer if answers were taken from the chain's tail.
+          {
+            serviceId: "map",
+            uuid: "after",
+            state: {
+              mode: "replace",
+              template: { meta: { status: 200, contentType: "text/plain" }, body: "something else" },
+            },
+          },
+        ],
+      })
+      .expect(200);
+
+    await request(server.httpServer)
+      .post("/runtimes/rt-1/services/doc/process")
+      .send({})
+      .expect(200);
+
+    const { body } = await request(server.httpServer)
+      .get("/runtimes/rt-1/services/http-1")
+      .expect(200);
+    return { mount: body.__hkpMount as string, stop: () => server.stop() };
+  }
+
+  it("answers its own document, not what the services after it make of it", async () => {
+    // Otherwise an endpoint could only ever be last in its runtime, and a
+    // runtime could publish exactly one document.
+    const { mount } = await servedByChain();
+
+    const res = await fetch(mount);
+
+    expect(await res.text()).toBe("the document");
+    expect(res.headers.get("content-type")).toBe("text/plain");
+  });
+});
