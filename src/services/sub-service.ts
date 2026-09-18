@@ -13,6 +13,7 @@
 import { randomUUID } from "node:crypto";
 
 import { childRun, HostedRuntime } from "../runtime";
+import { MOUNT_FIELD, collectMountRefs } from "../coordinator/mount";
 import {
   HostedService,
   JsonRecord,
@@ -160,6 +161,17 @@ export class SubService implements HostedService {
       return this.getState();
     }
 
+    // An address handed to a service that holds a pipeline is handed on to the
+    // services inside it. The board's coordinator resolves a mount reference
+    // wherever it appears in a service's state — a nested pipeline included —
+    // but configures the *service* it found it on, which for a nested consumer
+    // is this one. Passing it down is what makes a mount callable from inside a
+    // pipeline at all, and it is the same inheritance the nested runtime
+    // already gets for secrets, scope and log settings.
+    if (typeof config[MOUNT_FIELD] === "string" && config[MOUNT_FIELD]) {
+      this.handDownMount(config[MOUNT_FIELD] as string);
+    }
+
     if (isJsonRecord(config.configureService)) {
       const payload = config.configureService;
       if (
@@ -218,6 +230,31 @@ export class SubService implements HostedService {
     // mounts — and nothing else will ever reach them once this service is gone.
     this.pipeline?.destroy();
     this.pipeline = null;
+  }
+
+  /**
+   * Gives an address to the nested services that named a mount.
+   *
+   * Only those that named one: a nested service holding no reference is calling
+   * something it already has an address for, and must not be repointed at
+   * whatever this service was told about. A reference that has been resolved
+   * once keeps its own field, so this stays idempotent — `__hkpMount` is what
+   * the run produced and the reference is what the board says.
+   */
+  private handDownMount(url: string): void {
+    if (!this.pipeline) {
+      return;
+    }
+    for (const service of this.pipeline.listServices()) {
+      if (collectMountRefs(service.state).size === 0) {
+        continue;
+      }
+      if (service.state?.[MOUNT_FIELD] === url) {
+        continue;
+      }
+      this.pipeline.configureService(service.uuid, { [MOUNT_FIELD]: url });
+    }
+    this.syncStates();
   }
 
   private syncStates(): void {

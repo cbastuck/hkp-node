@@ -4,7 +4,8 @@
  * Service Name: Map
  * Runtime: hkp-node
  * Modes: replace | add | overwrite | sensingMode
- * Key Config: template, mode, arrayMode, sensingMode
+ * Key Config: template, mode, arrayMode, sensingMode, __hkpMount (an address
+ *             this template mentions)
  * IO: in=object|array|scalar -> out=mapped payload
  * Arrays: maps each element (arrayMode "single" maps the array as a whole)
  * Binary: not intended for raw binary
@@ -20,6 +21,12 @@
  * tell an author whether a template is valid without knowing where it will
  * run. What a term may reach is bounded there rather than here — see
  * `expression.ts`.
+ *
+ * A `hkp-mount://` value anywhere in what a template produces becomes the
+ * address it names. That is what lets a board *mention* an endpoint it cannot
+ * write down — an enclosure URL in a feed, a link somebody is handed — as
+ * against dialling one, which `http-client` already does with the same
+ * reference in the field it calls.
  */
 import {
   HostedService,
@@ -29,6 +36,11 @@ import {
   ServiceRegistryEntry,
 } from "../types";
 import { CompiledExpression, compileExpression } from "./expression";
+import {
+  MOUNT_FIELD,
+  parseMountRef,
+  substituteMounts,
+} from "../coordinator/mount";
 
 export const mapDescriptor: ServiceRegistryEntry = {
   serviceId: "map",
@@ -91,6 +103,17 @@ export class MapService implements HostedService {
   private properties: Record<string, unknown> = {};
   private structuredTemplate: TemplateNode | undefined;
   private host: RuntimeHost | undefined;
+  /**
+   * The address a mount reference in this template resolves to.
+   *
+   * A board that has to *mention* an endpoint — an enclosure URL in a feed, a
+   * link somebody scans, an address handed to a caller — cannot write one down:
+   * it is assigned when the board loads. `http-client` already takes a
+   * reference in the field it dials; this is the same thing for a service that
+   * only carries the address somewhere. Reserved name: the coordinator writes
+   * it, nobody authors it.
+   */
+  private mount = "";
 
   constructor(config: ServiceConfiguration) {
     this.uuid = config.uuid;
@@ -133,6 +156,11 @@ export class MapService implements HostedService {
       this.updateSensingMode(config.sensingMode);
     }
 
+    if (typeof config[MOUNT_FIELD] === "string") {
+      this.mount = config[MOUNT_FIELD] as string;
+      this.notify({ [MOUNT_FIELD]: this.mount });
+    }
+
     if (isJsonRecord(config.command)) {
       void this.runCommand(config.command).catch((err) =>
         this.host?.log("error", "service.failed", {
@@ -150,6 +178,7 @@ export class MapService implements HostedService {
       arrayMode: this.state.arrayMode,
       template: deepCopy(this.state.template),
       sensingMode: this.state.sensingMode,
+      [MOUNT_FIELD]: this.mount,
     };
   }
 
@@ -167,7 +196,7 @@ export class MapService implements HostedService {
     }
 
     if (this.state.arrayMode !== "single" && Array.isArray(input)) {
-      return input.map((entry) => this.mapper(entry));
+      return this.addressed(input.map((entry) => this.mapper(entry)));
     }
 
     if (
@@ -178,10 +207,31 @@ export class MapService implements HostedService {
       return this.state.mode === "replace" ? {} : input;
     }
 
-    return this.mapper(input);
+    return this.addressed(this.mapper(input));
   }
 
   // ── Private ────────────────────────────────────────────────────────────────
+
+  /**
+   * Replaces a mount reference in what was produced with the address it names.
+   *
+   * Applied to the output rather than to the template, so it covers a reference
+   * written as a static value and one an expression produced, and so a template
+   * still reads as what the board author wrote.
+   *
+   * An unresolved reference is left as it stands — the same choice a unit
+   * parameter makes. The owner has not published yet, and a value that says
+   * `hkp-mount://…` is visibly not an address, where an empty string would look
+   * like a field nobody filled in.
+   */
+  private addressed<T>(value: T): T {
+    if (!this.mount || parseMountRef(this.mount)) {
+      return value;
+    }
+    return substituteMounts(value, (ref) =>
+      parseMountRef(ref) ? this.mount : ref,
+    );
+  }
 
   private mapper(input: unknown): unknown {
     try {

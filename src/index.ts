@@ -83,6 +83,13 @@ async function main() {
     // are: HKP_DB_DIR="" keeps them in memory instead.
     database:
       process.env.HKP_DB_DIR ?? path.join(os.homedir(), ".hkp", "node", "db"),
+    // Where the bytes a board keeps are written. Persisted for the same reason,
+    // and a real directory rather than a derived one all the way down: what is
+    // here is meant to be findable, copyable and servable by its owner.
+    // HKP_FILES_DIR="" keeps them in memory instead.
+    files:
+      process.env.HKP_FILES_DIR ??
+      path.join(os.homedir(), ".hkp", "node", "files"),
     quotas: {
       maxRuntimesPerUser: readInteger(process.env.HKP_MAX_RUNTIMES_PER_USER, 0),
       maxServicesPerRuntime: readInteger(

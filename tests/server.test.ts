@@ -19,6 +19,8 @@ import { holdDescriptor } from "../src/services/hold";
 import { textGenerationDescriptor } from "../src/services/text-generation";
 import { storeDescriptor } from "../src/services/store";
 import { sqlDescriptor } from "../src/services/sql";
+import { filesystemDescriptor } from "../src/services/filesystem";
+import { storageDescriptor } from "../src/services/storage";
 import { conversationsDescriptor } from "../src/services/conversations";
 import { queueDescriptor } from "../src/services/queue";
 import { iteratorDescriptor } from "../src/services/iterator";
@@ -76,6 +78,8 @@ describe("hkp-node runtime server", () => {
       textGenerationDescriptor,
       storeDescriptor,
       sqlDescriptor,
+      filesystemDescriptor,
+      storageDescriptor,
       conversationsDescriptor,
       queueDescriptor,
       documentExtractDescriptor,

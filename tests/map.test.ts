@@ -65,3 +65,71 @@ describe("a template a board wrote", () => {
     expect(svc.process({ n: 21 }, () => {})).toEqual({ doubled: 42 });
   });
 });
+
+/**
+ * An address a board mentions rather than dials.
+ *
+ * A feed's enclosure URL is the case: it points at an endpoint whose address is
+ * assigned when the board loads, so the board can only name the service and let
+ * the coordinator say where it ended up.
+ */
+describe("map and a mount reference", () => {
+  const mapWith = (state: Record<string, unknown>) => {
+    const service = new MapService({
+      uuid: "map-1",
+      serviceId: "map",
+      state,
+    } as never);
+    return service;
+  };
+
+  it("becomes the address once the coordinator hands one over", () => {
+    const service = mapWith({
+      mode: "replace",
+      template: { base: "hkp-mount://library/listen" },
+    });
+
+    service.configure({ __hkpMount: "http://host:8080/hosted/abc" });
+
+    expect(service.process({}, () => {})).toEqual({
+      base: "http://host:8080/hosted/abc",
+    });
+  });
+
+  it("covers a reference an expression produced, not only a written one", () => {
+    const service = mapWith({
+      mode: "replace",
+      template: { "base=": "params.target" },
+      __hkpMount: "http://host:8080/hosted/abc",
+    });
+
+    expect(service.process({ target: "hkp-mount://library/listen" }, () => {})).toEqual({
+      base: "http://host:8080/hosted/abc",
+    });
+  });
+
+  it("leaves a reference alone while nothing has been published", () => {
+    // Visibly not an address beats an empty field that looks unfilled.
+    const service = mapWith({
+      mode: "replace",
+      template: { base: "hkp-mount://library/listen" },
+    });
+
+    expect(service.process({}, () => {})).toEqual({
+      base: "hkp-mount://library/listen",
+    });
+  });
+
+  it("leaves everything that is not a reference exactly as it was", () => {
+    const service = mapWith({
+      mode: "replace",
+      template: { url: "https://example.test/feed.xml", n: 3 },
+      __hkpMount: "http://host:8080/hosted/abc",
+    });
+
+    expect(service.process({}, () => {})).toEqual({
+      url: "https://example.test/feed.xml",
+      n: 3,
+    });
+  });
+});

@@ -4,8 +4,8 @@
  * Service Name: RSS
  * Runtime: hkp-node
  * Modes: none
- * Key Config: feeds, limit, timeoutMs, summaryChars; addFeed/removeFeed/refresh
- *             as commands
+ * Key Config: feeds, limit, timeoutMs, summaryChars, __hkpMount (a feed named
+ *             by reference); addFeed/removeFeed/refresh as commands
  * IO: in=any (ignored, a trigger) -> out=null immediately; the merged article
  *     list is pushed through the rest of the pipeline when the feeds answer
  * Arrays: emits an array of articles
@@ -40,6 +40,7 @@ import {
   ServiceRegistryEntry,
 } from "../types";
 import { FeedItem, parseFeed } from "./rss-parse";
+import { MOUNT_FIELD, parseMountRef } from "../coordinator/mount";
 
 export const rssDescriptor: ServiceRegistryEntry = {
   serviceId: "rss",
@@ -113,6 +114,16 @@ export class RssService implements HostedService {
   private timeoutMs = DEFAULT_TIMEOUT_MS;
   private summaryChars = DEFAULT_SUMMARY_CHARS;
   private fetching = false;
+  /**
+   * The address a feed named by reference resolves to.
+   *
+   * A feed on this board rather than out on the web — one unit publishing what
+   * another reads — has no address until the board loads, so it is named the
+   * way every other endpoint is and resolved by the coordinator. One address,
+   * so one feed of a list may be a reference; the rest are URLs, which is what
+   * they are anyway.
+   */
+  private mount = "";
 
   constructor(config: ServiceConfiguration) {
     this.uuid = config.uuid;
@@ -123,6 +134,17 @@ export class RssService implements HostedService {
 
   setHost(host: RuntimeHost): void {
     this.host = host;
+  }
+
+  /**
+   * The address a feed's url stands for: itself when it is a URL, the resolved
+   * mount when it is a reference, and nothing while a reference is unresolved.
+   */
+  private addressOf(url: string): string | null {
+    if (!parseMountRef(url)) {
+      return url;
+    }
+    return this.mount && !parseMountRef(this.mount) ? this.mount : null;
   }
 
   /**
@@ -141,6 +163,7 @@ export class RssService implements HostedService {
       timeoutMs: this.timeoutMs,
       summaryChars: this.summaryChars,
       fetching: this.fetching,
+      [MOUNT_FIELD]: this.mount,
     };
   }
 
@@ -186,6 +209,10 @@ export class RssService implements HostedService {
     // a remote runtime has no local instance for its UI to call, so configure
     // is the only verb that reaches it. Same work either way — Injector's
     // `inject` is the same arrangement for the same reason.
+    if (typeof config[MOUNT_FIELD] === "string") {
+      this.mount = config[MOUNT_FIELD] as string;
+    }
+
     if (config.refresh) {
       this.start((payload) => this._notify(payload as JsonRecord));
     }
@@ -273,10 +300,18 @@ export class RssService implements HostedService {
   private async readFeed(
     feed: Feed,
   ): Promise<{ feed: Feed; articles: Article[]; error?: string }> {
+    const address = this.addressOf(feed.url);
+    if (!address) {
+      // A reference nobody has published yet: the unit that serves this feed is
+      // still coming up. Not an error to act on, and not a URL to dial — the
+      // next round tries again, by which time the coordinator has usually
+      // handed the address over.
+      return { feed, articles: [], error: `Waiting for ${feed.url}` };
+    }
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);
     try {
-      const response = await fetch(feed.url, {
+      const response = await fetch(address, {
         headers: {
           accept:
             "application/rss+xml, application/atom+xml, application/xml, text/xml;q=0.9, */*;q=0.8",

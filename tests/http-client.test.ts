@@ -284,6 +284,60 @@ describe("http-client target", () => {
   });
 });
 
+/**
+ * Where a call goes can come from the pipeline, not only from configuration.
+ *
+ * One service calling a different address per item is the case: an episode
+ * written to its own path, a record fetched by its own id. The alternative is
+ * a service per address.
+ */
+describe("http-client and a request that says where it is going", () => {
+  it("takes the mount sub-path from the input's meta", async () => {
+    const target = await endpoint(() => ({ body: "{}" }));
+    const { host, pushed } = hostSpy();
+
+    const service = new HttpClientService({
+      uuid: "client-1",
+      serviceId: "http-client",
+      state: { __hkpMount: target.url, path: "/configured", method: "put" },
+    } as any);
+    service.setHost(host);
+
+    service.process(
+      {
+        meta: { path: "/episodes/one.mp3", contentType: "audio/mpeg" },
+        binary: new Uint8Array([1, 2, 3]),
+      },
+      () => {},
+    );
+    await nextPush(pushed);
+
+    expect(target.received[0].path).toBe("/episodes/one.mp3");
+    expect(target.received[0].method).toBe("PUT");
+    expect(target.received[0].contentType).toBe("audio/mpeg");
+    expect([...target.received[0].body]).toEqual([1, 2, 3]);
+  });
+
+  it("takes the method too, and leaves what the input did not say", async () => {
+    const target = await endpoint(() => ({ body: "{}" }));
+    const { host, pushed } = hostSpy();
+
+    const service = new HttpClientService({
+      uuid: "client-1",
+      serviceId: "http-client",
+      state: { __hkpMount: target.url, path: "/configured", method: "get" },
+    } as any);
+    service.setHost(host);
+
+    service.process({ meta: { method: "delete" }, body: {} }, () => {});
+    await nextPush(pushed);
+
+    expect(target.received[0].method).toBe("DELETE");
+    // Unsaid, so still the configured one.
+    expect(target.received[0].path).toBe("/configured");
+  });
+});
+
 describe("http-client request body", () => {
   it("sends a string as text and an object as JSON", async () => {
     const target = await endpoint(() => ({ body: "ok" }));
