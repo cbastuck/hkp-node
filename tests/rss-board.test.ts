@@ -28,11 +28,39 @@ const BOARD = path.join(
 
 type Service = { uuid: string; serviceId: string; state: Record<string, any> };
 
-type Board = { services: Record<string, Service[]> };
+type Board = {
+  services: Record<string, Service[]>;
+  unit?: { params?: Record<string, string> };
+};
 
 const board = JSON.parse(fs.readFileSync(BOARD, "utf8")) as Board;
 
-const services = board.services.node;
+/**
+ * The board as it runs, not as it is written.
+ *
+ * It is a unit, so its own `unit.params` are substituted into it when it is
+ * loaded — alone or composed. A test reading the file has to do the same, or it
+ * runs statements naming a database called `{{param.database}}`.
+ */
+function withParams<T>(value: T, params: Record<string, string>): T {
+  if (typeof value === "string") {
+    return value.replace(
+      /\{\{\s*param\.([A-Za-z0-9_.-]+)\s*\}\}/g,
+      (whole, name: string) => params[name] ?? whole,
+    ) as unknown as T;
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => withParams(item, params)) as unknown as T;
+  }
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [key, withParams(item, params)]),
+    ) as T;
+  }
+  return value;
+}
+
+const services = withParams(board.services.node, board.unit?.params ?? {});
 
 function statementOf(uuid: string): Service {
   const svc = services.find((service) => service.uuid === uuid);

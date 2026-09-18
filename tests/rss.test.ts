@@ -276,6 +276,9 @@ describe("RssService", () => {
     await nextPush(pushed);
 
     expect(Object.keys(svc.getState()).sort()).toEqual([
+      // The address a feed named by reference resolved to; a runtime fact
+      // rather than an article.
+      "__hkpMount",
       "feeds",
       "fetching",
       "limit",
@@ -300,5 +303,39 @@ describe("RssService", () => {
       fetching: false,
       error: "No feeds configured",
     });
+  });
+});
+
+/**
+ * A feed on this board rather than out on the web.
+ *
+ * One unit publishing what another reads has no address until the board loads,
+ * so the feed is named the way every other endpoint is.
+ */
+describe("RssService and a feed named by reference", () => {
+  it("reads the address the coordinator resolved", async () => {
+    const server = await feedServer(() => ({ body: RSS_2 }));
+    const { svc, notify, pushed } = service({
+      feeds: ["hkp-mount://reader/list"],
+      __hkpMount: `${server.url}/rss`,
+    });
+
+    svc.process(undefined, notify);
+    const items = await nextPush(pushed);
+
+    expect(items).toHaveLength(2);
+  });
+
+  it("waits, rather than dialling a reference, while nothing is published", async () => {
+    const { svc, notify, notified, pushed } = service({
+      feeds: ["hkp-mount://reader/list"],
+    });
+
+    svc.process(undefined, notify);
+    await nextPush(pushed);
+
+    const round = notified.at(-1) as any;
+    expect(round.items).toEqual([]);
+    expect(round.errors[0].error).toMatch(/Waiting for/);
   });
 });

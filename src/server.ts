@@ -52,6 +52,13 @@ import {
   createMemoryRecordStore,
   RecordStore,
 } from "./services/recordStore";
+import {
+  FileStore,
+  createDiskFileStore,
+  createMemoryFileStore,
+} from "./services/fileStore";
+import { FilesystemService, filesystemDescriptor } from "./services/filesystem";
+import { StorageService, storageDescriptor } from "./services/storage";
 import { StoreService, storeDescriptor } from "./services/store";
 import { SqlService, sqlDescriptor } from "./services/sql";
 import { QueueService, queueDescriptor } from "./services/queue";
@@ -153,6 +160,12 @@ type CreateRuntimeServerOptions = {
    */
   database?: string;
   /**
+   * Where `filesystem` keeps the files boards write, or a store to use as
+   * given. Absent or empty means memory, as with the two stores above — bytes
+   * a runtime was not told where to put outlive nothing.
+   */
+  files?: FileStore | string;
+  /**
    * Keys the derivation of public mount addresses; see MountRegistry.
    *
    * Absent draws one per process, so endpoints work but change on restart.
@@ -229,6 +242,15 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
         ? createFileRecordStore(options.recordStore)
         : createMemoryRecordStore()
       : (options.recordStore ?? createMemoryRecordStore());
+
+  // Files follow records and databases: one store for the server, scoped per
+  // call, and an empty path saying "keep nothing on disk".
+  const files: FileStore =
+    typeof options.files === "string"
+      ? options.files
+        ? createDiskFileStore(options.files)
+        : createMemoryFileStore()
+      : (options.files ?? createMemoryFileStore());
 
   /** True when adding one more to `count` would pass the limit (0/unset = no limit). */
   function atQuota(count: number, limit: number | undefined): boolean {
@@ -381,6 +403,20 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
       {
         descriptor: sqlDescriptor,
         create: (config, _createService) => new SqlService(config, databases),
+      },
+    ],
+    [
+      filesystemDescriptor.serviceId,
+      {
+        descriptor: filesystemDescriptor,
+        create: (config, _createService) => new FilesystemService(config, files),
+      },
+    ],
+    [
+      storageDescriptor.serviceId,
+      {
+        descriptor: storageDescriptor,
+        create: (config, createService) => new StorageService(config, createService),
       },
     ],
     [

@@ -6,7 +6,8 @@
  * Modes: none (method is configuration, not a mode)
  * Key Config: url, __hkpMount (target), path, query, method, headers, userAgent,
  *             body
- * IO: in=body to send (string | object | bytes | {meta, body|binary})
+ * IO: in=body to send (string | object | bytes | {meta, body|binary}), whose
+ *     meta may also say the method and the mount sub-path to call
  *     out=null immediately; the response is pushed through the rest of the
  *     pipeline when it arrives, shaped {meta, body?, binary?}
  *
@@ -90,6 +91,38 @@ function headerRecord(headers: Headers): JsonRecord {
 }
 
 type RequestBody = { body: BodyInit | Uint8Array; contentType?: string } | null;
+
+/**
+ * What the input says about where it is going, as against what it carries.
+ *
+ * `path` and `method` are configuration, which is right for a service that
+ * calls one endpoint over and over. It is not enough for one that calls a
+ * different address per item — an episode written to its own path, a record
+ * fetched by its own id — and the alternative is a service per address.
+ *
+ * So a request envelope may say: `{meta: {method, path}, binary | body}`, the
+ * mirror of the response envelope this service already reports and the same
+ * shape `http-server-subservices` hands its pipeline. What is unsaid stays as
+ * configured, so a board that names neither is unaffected.
+ *
+ * `path` is a sub-path of a mount, exactly as the configured field is — a typed
+ * URL carries its own path and is not rewritten from a distance.
+ */
+function requestMeta(input: unknown): { path?: string; method?: string } {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    return {};
+  }
+  const meta = (input as { meta?: JsonRecord }).meta;
+  if (!meta || typeof meta !== "object" || Array.isArray(meta)) {
+    return {};
+  }
+  return {
+    ...(typeof meta.path === "string" && meta.path ? { path: meta.path } : {}),
+    ...(typeof meta.method === "string" && meta.method
+      ? { method: meta.method }
+      : {}),
+  };
+}
 
 export class HttpClientService implements HostedService {
   readonly serviceId = httpClientDescriptor.serviceId;
@@ -215,7 +248,8 @@ export class HttpClientService implements HostedService {
       return input;
     }
 
-    const target = this.targetUrl();
+    const request = requestMeta(input);
+    const target = this.targetUrl(request.path);
     if (!target) {
       // Either nothing is configured, or the mount's owner has not published an
       // address yet. Say so and stop; the next input tries again, by which time
@@ -239,6 +273,7 @@ export class HttpClientService implements HostedService {
       input,
       notify,
       this.host?.currentContext() ?? undefined,
+      request.method,
     );
     return null;
   }
@@ -261,9 +296,9 @@ export class HttpClientService implements HostedService {
    * back past it would silently call something else. Boards written before the
    * split put the reference in `__hkpMount`; both read the same way.
    */
-  private targetUrl(): string | null {
+  private targetUrl(path?: string): string | null {
     if (this.mount && !parseMountRef(this.mount)) {
-      return this.withQuery(this.join(this.mount));
+      return this.withQuery(this.join(this.mount, path));
     }
     if (this.mount && parseMountRef(this.mount)) {
       return null;
@@ -283,12 +318,12 @@ export class HttpClientService implements HostedService {
    * a runtime and resolved by the coordinator, so naming a sub-path of it
    * needs a field of its own.
    */
-  private join(base: string): string {
-    if (!this.path) {
+  private join(base: string, path = this.path): string {
+    if (!path) {
       return base;
     }
     const stem = base.endsWith("/") ? base.slice(0, -1) : base;
-    const suffix = this.path.startsWith("/") ? this.path : `/${this.path}`;
+    const suffix = path.startsWith("/") ? path : `/${path}`;
     return `${stem}${suffix}`;
   }
 
@@ -312,13 +347,15 @@ export class HttpClientService implements HostedService {
     input: unknown,
     notify: (payload: unknown, instanceId?: string) => void,
     context?: ProcessContext,
+    requestMethod?: string,
   ): Promise<void> {
+    const method = requestMethod ?? this.method;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);
     this.inFlight += 1;
     notify({
       requesting: true,
-      method: this.method,
+      method,
       url,
       inFlight: this.inFlight,
     });
@@ -337,7 +374,7 @@ export class HttpClientService implements HostedService {
       if (problem) {
         notify({
           requesting: false,
-          method: this.method,
+          method,
           url,
           status: 0,
           error: problem,
@@ -354,7 +391,7 @@ export class HttpClientService implements HostedService {
       }
 
       const response = await fetch(url, {
-        method: this.method.toUpperCase(),
+        method: method.toUpperCase(),
         headers,
         // Node's fetch takes a Uint8Array body; the DOM lib's BodyInit, which
         // these types come from, only admits the browser's set.
@@ -365,7 +402,7 @@ export class HttpClientService implements HostedService {
       const result = await this.readResponse(url, response);
       notify({
         requesting: false,
-        method: this.method,
+        method,
         url,
         status: response.status,
         // Said on every outcome, so what a panel shows is this request's and
@@ -380,7 +417,7 @@ export class HttpClientService implements HostedService {
       // request before this stops standing as if it were this one's.
       notify({
         requesting: false,
-        method: this.method,
+        method,
         url,
         status: 0,
         error: message,

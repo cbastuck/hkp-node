@@ -26,6 +26,19 @@
  * Keeping those apart is what makes a nested pipeline worth configuring: having
  * declared a handler, a board author can add services behind this one without
  * silently rewriting an HTTP contract from a distance.
+ *
+ * **What the handler answers with is the envelope, read backwards.** A value
+ * carrying `meta.status` beside `body` or `binary` sets the status, the content
+ * type and the headers — the status being what distinguishes an answer from a
+ * request passed through unchanged, which is the same shape. Anything else is
+ * answered by its own type, which is JSON for everything a board returned
+ * before this existed. That is what lets one board
+ * serve a feed as XML and the next serve an audio file as audio — without which
+ * an endpoint can only ever say `application/json`, whatever it is holding.
+ *
+ * Byte answers are seekable: `Range` is honoured against the bytes the handler
+ * produced, because a player dragging a scrubber asks for one and a server that
+ * ignores it re-sends the whole file each time.
  */
 import { IncomingMessage, ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
@@ -151,6 +164,185 @@ function filenameFromDisposition(
   }
   const match = disposition.match(/filename\*?=(?:UTF-8'')?"?([^";]+)"?/i);
   return match ? decodeURIComponent(match[1]) : undefined;
+}
+
+/**
+ * What a pipeline may answer with, as against what it was given.
+ *
+ * The same envelope a request arrives in — `meta` beside `body` or `binary` —
+ * read in the other direction, which is also the shape `http-client` hands back
+ * for a call it made. So a board that proxies one endpoint to another passes
+ * the response along untouched, and a board that builds one writes the shape it
+ * already reads.
+ *
+ * Without an envelope the answer is JSON, which is what every board written
+ * before this got and still gets. The single exception is raw bytes, which are
+ * sent as bytes: JSON encoding them produced an object of numbered keys, and no
+ * board wanted that.
+ */
+type MixedResponse = {
+  meta?: JsonRecord;
+  binary?: Uint8Array;
+  body?: unknown;
+};
+
+/** A response, reduced to the three things writing one needs. */
+type Answer = {
+  status: number;
+  headers: JsonRecord;
+  /** The bytes to send; text and JSON are encoded before they get here. */
+  payload: Uint8Array;
+};
+
+function isBytes(value: unknown): value is Uint8Array {
+  return value instanceof Uint8Array;
+}
+
+/**
+ * Reads a value as a response envelope, or returns null when it is not one.
+ *
+ * **A status is what tells the two apart.** A request envelope and a response
+ * envelope are the same shape, and a pipeline that passes its input through
+ * returns the request — so reading any `meta` as a response would answer the
+ * caller with the content type they sent, and silently change what every board
+ * written before this did. A request has no status and a response always has
+ * one, which makes `meta.status` the one field that cannot be a coincidence.
+ *
+ * It is also what a proxied answer already carries: `http-client` reports a
+ * response as `{meta: {status, headers, contentType}, …}`, so a board that
+ * calls one endpoint and answers with what it got does nothing special.
+ */
+function asResponseEnvelope(value: unknown): MixedResponse | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  const candidate = value as MixedResponse;
+  const meta = candidate.meta;
+  if (!meta || typeof meta !== "object" || Array.isArray(meta)) {
+    return null;
+  }
+  if (typeof meta.status !== "number") {
+    return null;
+  }
+  const carries = "binary" in candidate || "body" in candidate;
+  return carries ? candidate : null;
+}
+
+/** Header map from an envelope's `meta.headers`, names lower-cased. */
+function envelopeHeaders(meta: JsonRecord): JsonRecord {
+  const declared = meta.headers;
+  if (!declared || typeof declared !== "object" || Array.isArray(declared)) {
+    return {};
+  }
+  const headers: JsonRecord = {};
+  for (const [name, value] of Object.entries(declared as JsonRecord)) {
+    if (value !== null && value !== undefined) {
+      headers[name.toLowerCase()] = String(value);
+    }
+  }
+  return headers;
+}
+
+/**
+ * The answer a value stands for: an envelope's status, headers and payload, or
+ * the type-led default for a bare value.
+ */
+function toAnswer(value: unknown): Answer {
+  const envelope = asResponseEnvelope(value);
+  if (envelope) {
+    const meta = envelope.meta ?? {};
+    const headers = envelopeHeaders(meta);
+    const status = typeof meta.status === "number" ? meta.status : 200;
+    const declaredType =
+      typeof meta.contentType === "string" ? meta.contentType : undefined;
+
+    if (isBytes(envelope.binary)) {
+      headers["content-type"] =
+        declaredType ?? headers["content-type"] ?? "application/octet-stream";
+      return { status, headers, payload: envelope.binary };
+    }
+
+    const body = envelope.body;
+    if (typeof body === "string") {
+      headers["content-type"] =
+        declaredType ?? headers["content-type"] ?? "text/plain; charset=utf-8";
+      return {
+        status,
+        headers,
+        payload: new Uint8Array(Buffer.from(body, "utf8")),
+      };
+    }
+
+    headers["content-type"] =
+      declaredType ?? headers["content-type"] ?? "application/json";
+    return {
+      status,
+      headers,
+      payload: new Uint8Array(Buffer.from(JSON.stringify(body ?? null), "utf8")),
+    };
+  }
+
+  // Bytes are the one value whose own type says what to do with it: JSON
+  // encoding a Uint8Array produces an object of numbered keys, which is nothing
+  // anybody asked for. Everything else stays JSON, including a bare string —
+  // that is what a board serving a held value already answers with, and a board
+  // that means text says so in an envelope.
+  if (isBytes(value)) {
+    return {
+      status: 200,
+      headers: { "content-type": "application/octet-stream" },
+      payload: value,
+    };
+  }
+
+  return {
+    status: 200,
+    headers: { "content-type": "application/json" },
+    payload: new Uint8Array(Buffer.from(JSON.stringify(value ?? null), "utf8")),
+  };
+}
+
+/**
+ * The range a `Range: bytes=…` header asks for, clamped to what there is, or
+ * null when the header asks for nothing this can serve — no header, a unit
+ * other than bytes, more than one range, or a start past the end.
+ *
+ * A player seeking inside an audio file sends one of these, and a server that
+ * ignores it answers the whole file every time somebody drags the scrubber.
+ * Slicing an answer already in hand is the whole of it: the pipeline produced
+ * the bytes, and which of them travel is the server's business.
+ */
+function requestedRange(
+  value: string | undefined,
+  length: number,
+): { start: number; end: number } | null {
+  if (!value) {
+    return null;
+  }
+  const match = value.match(/^bytes=(\d*)-(\d*)$/);
+  if (!match) {
+    return null;
+  }
+  const [, rawStart, rawEnd] = match;
+  if (rawStart === "" && rawEnd === "") {
+    return null;
+  }
+
+  // "bytes=-500" is the last 500 bytes, not a range starting at zero.
+  if (rawStart === "") {
+    const span = Number(rawEnd);
+    if (!span) {
+      return null;
+    }
+    return { start: Math.max(0, length - span), end: length - 1 };
+  }
+
+  const start = Number(rawStart);
+  if (start >= length) {
+    return null;
+  }
+  const end = rawEnd === "" ? length - 1 : Math.min(Number(rawEnd), length - 1);
+  return end < start ? null : { start, end };
 }
 
 type HttpServerSubservicesState = JsonRecord & {
@@ -588,12 +780,46 @@ export class HttpServerSubservicesService implements HostedService {
       this.host.emitResult(output);
     }
 
-    res.statusCode = 200;
-    res.setHeader("content-type", "application/json");
-    const json = JSON.stringify(
-      (answeredBySubservices ? answer : output) ?? null,
-    );
-    res.end(json);
+    this.sendAnswer(req, res, answeredBySubservices ? answer : output);
+  }
+
+  /**
+   * Writes what the handler produced, honouring a range request when the
+   * answer is bytes a caller can seek inside.
+   */
+  private sendAnswer(
+    req: IncomingMessage,
+    res: ServerResponse,
+    value: unknown,
+  ): void {
+    const answer = toAnswer(value);
+    for (const [name, headerValue] of Object.entries(answer.headers)) {
+      res.setHeader(name, String(headerValue));
+    }
+
+    const seekable = answer.status === 200;
+    if (seekable) {
+      res.setHeader("accept-ranges", "bytes");
+    }
+
+    const range = seekable
+      ? requestedRange(header(req, "range"), answer.payload.length)
+      : null;
+    if (range) {
+      const slice = answer.payload.subarray(range.start, range.end + 1);
+      res.statusCode = 206;
+      res.setHeader(
+        "content-range",
+        `bytes ${range.start}-${range.end}/${answer.payload.length}`,
+      );
+      res.setHeader("content-length", String(slice.length));
+      res.end(Buffer.from(slice));
+      return;
+    }
+
+    res.statusCode = answer.status;
+    res.setHeader("content-length", String(answer.payload.length));
+    res.end(Buffer.from(answer.payload));
   }
 
   /** Whether a nested pipeline is configured to handle requests. */
