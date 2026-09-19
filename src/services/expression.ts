@@ -329,11 +329,42 @@ export const globalScope: Record<string, unknown> = {
     String(x)
       .toLowerCase()
       .replace(/[^a-z0-9_-]/g, ""),
+  withoutUrls: (x: unknown) => withoutUrls(x),
   uuid: {
     v4: randomUUID,
     v7: uuidV7,
   },
 };
+
+/**
+ * A web address in running text, with whatever label introduced it.
+ *
+ * The label goes because it is only there to introduce the address: "Article
+ * URL:" with nothing after it says less than nothing. Bounded to a short run of
+ * words so it cannot swallow a sentence.
+ */
+const URL_IN_TEXT = /(?:[A-Za-z][\w ]{0,30}:[ \t]*)?(?:https?:\/\/|www\.)\S+/gi;
+
+/**
+ * Text with the web addresses taken out of it.
+ *
+ * Feeds are written for programs as much as for people, and some of them are
+ * mostly machinery: a summary that reads "Article URL: https://… Comments URL:
+ * https://… Points: 48" is a fine thing for a reader to show as a link and a
+ * miserable thing to hear read aloud, where an address becomes a minute of
+ * punctuation. This is for text on its way to something that speaks or
+ * summarises it — never for what a board stores or publishes, where the address
+ * is the useful part.
+ */
+export function withoutUrls(value: unknown): string {
+  return String(value ?? "")
+    .replace(URL_IN_TEXT, " ")
+    // What removal leaves behind: doubled spaces, and punctuation adrift from
+    // the word it belonged to.
+    .replace(/[ \t]{2,}/g, " ")
+    .replace(/\s+([.,;:!?])/g, "$1")
+    .trim();
+}
 
 /**
  * Compiles an expression source into a callable. Non-string sources are

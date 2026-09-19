@@ -121,3 +121,41 @@ describe("a Map template that tries to escape", () => {
     expect(service.process(input, () => {})).toEqual(input);
   });
 });
+
+describe("text on its way to a voice", () => {
+  // Feed summaries are written for programs as much as for people. Spoken, an
+  // address is a minute of punctuation, and the label that introduced it says
+  // nothing once it is gone.
+  const hackerNews =
+    "Article URL: https://overreacted.io/how-i-vibed-a-proof/ " +
+    "Comments URL: https://news.ycombinator.com/item?id=49755024 Points: 48 # Comments: 31";
+
+  it("takes the addresses out, and the labels that only introduced them", () => {
+    expect(evaluate("withoutUrls(params.summary)", { summary: hackerNews })).toBe(
+      "Points: 48 # Comments: 31",
+    );
+  });
+
+  it("leaves prose alone", () => {
+    expect(
+      evaluate("withoutUrls(params.s)", {
+        s: "The gunman is among the dead, police said.",
+      }),
+    ).toBe("The gunman is among the dead, police said.");
+  });
+
+  it("removes an address inside a sentence, and no more of the sentence", () => {
+    // The words around it are prose and stay, even where what is left reads
+    // oddly: mending a sentence is not a remit this can be given bounds for.
+    expect(
+      evaluate("withoutUrls(params.s)", {
+        s: "A proof, described at https://example.test/proof, of a conjecture.",
+      }),
+    ).toBe("A proof, described at of a conjecture.");
+  });
+
+  it("answers with text whatever it is given", () => {
+    expect(evaluate("withoutUrls(params.missing)", {})).toBe("");
+    expect(evaluate("withoutUrls(params.n)", { n: 48 })).toBe("48");
+  });
+});
