@@ -71,8 +71,35 @@ export class NestedPipeline {
     if (!next) {
       throw new Error(`Invalid pipeline format for '${this.label}'`);
     }
+    // A pipeline it already is, is not a change. Rebuilding destroys what is
+    // running inside it — a mount, a timer, a socket — and the commonest
+    // configure a service ever gets is the board handing back the state it just
+    // read: a coordinator on load, a panel saving an unrelated field. Without
+    // this, editing anything beside a pipeline tears that pipeline down.
+    if (this.matchesLive(next)) {
+      return;
+    }
     this.config = next;
     this.rebuild();
+  }
+
+  /** Whether `next` is what this pipeline is already running, state included. */
+  private matchesLive(next: ServiceConfiguration[]): boolean {
+    if (!this.runtime) {
+      return false;
+    }
+    const live = this.state();
+    if (live.length !== next.length) {
+      return false;
+    }
+    return next.every((entry, index) => {
+      const current = live[index];
+      return (
+        current.serviceId === entry.serviceId &&
+        current.instanceId === entry.uuid &&
+        JSON.stringify(current.state ?? {}) === JSON.stringify(entry.state ?? {})
+      );
+    });
   }
 
   append(entry: unknown): void {
