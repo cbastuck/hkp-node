@@ -4,18 +4,19 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { createMemoryDatabaseStore } from "../src/services/database";
+import { MapService } from "../src/services/map";
 import { SqlService } from "../src/services/sql";
-import { RuntimeHost } from "../src/types";
+import { TracksService } from "../src/services/tracks";
+import { HostedService, RuntimeHost, ServiceConfiguration } from "../src/types";
 
 /**
  * The RSS aggregator board's own statements, run.
  *
- * The board's reading list is three statements in a row acting on one request,
- * which is a design the SQL service supports and neither statement can check.
- * What is pinned here is that the board's SQL is *correct SQL for what it
- * claims*: the same article saved twice stays one row, an intent the statement
- * is not for leaves the table alone, and removing takes exactly the article
- * asked for.
+ * The board's reading list is two statements given the same request — tracks of
+ * one service — and a query reading the table afterwards. What is pinned here is
+ * that the board's SQL is *correct SQL for what it claims*: the same article
+ * saved twice stays one row, an intent neither statement is for leaves the table
+ * alone, and removing takes exactly the article asked for.
  *
  * The statements are read out of the board rather than repeated here — a copy
  * would pass while the board was broken.
@@ -85,25 +86,43 @@ const host = {
   emitResult: () => {},
 } as unknown as RuntimeHost;
 
-/** The board's three statements, on one in-memory database, in board order. */
+/**
+ * The board's statements, on one in-memory database, arranged as the board
+ * arranges them: the writers as tracks of one service, the query after it.
+ *
+ * The tracks service is the real one, so what runs here is the board's own
+ * configuration — the guards, the reducer, the order — rather than a retelling.
+ */
 function readingList() {
   const databases = createMemoryDatabaseStore();
-  const chain = ["keep-article", "drop-article", "kept-articles"].map((uuid) => {
-    const svc = new SqlService(
-      { uuid, serviceId: "sql", state: statementOf(uuid).state } as never,
-      databases,
-    );
-    svc.setHost(host);
-    return svc;
-  });
+  const create = (config: ServiceConfiguration): HostedService =>
+    config.serviceId === "map"
+      ? (new MapService(config) as unknown as HostedService)
+      : (new SqlService(config, databases) as unknown as HostedService);
 
-  /** One request through all three, the way the runtime would run them. */
-  const send = (request: Record<string, unknown>) => {
-    let value: unknown = request;
-    for (const svc of chain) {
-      value = svc.process(value, () => {});
-    }
-    return value as { rows: Record<string, unknown>[]; count: number };
+  const record = new TracksService(
+    {
+      uuid: "record-article",
+      serviceId: "tracks",
+      state: statementOf("record-article").state,
+    } as never,
+    create,
+  );
+  record.setHost(host);
+
+  const list = new SqlService(
+    { uuid: "kept-articles", serviceId: "sql", state: statementOf("kept-articles").state } as never,
+    databases,
+  );
+  list.setHost(host);
+
+  /** One request through both, the way the runtime would run them. */
+  const send = async (request: Record<string, unknown>) => {
+    const carried = await record.process(request, () => {});
+    return list.process(carried, () => {}) as {
+      rows: Record<string, unknown>[];
+      count: number;
+    };
   };
 
   return { send };
@@ -120,9 +139,9 @@ const article = {
 };
 
 describe("the RSS aggregator's reading list", () => {
-  it("saves an article and reads it back in the same pass", () => {
+  it("saves an article and reads it back in the same pass", async () => {
     const { send } = readingList();
-    const result = send(article);
+    const result = await send(article);
 
     // The query at the end sees what the insert before it just wrote, so the
     // facade never has to refresh after a save.
@@ -134,38 +153,38 @@ describe("the RSS aggregator's reading list", () => {
     });
   });
 
-  it("keeps one row when the same article is saved twice", () => {
+  it("keeps one row when the same article is saved twice", async () => {
     const { send } = readingList();
-    send(article);
+    await send(article);
     // The upsert's parse is the thing being checked: an INSERT … SELECT with
     // both a WHERE and an ON CONFLICT is exactly where SQLite is ambiguous.
-    expect(send(article).count).toBe(1);
+    expect((await send(article)).count).toBe(1);
   });
 
-  it("leaves the list alone for an intent neither statement is for", () => {
+  it("leaves the list alone for an intent neither statement is for", async () => {
     const { send } = readingList();
-    send(article);
+    await send(article);
     // What the facade sends on load to read the list without changing it.
-    const result = send({ intent: "none", link: "" });
+    const result = await send({ intent: "none", link: "" });
     expect(result.count).toBe(1);
   });
 
-  it("removes the article asked for and no other", () => {
+  it("removes the article asked for and no other", async () => {
     const { send } = readingList();
-    send(article);
-    send({ ...article, link: "https://example.com/two", title: "Another" });
-    expect(send({ intent: "none", link: "" }).count).toBe(2);
+    await send(article);
+    await send({ ...article, link: "https://example.com/two", title: "Another" });
+    expect((await send({ intent: "none", link: "" })).count).toBe(2);
 
-    const left = send({ intent: "drop", link: article.link });
+    const left = await send({ intent: "drop", link: article.link });
     expect(left.rows.map((row) => row.link)).toEqual([
       "https://example.com/two",
     ]);
   });
 
-  it("refuses an article with no address to open", () => {
+  it("refuses an article with no address to open", async () => {
     const { send } = readingList();
     // A row with no link is a row nothing can be done with, and it would take
     // the table's primary key.
-    expect(send({ ...article, link: "" }).count).toBe(0);
+    expect((await send({ ...article, link: "" })).count).toBe(0);
   });
 });

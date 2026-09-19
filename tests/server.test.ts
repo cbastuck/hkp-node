@@ -24,6 +24,7 @@ import { storageDescriptor } from "../src/services/storage";
 import { conversationsDescriptor } from "../src/services/conversations";
 import { queueDescriptor } from "../src/services/queue";
 import { iteratorDescriptor } from "../src/services/iterator";
+import { tracksDescriptor } from "../src/services/tracks";
 import { communicationDispatcherDescriptor } from "../src/services/communication-dispatcher";
 import { joinDescriptor } from "../src/services/join";
 import { documentExtractDescriptor } from "../src/services/document-extract";
@@ -63,6 +64,7 @@ describe("hkp-node runtime server", () => {
       mapDescriptor,
       subServiceDescriptor,
       iteratorDescriptor,
+      tracksDescriptor,
       communicationDispatcherDescriptor,
       joinDescriptor,
       httpServerSubservicesDescriptor,
