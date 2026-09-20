@@ -3,34 +3,40 @@
  * Service ID: http-server-subservices
  * Service Name: HttpServerSubservices
  * Runtime: hkp-node
- * Modes: process_on_session | process_on_data | process_on_both
- * Key Config: bypass/mode/pipeline (the endpoint is assigned, not configured)
+ * Modes: none — the entry points a board declares say what it is for
+ * Key Config: bypass/onProcess/onRequest (the endpoint is assigned, not configured)
  * IO: in=request envelope -> out=response envelope
  * Arrays: not primary
  * Binary: depends on endpoint + nested services
  * MixedData: not native in runtime
  *
- * Who answers a request depends on whether a nested pipeline is configured:
+ * **There are two ways in, and a board names the ones it uses.** `onRequest` is
+ * a caller arriving; `onProcess` is a pass of the board's own chain. Each is a
+ * pipeline of its own, because they are different jobs:
  *
- * - **With subservices** the nested pipeline is the handler: what it returns is
- *   what the caller gets. The outer runtime still runs, and its result still
- *   drives the next runtime, but it runs *after the answer is decided* — it is
- *   where a board puts the side effects of having served a request (logging it,
- *   forwarding it, notifying something) rather than where the answer is shaped.
+ *     { "onRequest": [ … ] }                      requests; a pass goes through
+ *     { "onProcess": [ … ] }                      passes; the board answers
+ *     { "onProcess": [ … ], "onRequest": [ … ] }  both, separately
+ *     { "pipeline":  [ … ] }                      one pipeline, entered from both
  *
- * - **Without subservices** the rest of the board is the handler: the request
- *   flows into the services after this one and whatever they return is the
- *   answer. This is the inversion of control the service is built around, and
- *   it is what makes a board able to answer an endpoint at all.
+ * **Declaring `onRequest` is what takes the answer away from the chain.** With
+ * one, that pipeline is the handler and what it returns is what the caller
+ * gets; the services after this one still run — that is where a board acts on
+ * having served a request — but after the answer is decided. Without one, the
+ * request flows into the services after this one and whatever they return is
+ * the answer, which is the inversion of control this service is built around
+ * and what makes a board able to answer an endpoint at all.
  *
- * - **In `process_on_data`** neither applies: the document the board handed
- *   this endpoint is the answer, and the services after it are side effects
- *   like the ones above. That is what lets a runtime publish more than one
- *   document — two endpoints in one chain, each answering its own.
+ * So an endpoint can have something to run on a pass without silently becoming
+ * an HTTP handler, which is what a single unnamed pipeline could not express:
+ * having one at all decided who answered.
  *
- * Keeping those apart is what makes a nested pipeline worth configuring: having
- * declared a handler, a board author can add services behind this one without
- * silently rewriting an HTTP contract from a distance.
+ * **A value does not survive between the two on its own.** They are separate
+ * pipelines, and a pass ends where it ends — so an endpoint that publishes what
+ * the board last handed it holds that value in a slot (see `hold`), in cells
+ * this service owns and lends to both of its pipelines. Legacy boards say the
+ * same thing as `mode: "process_on_data"`, which is this arrangement built in
+ * and unnamed; `entryFor` is where the older spellings are read.
  *
  * **What the handler answers with is the envelope, read backwards.** A value
  * carrying `meta.status` beside `body` or `binary` sets the status, the content
@@ -48,7 +54,7 @@
 import { IncomingMessage, ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
 
-import { childRun, HostedRuntime, newRun } from "../runtime";
+import { newRun } from "../runtime";
 import { MountContext, MountHandle } from "../mounts";
 import {
   HostedService,
@@ -59,7 +65,9 @@ import {
   ServiceConfiguration,
   ServiceCreator,
   ServiceRegistryEntry,
+  SlotStore,
 } from "../types";
+import { NestedPipeline } from "./nested-pipeline";
 
 export const httpServerSubservicesDescriptor: ServiceRegistryEntry = {
   serviceId: "http-server-subservices",
@@ -68,18 +76,32 @@ export const httpServerSubservicesDescriptor: ServiceRegistryEntry = {
 };
 
 /**
- * Where the nested pipeline is entered from:
+ * How a board that predates named entry points says which side enters the one
+ * pipeline it declares. Still accepted, and still reported back to a board that
+ * arrived carrying it; `entryFor` is the whole of what it means now.
  *
  * - `process_on_session` — requests only; data from the outer chain passes
  *   through untouched.
  * - `process_on_data` — data from the outer chain is stored and served back to
  *   requests verbatim; the nested pipeline is not used.
- * - `process_on_both` — both entry points run the nested pipeline. The pipeline
- *   is a single ordered list either way, so a service inside it that needs to
- *   tell a request from a data arrival has to do so from the input.
+ * - `process_on_both` — both entry points run the one pipeline, which is why a
+ *   service inside it can only tell a request from a pass by looking at what it
+ *   was given.
  */
 type HttpServerMode =
   "process_on_session" | "process_on_data" | "process_on_both";
+
+/**
+ * The two ways into this service, named.
+ *
+ * `onProcess` is a pass of the board's own chain arriving; `onRequest` is a
+ * caller. They are declared as separate pipelines because they are separate
+ * jobs — which is what the `mode` flag above was standing in for, badly: one
+ * unnamed list could not say what it was for, so a flag beside it had to.
+ */
+type EntryName = "onProcess" | "onRequest";
+
+const ENTRY_NAMES: EntryName[] = ["onProcess", "onRequest"];
 
 /**
  * An incoming request as MixedData: JSON metadata plus the raw body. Mirrors
@@ -396,10 +418,31 @@ export class HttpServerSubservicesService implements HostedService {
   private latestData: unknown = null;
 
   private mount: MountHandle | null = null;
-  private pipelineConfig: ServiceConfiguration[] = [];
-  private pipeline: HostedRuntime | null = null;
-  private releasePipelineNotifications: (() => void) | null = null;
-  private releasePipelineLogs: (() => void) | null = null;
+  /**
+   * Which way the board declared its pipelines; see the header.
+   *
+   * Kept because state reports what was declared rather than a canonical form:
+   * a board saved after being loaded has to come back out the way it went in,
+   * or every board on the older spelling rewrites itself the first time
+   * somebody saves it.
+   */
+  private form: "legacy" | "entries" = "legacy";
+  /** The one pipeline a legacy board declares, entered from whichever side its
+   *  `mode` says. */
+  private legacy: NestedPipeline | null = null;
+  private readonly entries: Record<EntryName, NestedPipeline | null> = {
+    onProcess: null,
+    onRequest: null,
+  };
+  /**
+   * The cells this endpoint's pipelines hold values in.
+   *
+   * Owned here because the two entry points are pipelines that never meet: a
+   * value one of them produces has nowhere to live until the other runs. One
+   * store per endpoint is also what keeps the names in it private, so two
+   * endpoints on a runtime may both call a slot `document`.
+   */
+  private readonly slotStore: SlotStore = new Map<string, unknown>();
   private readonly createService: ServiceCreator;
   private host: RuntimeHost | null = null;
 
@@ -452,37 +495,36 @@ export class HttpServerSubservicesService implements HostedService {
       this.mode = config.mode;
     }
 
-    if (Array.isArray(config.pipeline)) {
-      const nextPipeline = normalizePipelineArray(config.pipeline);
-      if (!nextPipeline) {
-        throw new Error("Invalid http-server-subservices pipeline format");
+    // Declaring an entry point by name is what puts this endpoint in the newer
+    // form, and from then on its state is reported that way.
+    for (const name of ENTRY_NAMES) {
+      if (Array.isArray(config[name])) {
+        this.form = "entries";
+        this.entryPipeline(name).setPipeline(config[name]);
       }
-      this.pipelineConfig = nextPipeline;
-      this.rebuild();
-    } else if (isJsonRecord(config.appendService)) {
-      const appended = normalizePipelineEntry(config.appendService);
-      if (!appended) {
-        throw new Error("Invalid appendService payload");
+    }
+
+    // An edit aimed at one named entry. The unscoped verbs below cannot say
+    // which pipeline they mean once there is more than one.
+    if (isJsonRecord(config.configurePipeline)) {
+      const payload = config.configurePipeline;
+      const name = payload.entry;
+      if (name === "onProcess" || name === "onRequest") {
+        this.form = "entries";
+        this.editPipeline(this.entryPipeline(name), payload);
       }
-      this.syncStates();
-      this.pipelineConfig.push(appended);
-      this.rebuild();
-    } else if (typeof config.removeService === "string") {
-      this.syncStates();
-      this.pipelineConfig = this.pipelineConfig.filter(
-        (entry) => entry.uuid !== config.removeService,
-      );
-      this.rebuild();
-    } else if (isJsonRecord(config.configureService)) {
-      const payload = config.configureService;
-      if (
-        typeof payload.instanceId === "string" &&
-        isJsonRecord(payload.state) &&
-        this.pipeline
-      ) {
-        this.pipeline.configureService(payload.instanceId, payload.state);
-        this.syncStates();
-      }
+    }
+
+    if (
+      Array.isArray(config.pipeline) ||
+      isJsonRecord(config.appendService) ||
+      typeof config.removeService === "string" ||
+      isJsonRecord(config.configureService)
+    ) {
+      // The unscoped verbs belong to the one pipeline a legacy board declares.
+      // Left working rather than redirected at an entry, because which entry
+      // they would mean is exactly what the older form cannot say.
+      this.editPipeline(this.legacyPipeline(), config);
     }
 
     if (typeof config.bypass === "boolean" && config.bypass !== this.bypass) {
@@ -504,21 +546,132 @@ export class HttpServerSubservicesService implements HostedService {
     return this.getState();
   }
 
+  /**
+   * The pipeline behind one entry point, built on first use.
+   *
+   * Built lazily because an endpoint declaring only `onRequest` should not
+   * carry an empty runtime for the side it never uses — and because an empty
+   * pipeline and an absent one differ here: only the second leaves the board
+   * answering.
+   */
+  private entryPipeline(name: EntryName): NestedPipeline {
+    const existing = this.entries[name];
+    if (existing) {
+      return existing;
+    }
+    const created = this.newPipeline(name);
+    this.entries[name] = created;
+    return created;
+  }
+
+  private legacyPipeline(): NestedPipeline {
+    if (!this.legacy) {
+      this.legacy = this.newPipeline("pipeline");
+    }
+    return this.legacy;
+  }
+
+  private newPipeline(label: string): NestedPipeline {
+    const pipeline = new NestedPipeline(
+      `${this.uuid}:${label}`,
+      this.createService,
+    );
+    // Both entries hold in the same cells: that they can is the whole reason
+    // for declaring them separately.
+    pipeline.shareSlots(this.slotStore);
+    if (this.host) {
+      pipeline.attach(this.host);
+    }
+    return pipeline;
+  }
+
+  /** The four edit verbs, applied to whichever pipeline was named. */
+  private editPipeline(pipeline: NestedPipeline, payload: JsonRecord): void {
+    if (Array.isArray(payload.pipeline)) {
+      pipeline.setPipeline(payload.pipeline);
+    } else if (isJsonRecord(payload.appendService)) {
+      pipeline.append(payload.appendService);
+    } else if (typeof payload.removeService === "string") {
+      pipeline.remove(payload.removeService);
+    } else if (isJsonRecord(payload.configureService)) {
+      const edit = payload.configureService;
+      if (typeof edit.instanceId === "string" && isJsonRecord(edit.state)) {
+        pipeline.configureService(edit.instanceId, edit.state);
+      }
+    }
+  }
+
   getState(): JsonRecord {
-    const state: HttpServerSubservicesState = {
+    const common = {
       bypass: this.bypass,
-      mode: this.mode,
       mountName: this.mountName,
       __hkpMount: this.mount?.url ?? "",
       forwardHeaders: this.forwardHeaders,
-      pipeline: this.getPipelineState(),
+    };
+
+    // What was declared, not what it was understood as. A board that named its
+    // entries gets them back; one that carries a `mode` keeps it, because that
+    // is the version an older runtime can still load.
+    if (this.form === "entries") {
+      const state: JsonRecord = { ...common };
+      for (const name of ENTRY_NAMES) {
+        const pipeline = this.entries[name];
+        if (pipeline) {
+          state[name] = pipeline.state();
+        }
+      }
+      return state;
+    }
+
+    const state: HttpServerSubservicesState = {
+      ...common,
+      mode: this.mode,
+      pipeline: this.legacy?.state() ?? [],
     };
     return state;
   }
 
-  /** Passes the scope on to the nested pipeline; see SubService.setScope. */
+  /** Passes the scope on to the nested pipelines; see SubService.setScope. */
   setScope(scope: RuntimeScope): void {
-    this.pipeline?.setScope(scope);
+    for (const pipeline of this.pipelines()) {
+      pipeline.setScope(scope);
+    }
+  }
+
+  /** Every pipeline this endpoint owns, each one only once. */
+  private pipelines(): NestedPipeline[] {
+    const all = [this.legacy, this.entries.onProcess, this.entries.onRequest];
+    return [...new Set(all.filter((p): p is NestedPipeline => !!p))];
+  }
+
+  /**
+   * The pipeline one side enters through, or null where that side has none.
+   *
+   * This is where a legacy `mode` is read, and the only place it is: a board
+   * that names its entries never reaches the table below.
+   *
+   * | declared                       | onProcess | onRequest |
+   * |--------------------------------|-----------|-----------|
+   * | `process_on_session`           | —         | the one   |
+   * | `process_on_both`              | the one   | the one   |
+   * | `process_on_data`              | —         | —         |
+   *
+   * `process_on_both` answers with *the same instance* on both sides, never a
+   * second copy of the configuration: a pipeline holding a Hold, a timer or a
+   * mount is one running thing, and duplicating it would give a board two of
+   * each and a slot that never reaches itself.
+   */
+  private entryFor(name: EntryName): NestedPipeline | null {
+    if (this.form === "entries") {
+      return this.entries[name];
+    }
+    if (this.mode === "process_on_data") {
+      return null;
+    }
+    if (name === "onProcess" && this.mode !== "process_on_both") {
+      return null;
+    }
+    return this.legacy;
   }
 
   setHost(host: RuntimeHost): void {
@@ -530,60 +683,46 @@ export class HttpServerSubservicesService implements HostedService {
       this.claimMount();
     }
     // A pipeline built in the constructor was built before there was a host to
-    // ask what board it belongs to.
-    this.adoptHostScope();
-  }
-
-  /**
-   * Hands the tenant, board, and log settings down to the nested pipeline.
-   *
-   * A pipeline this service builds knows none of them — it is created with an
-   * id of its own and nothing else — so without this a service inside it that
-   * keeps something durable would store it against an empty board name,
-   * separately from the very same service sitting beside this one. Handling a
-   * request changes where a service runs, not which board it belongs to.
-   */
-  private adoptHostScope(): void {
-    if (!this.pipeline || !this.host) {
-      return;
+    // ask what board it belongs to, or to report through.
+    for (const pipeline of this.pipelines()) {
+      pipeline.attach(host);
     }
-    this.pipeline.setScope(this.host.scope());
-    const settings = this.host.logSettings();
-    this.pipeline.setLogging(settings.logging);
-    this.pipeline.setLogData(settings.logData);
   }
 
   process(
     input: unknown,
     _notify: (payload: unknown, instanceId?: string) => void,
   ): unknown {
-    if (this.mode === "process_on_data") {
+    // The legacy built-in slot: what the board hands this endpoint is what a
+    // caller gets back. Expressible now as an `onProcess` that writes a slot
+    // and an `onRequest` that reads it, and kept because boards carry the older
+    // spelling and a board is a document people keep.
+    if (this.form === "legacy" && this.mode === "process_on_data") {
       this.latestData = input;
       return input;
     }
 
-    // Routing only: the nested pipeline handles data arriving from the outer
-    // chain exactly as it handles a request, and what it returns carries on
-    // down the chain. Whatever has to survive between the two — a value one
-    // side produces and the other reads — is a service's job, not this one's.
-    if (this.mode === "process_on_both" && !this.bypass) {
-      return this.processSessionInput(input);
+    const entry = this.bypass ? null : this.entryFor("onProcess");
+    if (!entry) {
+      return input;
     }
-
-    return input;
+    // Routing only: what the pass's own pipeline returns carries on down the
+    // chain. Whatever has to survive until a request arrives — a value this
+    // side produces and the other reads — belongs in a slot, which is a
+    // service's job and not this one's.
+    return this.runEntry(entry, input);
   }
 
   destroy(): void {
     this.releaseMount();
-    this.releasePipelineNotifications?.();
-    this.releasePipelineNotifications = null;
-    this.releasePipelineLogs?.();
-    this.releasePipelineLogs = null;
     // Nested services hold the same things top-level ones do — timers, sockets,
     // mounts — and nothing else will ever reach them once this service is gone.
-    this.pipeline?.destroy();
-    this.pipeline = null;
-    this.pipelineConfig = [];
+    for (const pipeline of this.pipelines()) {
+      pipeline.destroy();
+    }
+    this.legacy = null;
+    this.entries.onProcess = null;
+    this.entries.onRequest = null;
   }
 
   private claimMount(): void {
@@ -752,7 +891,7 @@ export class HttpServerSubservicesService implements HostedService {
     // Whether the answer is already decided here, or is whatever the rest of
     // the outer chain makes of what this service emitted.
     let answeredHere = false;
-    if (this.mode === "process_on_data") {
+    if (this.form === "legacy" && this.mode === "process_on_data") {
       processInput = this.latestData;
       output = processInput;
       // The mode's whole contract: what the board handed this endpoint is what
@@ -776,8 +915,16 @@ export class HttpServerSubservicesService implements HostedService {
         throw error;
       }
       processInput = request;
-      answeredHere = this.hasSubservices();
-      output = await this.processSessionInput(processInput, runContext);
+      // A declared handler is what takes the answer away from the chain — not
+      // the presence of a pipeline, which says only that this endpoint has
+      // something to run, possibly on the other side. Without one the board
+      // answers, which is the inversion of control this service is built
+      // around.
+      const handler = this.entryFor("onRequest");
+      answeredHere = !!handler && !handler.isEmpty();
+      output = handler
+        ? await this.runEntry(handler, processInput, runContext)
+        : processInput;
     }
 
     // What the nested pipeline produced, before the outer runtime sees it.
@@ -836,111 +983,27 @@ export class HttpServerSubservicesService implements HostedService {
     res.end(Buffer.from(answer.payload));
   }
 
-  /** Whether a nested pipeline is configured to handle requests. */
-  private hasSubservices(): boolean {
-    return !!this.pipeline && this.pipeline.listServices().length > 0;
-  }
-
   /**
-   * Runs the nested pipeline as a run descended from `parent`.
+   * Runs one entry's pipeline as a run descended from `parent`.
    *
    * Both entry points land here, and they differ only in what they descend
    * from: a request brings the run its caller minted for the whole exchange,
    * while data from the outer chain arrives mid-call and descends from whatever
    * that call is running as.
    */
-  private async processSessionInput(
+  private async runEntry(
+    pipeline: NestedPipeline,
     input: unknown,
     parent?: ProcessContext | null,
   ): Promise<unknown> {
-    if (!this.pipeline || this.pipeline.listServices().length === 0) {
-      return input;
-    }
-
-    // No-op: the nested runtime fans these out to the target registered in
-    // rebuild(). Forwarding them here as well would deliver every one twice.
-    return await this.pipeline.process(
+    return await pipeline.process(
       input,
-      () => {},
-      childRun(parent ?? this.host?.currentContext() ?? null),
+      parent ?? this.host?.currentContext() ?? null,
     );
   }
 
   private notify(payload: unknown, instanceId?: string): void {
     this.host?.notify(payload, instanceId ?? this.uuid);
-  }
-
-  private syncStates(): void {
-    if (!this.pipeline) {
-      return;
-    }
-
-    const byId = new Map(
-      this.pipeline
-        .listServices()
-        .map((service) => [service.uuid, service.state] as const),
-    );
-
-    this.pipelineConfig = this.pipelineConfig.map((entry) => {
-      const state = byId.get(entry.uuid);
-      if (!state || !isJsonRecord(state)) {
-        return entry;
-      }
-      return { ...entry, state };
-    });
-  }
-
-  private rebuild(): void {
-    this.releasePipelineNotifications?.();
-    this.releasePipelineLogs?.();
-    // The pipeline being replaced is about to become unreachable; its services
-    // keep running until told otherwise. State worth carrying over has already
-    // been read into pipelineConfig by syncStates().
-    this.pipeline?.destroy();
-    this.pipeline = new HostedRuntime(
-      {
-        id: `${this.uuid}:http-sub-runtime`,
-        name: `${this.serviceName}-${this.uuid}`,
-        boardName: "",
-        services: this.pipelineConfig,
-      },
-      this.createService,
-    );
-
-    // A nested runtime has no notification targets of its own, so what its
-    // services report — a Timer's tick, a Hold's counts — reaches nobody unless
-    // the service hosting the pipeline carries it out to the board. Services
-    // report through their host precisely because it is not always a call they
-    // are answering: an autonomous emitter has no caller to report to.
-    this.releasePipelineNotifications =
-      this.pipeline.registerNotificationTarget((notification) =>
-        this.notify(notification.payload, notification.instanceId),
-      );
-
-    // A nested pipeline's entries belong to the same board log as everything
-    // else; only the runtime hosting this service can carry them there, since a
-    // nested runtime has no route out of its own.
-    this.releasePipelineLogs = this.pipeline.registerLogTarget((entry) =>
-      this.host?.forwardLog(entry),
-    );
-
-    this.adoptHostScope();
-  }
-
-  private getPipelineState(): HttpServerSubservicesState["pipeline"] {
-    if (!this.pipeline) {
-      return this.pipelineConfig.map((entry) => ({
-        serviceId: entry.serviceId,
-        instanceId: entry.uuid,
-        state: entry.state ?? {},
-      }));
-    }
-
-    return this.pipeline.listServices().map((service) => ({
-      serviceId: service.serviceId,
-      instanceId: service.uuid,
-      state: service.state,
-    }));
   }
 }
 
@@ -948,43 +1011,3 @@ function isJsonRecord(value: unknown): value is JsonRecord {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function normalizePipelineArray(
-  value: unknown[],
-): ServiceConfiguration[] | null {
-  const result: ServiceConfiguration[] = [];
-  for (const entry of value) {
-    const normalized = normalizePipelineEntry(entry);
-    if (!normalized) {
-      return null;
-    }
-    result.push(normalized);
-  }
-  return result;
-}
-
-function normalizePipelineEntry(value: unknown): ServiceConfiguration | null {
-  if (!isJsonRecord(value) || typeof value.serviceId !== "string") {
-    return null;
-  }
-
-  const instanceId =
-    typeof value.instanceId === "string" && value.instanceId.length > 0
-      ? value.instanceId
-      : typeof value.uuid === "string" && value.uuid.length > 0
-        ? value.uuid
-        : randomUUID();
-
-  const state = value.state;
-  if (state !== undefined && !isJsonRecord(state)) {
-    return null;
-  }
-
-  return {
-    serviceId: value.serviceId,
-    uuid: instanceId,
-    name: typeof value.name === "string" ? value.name : undefined,
-    serviceName:
-      typeof value.serviceName === "string" ? value.serviceName : undefined,
-    state,
-  };
-}

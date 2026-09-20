@@ -223,6 +223,23 @@ export type LogEntry = {
   durationMs?: number;
 };
 
+/**
+ * Named cells two pipelines can share a value through.
+ *
+ * A pipeline pass carries one value and ends; anything that has to survive
+ * until a *different* pipeline runs has nowhere to live. A store gives it a
+ * name, and whoever owns the pipelines that must share decides which store they
+ * see — which is what keeps the sharing scoped to the arrangement that needs it
+ * rather than being ambient across a runtime.
+ *
+ * Deliberately not a cache: nothing expires, nothing is computed on a miss. It
+ * is a cell, and the services that read and write it say what it means.
+ */
+export interface SlotStore {
+  get(name: string): unknown;
+  set(name: string, value: unknown): void;
+}
+
 export interface RuntimeHost {
   /**
    * Runs the services after `startAfterUuid` and answers with what they
@@ -310,4 +327,14 @@ export interface RuntimeHost {
    * saved from, which is the whole thing this arrangement exists to prevent.
    */
   secrets(): SecretVault;
+  /**
+   * The slots this pipeline's values may be held in, or nothing where no store
+   * has been provided.
+   *
+   * A nested runtime answers with the store the service hosting it gave it, and
+   * otherwise with its parent's — so a slot named inside a sub-pipeline reaches
+   * the nearest owner that declared one, and a service that declared none does
+   * not silently isolate what is nested in it.
+   */
+  slots?(): SlotStore | null;
 }
