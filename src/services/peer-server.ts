@@ -182,6 +182,11 @@ export class PeerServerService implements HostedService {
     }
   }
 
+  /** See HostedService.remount: the runtime can serve one now. */
+  remount(): void {
+    this.claimMount();
+  }
+
   private claimMount(): void {
     if (this.mount || !this.host?.mount) {
       return;

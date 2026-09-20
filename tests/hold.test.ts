@@ -412,7 +412,8 @@ describe("hold behind an http-server endpoint", () => {
 
     const seen = await collectState(
       wsUrl,
-      "hold-1",
+      // Under its scoped address; see address.ts.
+      "http-1.hold-1",
       (states) => states.some((state) => state.readCount >= 1),
       async () => {
         // The producer writes, then a caller reads: both sides have to show up.
@@ -462,7 +463,7 @@ describe("hold behind an http-server endpoint", () => {
       },
     );
 
-    expect(flowCount(seen, "hold-1", "call-process")).toBe(1);
-    expect(flowCount(seen, "hold-1", "call-process-finished")).toBe(1);
+    expect(flowCount(seen, "http-1.hold-1", "call-process")).toBe(1);
+    expect(flowCount(seen, "http-1.hold-1", "call-process-finished")).toBe(1);
   });
 });

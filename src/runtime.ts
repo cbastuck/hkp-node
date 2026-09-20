@@ -18,6 +18,7 @@ import {
   ServiceDescriptor,
   SlotStore,
 } from "./types";
+import { ADDRESS_SEPARATOR, descend, splitAddress } from "./address";
 import { SecretVault } from "./secrets";
 import { ANONYMOUS_SUB } from "./auth";
 import { MountHandle, MountHandlers } from "./mounts";
@@ -102,6 +103,17 @@ export class HostedRuntime implements RuntimeHost {
   private readonly resultTargets = new Set<(result: unknown) => void>();
   private readonly createService: ServiceCreator;
   private readonly mounts?: RuntimeMounts;
+  /**
+   * Where this runtime's mounts are claimed, when it has no server of its own;
+   * see `delegateMounts`.
+   */
+  private mountsFrom:
+    | ((
+        serviceUuid: string,
+        handlers: MountHandlers,
+        options: { mountName?: string },
+      ) => MountHandle | null)
+    | null = null;
   /**
    * The call being processed right now, and which service it is inside.
    *
@@ -212,8 +224,24 @@ export class HostedRuntime implements RuntimeHost {
       }));
   }
 
-  getService(uuid: string): HostedService | undefined {
-    return this.services.get(uuid);
+  /**
+   * The service an address names, flat or scoped.
+   *
+   * The flat list is asked first, so a uuid that happens to contain a dot is
+   * still that service rather than a path into something else. Only when no
+   * service carries the whole address is it read as one — see `address.ts`.
+   */
+  getService(address: string): HostedService | undefined {
+    const direct = this.services.get(address);
+    if (direct) {
+      return direct;
+    }
+    const segments = splitAddress(address);
+    if (segments.length < 2) {
+      return undefined;
+    }
+    const head = this.services.get(segments[0]);
+    return head ? descend(head, segments.slice(1)) : undefined;
   }
 
   addService(config: ServiceConfiguration): JsonRecord {
@@ -230,8 +258,8 @@ export class HostedRuntime implements RuntimeHost {
     return service.getState();
   }
 
-  configureService(uuid: string, config: JsonRecord): JsonRecord | null {
-    const service = this.services.get(uuid);
+  configureService(address: string, config: JsonRecord): JsonRecord | null {
+    const service = this.getService(address);
     if (!service) {
       return null;
     }
@@ -388,7 +416,22 @@ export class HostedRuntime implements RuntimeHost {
   ): Promise<unknown> {
     const startIndex = this.serviceOrder.indexOf(startAtUuid);
     if (startIndex < 0) {
-      throw new Error(`No such service: ${startAtUuid}`);
+      // Not one of this runtime's own: a scoped address enters the pipeline
+      // that holds it instead, and runs to the end of *that* list. What it
+      // produces is the nested pipeline's answer, and reaches the board the
+      // way that pipeline's answers always do.
+      const segments = splitAddress(startAtUuid);
+      const head = segments.length > 1 && this.services.get(segments[0]);
+      const enter = head ? head.processNested : undefined;
+      if (!head || !enter) {
+        throw new Error(`No such service: ${startAtUuid}`);
+      }
+      return enter.call(
+        head,
+        segments.slice(1).join(ADDRESS_SEPARATOR),
+        input,
+        context,
+      );
     }
     // Nothing to continue: whoever asked for this is outside the board, so it
     // begins a run rather than joining one.
@@ -593,6 +636,13 @@ export class HostedRuntime implements RuntimeHost {
     handlers: MountHandlers,
     options: { mountName?: string } = {},
   ): MountHandle | null {
+    // A nested runtime has no server of its own, so it asks the one around it
+    // — the same arrangement as secrets and slots. Without this an endpoint
+    // inside a scope had no address at all, which made a scope something a
+    // board could not put an endpoint in.
+    if (this.mountsFrom) {
+      return this.mountsFrom(serviceUuid, handlers, options);
+    }
     // The board comes from the runtime, not from the service: a mount's address
     // is derived from where it sits, and a service does not know that.
     return (
@@ -601,6 +651,30 @@ export class HostedRuntime implements RuntimeHost {
         mountName: options.mountName,
       }) ?? null
     );
+  }
+
+  /**
+   * Claim mounts somewhere else rather than on a server of this runtime's own.
+   *
+   * Read on each call rather than copied, so a pipeline attached before its
+   * host could answer still reaches one, and so nesting composes outward to
+   * whichever runtime is actually listening.
+   */
+  delegateMounts(
+    source: (
+      serviceUuid: string,
+      handlers: MountHandlers,
+      options: { mountName?: string },
+    ) => MountHandle | null,
+  ): void {
+    this.mountsFrom = source;
+    // The services here were built before this runtime could serve a mount, so
+    // any that wanted one gave up on it. Now that there is somewhere to claim
+    // from, they are told to ask again; a service with nothing to claim has
+    // nothing to do here and does not answer.
+    for (const service of this.services.values()) {
+      service.remount?.();
+    }
   }
 
   // ──────────────────────────────────────────────────────────────────────────

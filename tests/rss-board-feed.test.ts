@@ -65,8 +65,11 @@ describe("the reader board as it ships", () => {
 
     // Save an article, which is the pass that rebuilds the feed and hands it to
     // the endpoint.
+    // Addressed through the scope holding it: the board's two flows are scopes
+    // now, so a service inside one is named by the path through it. This is
+    // also what the facade's buttons send.
     await request(server.httpServer)
-      .post("/runtimes/node/services/record-article/process")
+      .post("/runtimes/node/services/list.record-article/process")
       .send({
         intent: "keep",
         title: "Jemalloc 5.4.0",
@@ -81,7 +84,7 @@ describe("the reader board as it ships", () => {
 
 
     const { body } = await request(server.httpServer)
-      .get("/runtimes/node/services/feed-serve")
+      .get("/runtimes/node/services/list.feed-serve")
       .expect(200);
 
     const res = await fetch(`${body.__hkpMount}/feed.xml`);

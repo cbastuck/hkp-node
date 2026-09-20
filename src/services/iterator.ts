@@ -138,8 +138,10 @@ export class IteratorService extends SubService {
       this.pipeline.listServices().length === 0
     ) {
       // Nothing to run the items through. Passing the input on unchanged is
-      // what an empty SubService does, and keeps a half-built board legible.
-      return input;
+      // what an empty SubService does, and keeps a half-built board legible —
+      // unless this one passes nothing on at all, which it says whether or not
+      // there was anything to run.
+      return this.stopPropagation ? null : input;
     }
 
     const items = this.items(input);
@@ -172,6 +174,9 @@ export class IteratorService extends SubService {
     this.lastFailed = failed;
     notify({ items: items.length, results: results.length, failed });
 
+    if (this.stopPropagation) {
+      return null;
+    }
     return results.length > 0 ? results : null;
   }
 

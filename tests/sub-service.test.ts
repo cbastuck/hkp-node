@@ -90,7 +90,9 @@ describe("sub-service notifications", () => {
 
     const seen = await collectState(
       `${baseUrl.replace("http", "ws")}/rt-1`,
-      "hold-1",
+      // Under its scoped address: an instanceId is unique only inside its own
+      // pipeline, so each boundary prefixes its owner on the way out.
+      "sub-1.hold-1",
       (states) => states.some((state) => state.writeCount >= 1),
       async () => {
         await tick(server);
@@ -119,12 +121,13 @@ describe("sub-service notifications", () => {
       },
     );
 
-    expect(flowCount(seen, "hold-1", "call-process")).toBe(1);
-    expect(flowCount(seen, "hold-1", "call-process-finished")).toBe(1);
+    expect(flowCount(seen, "sub-1.hold-1", "call-process")).toBe(1);
+    expect(flowCount(seen, "sub-1.hold-1", "call-process-finished")).toBe(1);
     expect(
       seen.filter(
         (entry) =>
-          entry.instanceId === "hold-1" && entry.payload?.writeCount === 1,
+          entry.instanceId === "sub-1.hold-1" &&
+          entry.payload?.writeCount === 1,
       ),
     ).toHaveLength(1);
   });
