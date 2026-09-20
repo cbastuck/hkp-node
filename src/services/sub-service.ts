@@ -12,16 +12,19 @@
  */
 import { randomUUID } from "node:crypto";
 
+import { joinAddress } from "../address";
 import { childRun, HostedRuntime } from "../runtime";
 import { MOUNT_FIELD, collectMountRefs } from "../coordinator/mount";
 import {
   HostedService,
   JsonRecord,
+  ProcessContext,
   RuntimeHost,
   RuntimeScope,
   ServiceConfiguration,
   ServiceCreator,
   ServiceRegistryEntry,
+  SlotStore,
 } from "../types";
 
 export const subServiceDescriptor: ServiceRegistryEntry = {
@@ -30,8 +33,20 @@ export const subServiceDescriptor: ServiceRegistryEntry = {
   capabilities: ["subservices"],
 };
 
+/**
+ * Where a scope's pipeline holds what it holds.
+ *
+ * `own` is a store of this service's, so two copies of the same scope on one
+ * runtime do not clobber each other's cells and a name used inside means
+ * nothing outside. `inherit` reaches the runtime around it, so a slot named
+ * inside a scope is the same cell as one named next to it.
+ */
+export type ScopeSlots = "own" | "inherit";
+
 type SubServiceState = JsonRecord & {
   bypass: boolean;
+  stopPropagation: boolean;
+  scope: { slots: ScopeSlots };
   pipeline: Array<{
     serviceId: string;
     instanceId: string;
@@ -48,6 +63,38 @@ export class SubService implements HostedService {
   // Protected, not private: an Iterator is a sub-service that runs its pipeline
   // once per item rather than once, and needs these to do it.
   protected bypass = false;
+  /**
+   * Whether what this pipeline produced leaves this service.
+   *
+   * A scope that ends here rather than feeding the services after it: the two
+   * flows on one runtime that a Stopper between them used to mark by
+   * convention. False — and absent — is the pipeline a board already has, so
+   * every board that says nothing about it goes on passing its result along.
+   *
+   * It closes **both** routes out, which is the whole of the work: `process`
+   * returns null, and `emitOutward` drops what the pipeline emitted on its own
+   * — a Timer tick, or a service that answered null and came back later. A
+   * scope holding one of those would otherwise go on pushing into the board
+   * long after its own answer stopped.
+   */
+  protected stopPropagation = false;
+  /**
+   * What this scope keeps to itself.
+   *
+   * One block rather than a flat key because a scope has more than one thing
+   * to say about what its children can see — which credentials they resolve,
+   * what they log — and those should read as one statement about a boundary
+   * rather than as keys added one at a time.
+   */
+  protected scopeSlots: ScopeSlots = "own";
+  /**
+   * The cells a scope of its own holds values in.
+   *
+   * Owned here rather than left to the nested runtime so that rebuilding the
+   * pipeline — which a board does on every edit to it — does not drop what was
+   * being held across it.
+   */
+  private readonly slotStore: SlotStore = new Map<string, unknown>();
   private pipelineConfig: ServiceConfiguration[] = [];
   protected pipeline: HostedRuntime | null = null;
   private releasePipelineNotifications: (() => void) | null = null;
@@ -72,6 +119,8 @@ export class SubService implements HostedService {
     this.applyLogSettings();
     this.applyScope();
     this.applySecrets();
+    this.applySlots();
+    this.applyMounts();
   }
 
   /**
@@ -119,6 +168,41 @@ export class SubService implements HostedService {
     this.pipeline?.delegateSecrets(() => this.host?.secrets?.() ?? null);
   }
 
+  /**
+   * Points the nested pipeline at the cells its values are held in.
+   *
+   * Read on each lookup rather than now, so that changing what a scope keeps
+   * to itself takes effect without rebuilding the pipeline, and so that a
+   * scope inside a scope reaches outward the same way one level at a time.
+   */
+  private applySlots(): void {
+    this.pipeline?.delegateSlots(() =>
+      this.scopeSlots === "inherit"
+        ? (this.host?.slots?.() ?? null)
+        : this.slotStore,
+    );
+  }
+
+  /**
+   * Lets the services inside claim an endpoint on the runtime outside.
+   *
+   * A nested runtime has no server, so without this an `http-server` inside a
+   * scope published no address and a board could not put one there. The name a
+   * mount is derived from falls back to the **scoped address** rather than the
+   * bare instanceId, so two copies of one scope do not derive the same address
+   * and quietly take each other's callers; a board that named its mount keeps
+   * that name, and with it the address it already had before being scoped.
+   */
+  private applyMounts(): void {
+    this.pipeline?.delegateMounts((serviceUuid, handlers, options) =>
+      this.host?.mount?.(serviceUuid, handlers, {
+        // `||`, not `??`: an endpoint that was never named carries an empty
+        // mountName rather than none, the same spelling mounts.ts reads.
+        mountName: options.mountName || joinAddress(this.uuid, serviceUuid),
+      }) ?? null,
+    );
+  }
+
   private applyScope(): void {
     const scope = this.host?.scope();
     if (scope && this.pipeline) {
@@ -129,6 +213,17 @@ export class SubService implements HostedService {
   configure(config: JsonRecord): JsonRecord {
     if (typeof config.bypass === "boolean") {
       this.bypass = config.bypass;
+    }
+    // Read only when it is a boolean, so a board that never mentions it keeps
+    // the default rather than having one written over it by silence.
+    if (typeof config.stopPropagation === "boolean") {
+      this.stopPropagation = config.stopPropagation;
+    }
+    if (isJsonRecord(config.scope)) {
+      const slots = config.scope.slots;
+      if (slots === "own" || slots === "inherit") {
+        this.scopeSlots = slots;
+      }
     }
 
     if (Array.isArray(config.pipeline)) {
@@ -190,9 +285,54 @@ export class SubService implements HostedService {
   getState(): JsonRecord {
     const state: SubServiceState = {
       bypass: this.bypass,
+      // Reported even when false, like the bypass beside it: a saved board
+      // then says outright what each scope does with its answer, instead of
+      // leaving a reader to infer a boundary from what follows it.
+      stopPropagation: this.stopPropagation,
+      scope: { slots: this.scopeSlots },
       pipeline: this.getPipelineState(),
     };
     return state;
+  }
+
+  /**
+   * The nested service a scoped address names inside this one.
+   *
+   * What makes a sub-pipeline addressable from outside: without it the board
+   * can reach this service but nothing it contains, so a facade could drive a
+   * scope but not read what the scope is doing.
+   */
+  /**
+   * Passes the retry down: an endpoint two levels in gave up on its mount for
+   * the same reason one level in did, and is reached the same way.
+   */
+  remount(): void {
+    for (const service of this.pipeline?.listServices() ?? []) {
+      this.pipeline?.getService(service.uuid)?.remount?.();
+    }
+  }
+
+  findNested(instanceId: string): HostedService | undefined {
+    return this.pipeline?.getService(instanceId);
+  }
+
+  /**
+   * Enters this service's pipeline at one of its services.
+   *
+   * The nested pipeline is a chain like any other, so this is `processAt` one
+   * level down — what follows the named service inside this scope runs, and
+   * what precedes it does not. The notifications go nowhere from here because
+   * the nested runtime already carries its own out to the board; see rebuild().
+   */
+  processNested(
+    address: string,
+    input: unknown,
+    context?: ProcessContext,
+  ): Promise<unknown> {
+    if (!this.pipeline) {
+      throw new Error(`No such service: ${address}`);
+    }
+    return this.pipeline.processAt(address, input, () => {}, context);
   }
 
   async process(
@@ -204,7 +344,10 @@ export class SubService implements HostedService {
       !this.pipeline ||
       this.pipeline.listServices().length === 0
     ) {
-      return input;
+      // A scope that passes nothing on passes nothing on when there is nothing
+      // to run either: what leaves this service is the board author's to say,
+      // and it does not become the input again because the pipeline was empty.
+      return this.stopPropagation ? null : input;
     }
 
     // No-op: the nested runtime fans these out to the target registered in
@@ -212,11 +355,12 @@ export class SubService implements HostedService {
     // The nested pipeline runs as a run of its own, descended from the one
     // calling it, so what happens inside stays attributable to this service
     // rather than blending into the pipeline around it.
-    return this.pipeline.process(
+    const result = await this.pipeline.process(
       input,
       () => {},
       childRun(this.host?.currentContext() ?? null),
     );
+    return this.stopPropagation ? null : result;
   }
 
   destroy(): void {
@@ -296,6 +440,16 @@ export class SubService implements HostedService {
     if (result === null || result === undefined) {
       return;
     }
+    // The second route out, and the one a scope would otherwise leak through.
+    // What arrives here was not produced by a call this service is answering,
+    // so nothing has already been stopped on its behalf: a Timer inside a
+    // scope, or a service that answered null and came back with the result
+    // later, would go on driving the board after the scope's own answers had
+    // stopped. `process` returning null does not cover this, which is why
+    // stopping propagation has to be said in both places.
+    if (this.stopPropagation) {
+      return;
+    }
     const host = this.host;
     if (!host) {
       return;
@@ -327,9 +481,16 @@ export class SubService implements HostedService {
     // the service hosting the pipeline carries it out to the board. Services
     // report through their host precisely because it is not always a call they
     // are answering: an autonomous emitter has no caller to report to.
+    // Carried out under a scoped address rather than the bare instanceId the
+    // nested service reported: an instanceId is unique only inside its own
+    // pipeline, so on its own it is a name, not an address. Prefixing at each
+    // boundary is what makes the path a listener hears the path it can dial.
     this.releasePipelineNotifications =
       this.pipeline.registerNotificationTarget((notification) =>
-        this.host?.notify(notification.payload, notification.instanceId),
+        this.host?.notify(
+          notification.payload,
+          joinAddress(this.uuid, notification.instanceId),
+        ),
       );
 
     // A nested pipeline's entries belong to the same board log as everything
@@ -349,6 +510,8 @@ export class SubService implements HostedService {
     this.applyLogSettings();
     this.applyScope();
     this.applySecrets();
+    this.applySlots();
+    this.applyMounts();
   }
 
   private getPipelineState(): SubServiceState["pipeline"] {

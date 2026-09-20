@@ -63,12 +63,40 @@ function withParams<T>(value: T, params: Record<string, string>): T {
 
 const services = withParams(board.services.node, board.unit?.params ?? {});
 
+/**
+ * A service the board declares, wherever it sits.
+ *
+ * The board's two flows are scopes now, so its statements are inside one
+ * rather than in the runtime's own list. Searched by shape rather than by the
+ * field a scope keeps its pipeline in, so this goes on finding them if the
+ * board is rearranged again.
+ */
 function statementOf(uuid: string): Service {
-  const svc = services.find((service) => service.uuid === uuid);
+  const svc = find(services, uuid);
   if (!svc) {
     throw new Error(`the board has no service "${uuid}"`);
   }
   return svc;
+}
+
+function find(node: unknown, uuid: string): Service | null {
+  if (Array.isArray(node)) {
+    for (const item of node) {
+      const found = find(item, uuid);
+      if (found) {
+        return found;
+      }
+    }
+    return null;
+  }
+  if (!node || typeof node !== "object") {
+    return null;
+  }
+  const record = node as Record<string, unknown>;
+  if (typeof record.serviceId === "string" && record.uuid === uuid) {
+    return record as unknown as Service;
+  }
+  return find(Object.values(record), uuid);
 }
 
 const host = {

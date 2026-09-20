@@ -11,8 +11,10 @@
  */
 import { randomUUID } from "node:crypto";
 
+import { joinAddress } from "../address";
 import { childRun, HostedRuntime } from "../runtime";
 import {
+  HostedService,
   JsonRecord,
   ProcessContext,
   RuntimeHost,
@@ -40,10 +42,14 @@ export class NestedPipeline {
   /**
    * @param label   Names the nested runtime in logs; the owning service's uuid,
    *                plus the branch it belongs to where there is more than one.
+   * @param owner   The uuid a service inside this pipeline is addressed under.
+   *                Not read off `label`, which carries the branch too and is
+   *                shaped for a person reading a log rather than for dialling.
    */
   constructor(
     private readonly label: string,
     private readonly createService: ServiceCreator,
+    private readonly owner: string,
   ) {}
 
   /**
@@ -59,6 +65,7 @@ export class NestedPipeline {
     this.applyScope();
     this.applySecrets();
     this.applySlots();
+    this.applyMounts();
   }
 
   /** True while there is nothing to run. */
@@ -179,6 +186,11 @@ export class NestedPipeline {
     return this.runtime?.listServices() ?? [];
   }
 
+  /** One of them, by the name it carries here — for a scoped address. */
+  find(instanceId: string): HostedService | undefined {
+    return this.runtime?.getService(instanceId);
+  }
+
   destroy(): void {
     this.releaseNotifications?.();
     this.releaseNotifications = null;
@@ -214,9 +226,15 @@ export class NestedPipeline {
     // out to the board. Services report through their host precisely because it
     // is not always a call they are answering: an autonomous emitter has no
     // caller to report to.
+    // Under a scoped address, not the bare instanceId: an instanceId is unique
+    // only inside its own pipeline, so each boundary prefixes its owner on the
+    // way out. See address.ts.
     this.releaseNotifications = this.runtime.registerNotificationTarget(
       (notification) =>
-        this.host?.notify(notification.payload, notification.instanceId),
+        this.host?.notify(
+          notification.payload,
+          joinAddress(this.owner, notification.instanceId),
+        ),
     );
 
     // A nested pipeline's entries belong to the same board log as everything
@@ -229,6 +247,7 @@ export class NestedPipeline {
     this.applyScope();
     this.applySecrets();
     this.applySlots();
+    this.applyMounts();
   }
 
   private applyLogSettings(): void {
@@ -269,6 +288,24 @@ export class NestedPipeline {
    * for the same reason secrets are: the pipeline is attached before the host
    * is necessarily able to answer.
    */
+  /**
+   * Lets the services inside claim an endpoint on the runtime outside.
+   *
+   * Same reason as slots and secrets: a nested runtime has no server of its
+   * own. The name falls back to the scoped address, so two containers holding
+   * a pipeline that names no mount do not derive one address between them.
+   */
+  private applyMounts(): void {
+    this.runtime?.delegateMounts(
+      (serviceUuid, handlers, options) =>
+        this.host?.mount?.(serviceUuid, handlers, {
+          // `||`, not `??`: an endpoint that was never named carries an empty
+        // mountName rather than none, the same spelling mounts.ts reads.
+        mountName: options.mountName || joinAddress(this.owner, serviceUuid),
+        }) ?? null,
+    );
+  }
+
   private applySlots(): void {
     this.runtime?.delegateSlots(
       () => this.shared ?? this.host?.slots?.() ?? null,

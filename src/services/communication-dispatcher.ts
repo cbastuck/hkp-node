@@ -59,6 +59,7 @@ import {
   ServiceConfiguration,
   ServiceCreator,
   ServiceRegistryEntry,
+  SlotStore,
 } from "../types";
 
 export const communicationDispatcherDescriptor: ServiceRegistryEntry = {
@@ -135,6 +136,14 @@ export class CommunicationDispatcherService implements HostedService {
   private stateFrom = "state";
   private maxContextChars = 20_000;
   private actions: Action[] = [];
+  /**
+   * The cells this service's pipelines hold values in.
+   *
+   * Owned here, like an endpoint's: `decide` and the actions are pipelines of
+   * one arrangement, so a value one leaves for another belongs to this service
+   * rather than to the runtime around it.
+   */
+  private readonly slotStore: SlotStore = new Map<string, unknown>();
   private decide: NestedPipeline;
 
   private lastAction = "";
@@ -146,7 +155,8 @@ export class CommunicationDispatcherService implements HostedService {
   constructor(config: ServiceConfiguration, createService: ServiceCreator) {
     this.uuid = config.uuid;
     this.createService = createService;
-    this.decide = new NestedPipeline(`${this.uuid}:${DECIDE}`, createService);
+    this.decide = new NestedPipeline(`${this.uuid}:${DECIDE}`, createService, this.uuid);
+    this.decide.shareSlots(this.slotStore);
 
     if (config.state) {
       this.configure(config.state);
@@ -167,6 +177,17 @@ export class CommunicationDispatcherService implements HostedService {
     for (const action of this.actions) {
       action.pipeline.setScope(scope);
     }
+  }
+
+  /** The nested service a scoped address names: the actions, then `decide`. */
+  findNested(instanceId: string): HostedService | undefined {
+    for (const action of this.actions) {
+      const found = action.pipeline.find(instanceId);
+      if (found) {
+        return found;
+      }
+    }
+    return this.decide.find(instanceId);
   }
 
   getState(): JsonRecord {
@@ -550,7 +571,8 @@ export class CommunicationDispatcherService implements HostedService {
       const existing = previous.get(entry.name);
       const pipeline =
         existing?.pipeline ??
-        new NestedPipeline(`${this.uuid}:${entry.name}`, this.createService);
+        new NestedPipeline(`${this.uuid}:${entry.name}`, this.createService, this.uuid);
+      pipeline.shareSlots(this.slotStore);
       if (Array.isArray(entry.pipeline)) {
         pipeline.setPipeline(entry.pipeline);
       }

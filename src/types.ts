@@ -128,6 +128,43 @@ export interface HostedService {
    * tenant shares.
    */
   setScope?(scope: RuntimeScope): void;
+  /**
+   * The service one segment of a scoped address names inside this one.
+   *
+   * Only a service holding a pipeline answers: it is what lets an address
+   * reach past the runtime's flat list into what a scope contains. A service
+   * with several pipelines searches them in declaration order. See
+   * `address.ts`.
+   */
+  /**
+   * Try again to claim an endpoint, now that the runtime can serve one.
+   *
+   * A mount is claimed once, eagerly, when a service is given its host — and a
+   * service inside a pipeline is built before the pipeline has a host to pass
+   * on, so its first attempt reaches nothing. Secrets and slots do not need
+   * this because they are looked up on each use; a mount is held, so the
+   * service that gave up on one has to be told to ask again.
+   *
+   * Implemented by a service that claims a mount, and by one holding a
+   * pipeline, which passes it down.
+   */
+  remount?(): void;
+  findNested?(instanceId: string): HostedService | undefined;
+  /**
+   * Runs from a service inside this one to the end of the pipeline holding it,
+   * the way `processAt` does at the top level.
+   *
+   * Only a service whose pipeline is a chain answers. An endpoint's entries and
+   * a Tracks branch are driven by the thing that owns them — a request
+   * arriving, a fan-out — so entering one from outside would run half of an
+   * arrangement whose other half never happened. Those stay readable and
+   * configurable by address without being enterable by one.
+   */
+  processNested?(
+    address: string,
+    input: unknown,
+    context?: ProcessContext,
+  ): Promise<unknown>;
   destroy?(): void;
 }
 

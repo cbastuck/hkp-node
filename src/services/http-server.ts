@@ -575,6 +575,7 @@ export class HttpServerSubservicesService implements HostedService {
     const pipeline = new NestedPipeline(
       `${this.uuid}:${label}`,
       this.createService,
+      this.uuid,
     );
     // Both entries hold in the same cells: that they can is the whole reason
     // for declaring them separately.
@@ -599,6 +600,22 @@ export class HttpServerSubservicesService implements HostedService {
         pipeline.configureService(edit.instanceId, edit.state);
       }
     }
+  }
+
+  /**
+   * The nested service a scoped address names, searching every pipeline this
+   * endpoint owns. The two entries are separate pipelines rather than branches
+   * of one, so an instanceId used in both resolves to whichever `pipelines()`
+   * lists first.
+   */
+  findNested(instanceId: string): HostedService | undefined {
+    for (const pipeline of this.pipelines()) {
+      const found = pipeline.find(instanceId);
+      if (found) {
+        return found;
+      }
+    }
+    return undefined;
   }
 
   getState(): JsonRecord {
@@ -723,6 +740,16 @@ export class HttpServerSubservicesService implements HostedService {
     this.legacy = null;
     this.entries.onProcess = null;
     this.entries.onRequest = null;
+  }
+
+  /** See HostedService.remount: the runtime can serve one now. */
+  remount(): void {
+    // Bypassed is the same answer it gives at setHost: an endpoint switched
+    // off holds no address, and gaining somewhere to claim one does not switch
+    // it back on.
+    if (!this.bypass) {
+      this.claimMount();
+    }
   }
 
   private claimMount(): void {

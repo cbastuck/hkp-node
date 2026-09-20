@@ -63,6 +63,7 @@ import {
   ServiceCreator,
   ServiceRegistryEntry,
   HostedService,
+  SlotStore,
 } from "../types";
 import { MOUNT_FIELD, collectMountRefs } from "../coordinator/mount";
 import { isJsonRecord, NestedPipeline, PipelineEntryState } from "./nested-pipeline";
@@ -104,6 +105,16 @@ export class TracksService implements HostedService {
   private host: RuntimeHost | null = null;
   private bypass = false;
   private run: RunMode = "serial";
+  /**
+   * The cells this service's pipelines hold values in.
+   *
+   * Owned here, like an endpoint's: the branches are pipelines of one
+   * arrangement, so a value one leaves for another belongs to this service
+   * rather than to the runtime around it — and two of these on a runtime may
+   * both use a name without meeting. A scope says the same thing with
+   * `scope: { slots: "own" }`; here it is what the service is.
+   */
+  private readonly slotStore: SlotStore = new Map<string, unknown>();
   private tracks: Track[] = [];
   private reduce: NestedPipeline;
   private lastError = "";
@@ -113,7 +124,8 @@ export class TracksService implements HostedService {
     private readonly createService: ServiceCreator,
   ) {
     this.uuid = config.uuid;
-    this.reduce = new NestedPipeline(`${this.uuid}:${REDUCE}`, createService);
+    this.reduce = new NestedPipeline(`${this.uuid}:${REDUCE}`, createService, this.uuid);
+    this.reduce.shareSlots(this.slotStore);
 
     if (config.state) {
       this.configure(config.state);
@@ -134,6 +146,22 @@ export class TracksService implements HostedService {
     for (const track of this.tracks) {
       track.pipeline.setScope(scope);
     }
+  }
+
+  /**
+   * The nested service a scoped address names, tracks first and in declaration
+   * order, then the reducer. A name used in two tracks resolves to the earlier,
+   * which is the cost of addressing a branch by what is in it rather than by
+   * the branch's own name.
+   */
+  findNested(instanceId: string): HostedService | undefined {
+    for (const track of this.tracks) {
+      const found = track.pipeline.find(instanceId);
+      if (found) {
+        return found;
+      }
+    }
+    return this.reduce.find(instanceId);
   }
 
   getState(): JsonRecord {
@@ -275,7 +303,8 @@ export class TracksService implements HostedService {
       // edited.
       const existing = previous.get(name);
       const pipeline =
-        existing?.pipeline ?? new NestedPipeline(`${this.uuid}:${name}`, this.createService);
+        existing?.pipeline ?? new NestedPipeline(`${this.uuid}:${name}`, this.createService, this.uuid);
+      pipeline.shareSlots(this.slotStore);
       if (Array.isArray(entry.pipeline)) {
         pipeline.setPipeline(entry.pipeline);
       }
