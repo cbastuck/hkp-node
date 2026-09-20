@@ -233,7 +233,9 @@ async function loadBoard(
    * returns `null` by design. What a service produced reaches an attached board
    * as a notification, and that is the channel the facade reads — so it is the
    * channel to assert on. Nested services report through their host, so what
-   * happens inside an Iterator or a Join shows up here too.
+   * happens inside an Iterator or a Join shows up here too — under its scoped
+   * address rather than its bare uuid (`approve-each.mark-approved`), because
+   * an instanceId is unique only inside its own pipeline.
    */
   const at = async (runtimeId: string, uuid: string, payload: unknown) => {
     const sockets = await Promise.all(
@@ -430,7 +432,7 @@ describe("the board as a whole", () => {
     // 6. What "Approve selected" does.
     const artifactId = awaiting.artifacts[0].id;
     const approved = await at("approve", "approve-each", { ids: [artifactId] });
-    expect(approved.said("mark-approved")).toMatchObject({
+    expect(approved.said("approve-each.mark-approved")).toMatchObject({
       id: artifactId,
       status: "approved",
     });
@@ -521,7 +523,9 @@ describe("the board as a whole", () => {
 
     // It was tried, and it said why it could not. Which guard spoke first is
     // not the point — that it refused, and said so, is.
-    expect(attempt.said("send-mail").error).toBeTruthy();
+    expect(
+      attempt.said("per-conversation.manager.deliver.send-mail").error,
+    ).toBeTruthy();
 
     // And nothing after the failed send ran: the conversation is where it was.
     const conversation = (
@@ -549,7 +553,9 @@ describe("the board as a whole", () => {
     // the assertion about threading: `threadOf` matches on In-Reply-To and
     // References, so without them this would have opened a conversation of
     // its own under the outbound message's own id.
-    const outbound = sending.said("file-outbound");
+    const outbound = sending.said(
+      "per-conversation.manager.deliver.file-outbound",
+    );
     expect(outbound).toMatchObject({
       conversationId: draft.conversationId,
       isNew: false,
@@ -563,7 +569,7 @@ describe("the board as a whole", () => {
     });
 
     // That draft, not some other artifact.
-    expect(sending.said("mark-sent")).toMatchObject({
+    expect(sending.said("per-conversation.manager.mark-sent")).toMatchObject({
       id: draft.id,
       status: "sent",
     });
