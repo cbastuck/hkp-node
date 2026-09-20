@@ -154,6 +154,112 @@ describe("hold", () => {
   });
 });
 
+describe("hold with a slot, where the role is declared", () => {
+  /** Two Holds over one store, as an endpoint's two entry points hold. */
+  function pair(slot = "document") {
+    const cells = new Map<string, unknown>();
+    const host = { slots: () => cells, notify: () => {} } as never;
+    const write = makeHold({ slot, op: "write" });
+    const read = makeHold({ slot, op: "read" });
+    write.setHost(host);
+    read.setHost(host);
+    return { write, read, cells };
+  }
+
+  it("reads back what the other end wrote", () => {
+    const { write, read } = pair();
+    write.process({ meta: { status: 200 }, body: "<rss/>" }, () => {});
+    expect(read.process(REQUEST, () => {})).toEqual({
+      meta: { status: 200 },
+      body: "<rss/>",
+    });
+  });
+
+  it("passes a write's input on unchanged", () => {
+    // The pass a write belongs to carries on as though the Hold were not
+    // there — nothing is wrapped, so the services after it see what they would
+    // have seen anyway.
+    const { write } = pair();
+    const document = { meta: { status: 200 }, body: "<rss/>" };
+    expect(write.process(document, () => {})).toBe(document);
+  });
+
+  it("holds what a property never could: two shapes that look alike", () => {
+    // The reason the older arrangement cannot express an endpoint publishing a
+    // document — a response and a request are the same shape, so there is
+    // nothing in the value to discriminate on. Declaring the role sidesteps it.
+    const { write, read } = pair();
+    write.process({ meta: { status: 200 }, body: "ok" }, () => {});
+    const asRequest = { meta: { method: "GET", path: "/" } };
+    expect(read.process(asRequest, () => {})).toEqual({
+      meta: { status: 200 },
+      body: "ok",
+    });
+    // The request did not overwrite what is held: a read is only ever a read.
+    expect(read.process(asRequest, () => {})).toEqual({
+      meta: { status: 200 },
+      body: "ok",
+    });
+  });
+
+  it("holds bytes, and reports their size rather than their content", () => {
+    const { write, read } = pair();
+    const audio = new Uint8Array(4096).fill(7);
+    write.process(audio, () => {});
+    expect(read.process(REQUEST, () => {})).toBe(audio);
+    expect(write.getState().held).toBe("[4096 bytes]");
+  });
+
+  it("stops a read that arrives before anything has been written", () => {
+    const { read } = pair();
+    expect(read.process(REQUEST, () => {})).toBeNull();
+  });
+
+  it("keeps slots apart by name", () => {
+    const cells = new Map<string, unknown>();
+    const host = { slots: () => cells, notify: () => {} } as never;
+    const feed = makeHold({ slot: "feed", op: "write" });
+    const playlist = makeHold({ slot: "playlist", op: "read" });
+    feed.setHost(host);
+    playlist.setHost(host);
+
+    feed.process({ body: "<rss/>" }, () => {});
+
+    expect(playlist.process(REQUEST, () => {})).toBeNull();
+  });
+
+  it("leaves the cell alone when it is destroyed", () => {
+    // A pipeline rebuilt while a board runs destroys the services in it. The
+    // other end of the slot outlives this one and must keep answering.
+    const { write, read } = pair();
+    write.process({ body: "<rss/>" }, () => {});
+    write.destroy();
+    expect(read.process(REQUEST, () => {})).toEqual({ body: "<rss/>" });
+  });
+
+  it("reports the arrangement it is using, and not the other one", () => {
+    // A state property a service does not act on is one a board keeps and a
+    // reader has to discount.
+    const { write } = pair();
+    expect(write.getState()).toMatchObject({ slot: "document", op: "write" });
+    expect(write.getState().property).toBeUndefined();
+
+    const byProperty = makeHold({ property: "triggerCount" });
+    expect(byProperty.getState()).toMatchObject({ property: "triggerCount" });
+    expect(byProperty.getState().slot).toBeUndefined();
+  });
+
+  it("holds for itself where nothing provides a store", () => {
+    // A Hold is still a Hold outside any host that lends it cells; what it
+    // cannot do there is share, which is visible rather than silent because
+    // there is no second service to share with.
+    const alone = makeHold({ slot: "document", op: "write" });
+    const document = { body: "<rss/>" };
+    alone.process(document, () => {});
+    expect(alone.getState()).toMatchObject({ held: document, writeCount: 1 });
+  });
+});
+
 describe("hold behind an http-server endpoint", () => {
   /** The board: a producer writes, a request reads, one nested pipeline. */
   const subPipeline = (extra: Array<Record<string, unknown>> = []) => [

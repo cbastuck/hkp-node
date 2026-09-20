@@ -65,7 +65,42 @@ SELECT '<?xml version="1.0" encoding="UTF-8"?>'
      WHERE rendered IS NOT NULL
   )`;
 
-async function startBoard() {
+/**
+ * The endpoint that publishes the document, in each of the two ways a board can
+ * say it.
+ *
+ * `process_on_data` is the built-in slot: hold the last value handed over,
+ * answer callers with it. Named entry points say the same thing out of parts —
+ * a pipeline for the pass, a pipeline for the request, and a slot between them
+ * — which is the arrangement the mode was standing in for.
+ */
+const LEGACY = {
+  bypass: false,
+  mode: "process_on_data",
+  mountName: "feed",
+  pipeline: [],
+};
+
+const ENTRIES = {
+  bypass: false,
+  mountName: "feed",
+  onProcess: [
+    {
+      serviceId: "hold",
+      instanceId: "keep-document",
+      state: { slot: "document", op: "write" },
+    },
+  ],
+  onRequest: [
+    {
+      serviceId: "hold",
+      instanceId: "serve-document",
+      state: { slot: "document", op: "read" },
+    },
+  ],
+};
+
+async function startBoard(endpoint: Record<string, unknown> = LEGACY) {
   const server = createRuntimeServer({
     externalHost: "127.0.0.1",
     auth: { mode: "none" },
@@ -116,7 +151,7 @@ async function startBoard() {
           serviceId: httpServerSubservicesDescriptor.serviceId,
           uuid: "serve",
           serviceName: "Serve the feed",
-          state: { bypass: false, mode: "process_on_data", mountName: "feed", pipeline: [] },
+          state: endpoint,
         },
       ],
     })
@@ -239,5 +274,70 @@ describe("a table published as a feed", () => {
 
     expect(res.status).toBe(200);
     expect(await res.text()).toContain("<channel>");
+  });
+});
+
+describe("the same feed, published through named entry points", () => {
+  it("serves what the board handed it, out of two pipelines and a slot", async () => {
+    // The same board as above with the mode replaced by what it stood for: the
+    // pass writes the document into a slot, the request reads it back. Nothing
+    // in the pipeline looks at the value, which is why the two sides being
+    // indistinguishable envelopes no longer matters.
+    const { server, mount } = await startBoard(ENTRIES);
+    await publish(server, {
+      slug: "one",
+      title: "Jemalloc 5.4.0",
+      summary: "A release.",
+      link: "https://example.test/jemalloc",
+      published: "2026-09-18T04:20:24.000Z",
+      bytes: 209280,
+    });
+
+    const res = await fetch(`${mount}/feed.xml`);
+
+    expect(res.headers.get("content-type")).toBe("application/rss+xml; charset=utf-8");
+    expect(await res.text()).toContain("<title><![CDATA[Jemalloc 5.4.0]]></title>");
+  });
+
+  it("answers with nothing held before the board has run", async () => {
+    // A subscriber who arrives first gets the empty slot, the same as an
+    // endpoint that has not been handed a document yet.
+    const { mount } = await startBoard(ENTRIES);
+
+    const res = await fetch(`${mount}/feed.xml`);
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toBeNull();
+  });
+
+  it("reports the entry points it was given, and no mode", async () => {
+    // State is what a board is saved from. Reporting a canonical form here
+    // would rewrite every board that used the other spelling, in whichever
+    // direction this service preferred.
+    const { server } = await startBoard(ENTRIES);
+
+    const { body } = await request(server.httpServer)
+      .get("/runtimes/rt-1/services/serve")
+      .expect(200);
+
+    expect(body.mode).toBeUndefined();
+    expect(body.pipeline).toBeUndefined();
+    expect(body.onProcess).toHaveLength(1);
+    expect(body.onRequest[0]).toMatchObject({
+      serviceId: "hold",
+      instanceId: "serve-document",
+      state: expect.objectContaining({ slot: "document", op: "read" }),
+    });
+  });
+
+  it("keeps the older spelling on a board that arrived with one", async () => {
+    const { server } = await startBoard();
+
+    const { body } = await request(server.httpServer)
+      .get("/runtimes/rt-1/services/serve")
+      .expect(200);
+
+    expect(body.mode).toBe("process_on_data");
+    expect(body.onProcess).toBeUndefined();
   });
 });

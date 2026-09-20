@@ -16,6 +16,7 @@ import {
   ServiceCreator,
   ServiceConfiguration,
   ServiceDescriptor,
+  SlotStore,
 } from "./types";
 import { SecretVault } from "./secrets";
 import { ANONYMOUS_SUB } from "./auth";
@@ -133,6 +134,19 @@ export class HostedRuntime implements RuntimeHost {
    * own; see `delegateSecrets`.
    */
   private secretsFrom: (() => SecretVault | null) | null = null;
+  /**
+   * The cells services in this runtime hold values in between passes.
+   *
+   * Owned rather than delegated by default: a runtime is the outermost thing a
+   * slot name can mean, so two services that name the same slot and are given
+   * nothing more specific share this one.
+   */
+  private readonly ownSlots: SlotStore = new Map<string, unknown>();
+  /**
+   * Where this runtime's slots actually come from, when they are not its own;
+   * see `delegateSlots`.
+   */
+  private slotsFrom: (() => SlotStore | null) | null = null;
 
   constructor(
     config: RuntimeConfiguration,
@@ -508,6 +522,23 @@ export class HostedRuntime implements RuntimeHost {
    */
   delegateSecrets(source: () => SecretVault | null): void {
     this.secretsFrom = source;
+  }
+
+  slots(): SlotStore {
+    return this.slotsFrom?.() ?? this.ownSlots;
+  }
+
+  /**
+   * Hold values somewhere other than this runtime's own cells.
+   *
+   * What a nested pipeline shares with is decided by the service hosting it: an
+   * endpoint that wants its two entry points to hold between them gives both of
+   * them one store, and a service with nothing to share passes its parent's
+   * along — so a slot named deep inside reaches the nearest owner that declared
+   * one, and nesting never isolates what is inside it by accident.
+   */
+  delegateSlots(source: () => SlotStore | null): void {
+    this.slotsFrom = source;
   }
 
   /**

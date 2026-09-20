@@ -19,6 +19,7 @@ import {
   RuntimeScope,
   ServiceConfiguration,
   ServiceCreator,
+  SlotStore,
 } from "../types";
 
 export type PipelineEntryState = {
@@ -33,6 +34,8 @@ export class NestedPipeline {
   private releaseNotifications: (() => void) | null = null;
   private releaseLogs: (() => void) | null = null;
   private host: RuntimeHost | null = null;
+  /** See shareSlots. Null means the surrounding runtime's cells. */
+  private shared: SlotStore | null = null;
 
   /**
    * @param label   Names the nested runtime in logs; the owning service's uuid,
@@ -55,6 +58,7 @@ export class NestedPipeline {
     this.applyLogSettings();
     this.applyScope();
     this.applySecrets();
+    this.applySlots();
   }
 
   /** True while there is nothing to run. */
@@ -224,6 +228,7 @@ export class NestedPipeline {
     this.applyLogSettings();
     this.applyScope();
     this.applySecrets();
+    this.applySlots();
   }
 
   private applyLogSettings(): void {
@@ -253,6 +258,31 @@ export class NestedPipeline {
    */
   private applySecrets(): void {
     this.runtime?.delegateSecrets(() => this.host?.secrets?.() ?? null);
+  }
+
+  /**
+   * Points the nested runtime at the cells its values are held in.
+   *
+   * A store the owning service provided is what two of its pipelines share;
+   * with none, the surrounding runtime's is used, so a slot named inside a
+   * pipeline means what the same name means outside it. Read on each lookup,
+   * for the same reason secrets are: the pipeline is attached before the host
+   * is necessarily able to answer.
+   */
+  private applySlots(): void {
+    this.runtime?.delegateSlots(
+      () => this.shared ?? this.host?.slots?.() ?? null,
+    );
+  }
+
+  /**
+   * The store this pipeline holds values in, instead of the surrounding
+   * runtime's. Set by a service with more than one pipeline that has to hold
+   * something between them.
+   */
+  shareSlots(store: SlotStore): void {
+    this.shared = store;
+    this.applySlots();
   }
 
   /** Reads live state back into the configuration before it is rebuilt from. */

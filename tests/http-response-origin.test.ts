@@ -22,6 +22,12 @@ import { stopperDescriptor } from "../src/services/stopper";
  * The middle row is the point: configuring a nested pipeline declares a
  * handler, and services added behind the server must not silently rewrite what
  * an external caller receives.
+ *
+ * What declares a handler is `onRequest` — a pipeline for requests. The rows
+ * above say "nested pipeline" because a board that names no entry points has
+ * only one, and the legacy `mode` decides which sides enter it. An endpoint
+ * that declares `onProcess` alone has a pipeline and no handler, which is the
+ * fourth row and the one the older shape could not express.
  */
 
 type Server = ReturnType<typeof createRuntimeServer>;
@@ -50,6 +56,8 @@ const outer = {
 async function endpointWith(options: {
   subservices: boolean;
   after: Array<Record<string, unknown>>;
+  /** Declared instead of the legacy mode + pipeline, when given. */
+  entries?: Record<string, unknown>;
 }): Promise<string> {
   const server = createRuntimeServer({
     externalHost: "127.0.0.1",
@@ -67,7 +75,7 @@ async function endpointWith(options: {
         {
           serviceId: httpServerSubservicesDescriptor.serviceId,
           uuid: "http-1",
-          state: {
+          state: options.entries ?? {
             bypass: false,
             mode: "process_on_session",
             pipeline: options.subservices ? [nested] : [],
@@ -102,6 +110,32 @@ describe("what forms the HTTP response", () => {
     // is the handler.
     const url = await endpointWith({ subservices: false, after: [outer] });
     expect(await (await fetch(url)).json()).toEqual({ from: "outer" });
+  });
+
+  it("a pipeline for passes alone leaves the chain answering", async () => {
+    // The distinction a single unnamed pipeline could not draw: this endpoint
+    // has something to run, but nothing to run *for a request*, so the board
+    // still answers. Declared the old way the same board would have served
+    // whatever its one pipeline returned, because having one at all decided.
+    const url = await endpointWith({
+      subservices: false,
+      after: [outer],
+      entries: { bypass: false, onProcess: [nested] },
+    });
+    expect(await (await fetch(url)).json()).toEqual({ from: "outer" });
+  });
+
+  it("a pipeline for requests answers, with one for passes beside it", async () => {
+    const url = await endpointWith({
+      subservices: false,
+      after: [outer],
+      entries: {
+        bypass: false,
+        onProcess: [{ ...nested, instanceId: "on-pass" }],
+        onRequest: [{ ...nested, instanceId: "on-request" }],
+      },
+    });
+    expect(await (await fetch(url)).json()).toEqual({ from: "subservice" });
   });
 
   it("a Stopper behind the server ends the chain without touching the answer", async () => {
