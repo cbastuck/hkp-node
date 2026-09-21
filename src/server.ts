@@ -132,6 +132,12 @@ export type Quotas = {
  */
 const DEFAULT_MAX_REQUEST_BODY_BYTES = 25 * 1024 * 1024;
 
+/**
+ * Which runtime server this is, reported beside the runtimes so a client can
+ * tell remote runtimes apart without reading their address.
+ */
+const RUNTIME_SERVER_KIND = "node";
+
 type CreateRuntimeServerOptions = {
   auth?: AuthConfig;
   quotas?: Quotas;
@@ -625,6 +631,7 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
         .map((runtime) => serializeRuntime(runtime)),
       // The service registry is a property of the build, not of a tenant.
       registry: runtimeApp.getRegistry(),
+      server: RUNTIME_SERVER_KIND,
     });
   });
 
@@ -707,7 +714,11 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
       runtimes.push(serializeRuntime(runtime));
     }
 
-    res.json({ runtimes, registry: runtimeApp.getRegistry() });
+    res.json({
+      runtimes,
+      registry: runtimeApp.getRegistry(),
+      server: RUNTIME_SERVER_KIND,
+    });
   });
 
   expressApp.get("/runtimes/:runtimeId", (req, res) => {
