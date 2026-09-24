@@ -24,7 +24,7 @@ import { HostedService, RuntimeHost, ServiceConfiguration } from "../src/types";
 
 const BOARD = path.join(
   __dirname,
-  "../../hkp-frontend/boards/rss-demo-board.json",
+  "../../boards/rss-demo-board.json",
 );
 
 type Service = { uuid: string; serviceId: string; state: Record<string, any> };

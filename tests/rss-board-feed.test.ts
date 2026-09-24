@@ -10,7 +10,7 @@ import { createRuntimeServer } from "../src/server";
 // this package's sources, and a board is data here rather than a module.
 const board = JSON.parse(
   readFileSync(
-    join(__dirname, "../../hkp-frontend/boards/rss-demo-board.json"),
+    join(__dirname, "../../boards/rss-demo-board.json"),
     "utf8",
   ),
 );

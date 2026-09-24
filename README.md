@@ -167,7 +167,7 @@ Because JS has no JSON form for a byte array, a Monitor renders `binary` as
 real `Uint8Array`.
 
 **This replaced the previous flat `{ path, method }`.** A pipeline that matched on `params.path`
-now needs `params.meta.path`. No board shipped in `hkp-frontend/boards` used this service on
+now needs `params.meta.path`. No board shipped in `boards` used this service on
 hkp-node, so nothing in-tree broke, but your own boards may need the same edit.
 
 Note hkp-rt's `http-server-subservices` still emits the flat shape — the two runtimes are

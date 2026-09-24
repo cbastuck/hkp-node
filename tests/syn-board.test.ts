@@ -25,7 +25,7 @@ import { createRuntimeServer } from "../src/server";
 
 const BOARD = path.join(
   __dirname,
-  "../../hkp-frontend/boards/syn-conversations-demo-board.json",
+  "../../boards/syn-conversations-demo-board.json",
 );
 
 type Board = {
