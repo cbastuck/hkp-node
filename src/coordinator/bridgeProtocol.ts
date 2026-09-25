@@ -10,7 +10,7 @@
  *
  * Direction is part of each name below. The browser owns its own runtimes, so
  * what the coordinator knows about *those* is cache, and what the browser knows
- * about remote runtimes is cache — see TODO-CLOUD-COORDINATOR.md.
+ * about remote runtimes is cache — see plans/TODO-CLOUD-COORDINATOR.md.
  */
 
 import { LogEntry } from "../types";

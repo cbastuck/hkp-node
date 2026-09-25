@@ -75,7 +75,7 @@ export class BoardSession {
     // Set when the board comes back from a store rather than from a deploy. It
     // keeps the date the board was first registered, and it starts stopped:
     // nothing was provisioned, and provisioning needs a user this session does
-    // not have. See CLOUD-BOARDS.md.
+    // not have. See docs/content/concepts/cloud-boards.md.
     restored?: { createdAt: string },
     // Where this board's entries are kept. Absent means nothing is collected —
     // a session in a test, or a coordinator configured without a log root.

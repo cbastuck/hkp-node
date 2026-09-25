@@ -209,7 +209,7 @@ export type RuntimeScope = {
  * runtimes carry for a different purpose: `requestId` is a *reply address*,
  * exists only while someone awaits a response, and is consumed on resolution.
  * A run outlives any number of those, so the two are not interchangeable — see
- * TODO-CONSOLIDATION.md section 4.
+ * plans/TODO-CONSOLIDATION.md section 4.
  */
 export type ProcessContext = {
   /**

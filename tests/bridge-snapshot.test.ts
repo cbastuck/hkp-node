@@ -22,7 +22,7 @@ import { monitorDescriptor } from "../src/services/monitor";
  * their state. A browser renders from what it is sent and asks the coordinator
  * to act on remote services, rather than dialling those runtimes itself — so a
  * board's runtimes may live somewhere the browser cannot reach. See
- * TODO-CLOUD-COORDINATOR.md.
+ * plans/TODO-CLOUD-COORDINATOR.md.
  */
 
 type Server = ReturnType<typeof createRuntimeServer>;
