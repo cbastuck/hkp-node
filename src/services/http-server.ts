@@ -53,18 +53,11 @@
  *
  * **A stream is the one answer that keeps coming** (see `./stream`). With
  * `stream: { path, … }` declared, a GET on that path is a listener to keep, and
- * what every pass produces is written to all of them. A WebSocket on the same
- * path is the stream's **source**: a runtime elsewhere — behind a NAT, say —
- * connects out to this one and sends the stream, and every message it sends
- * goes to the listeners as it is. Only a source presenting `ingestKey` is
- * accepted, and only one at a time: a new source replaces the old, which is
- * what a source reconnecting after a dropped network looks like from here.
+ * what every pass produces is written to all of them. What a pass is — the
+ * previous service's output, a message a `websocket-reader` received, the
+ * result of the runtime before — is the board's business, not the endpoint's.
  */
 import { IncomingMessage, ServerResponse } from "node:http";
-import { timingSafeEqual } from "node:crypto";
-import { Duplex } from "node:stream";
-
-import { WebSocket, WebSocketServer } from "ws";
 
 import { newRun } from "../runtime";
 import { MountContext, MountHandle } from "../mounts";
@@ -80,7 +73,6 @@ import {
   SlotStore,
 } from "../types";
 import { NestedPipeline } from "./nested-pipeline";
-import { resolveCredential } from "../secrets";
 import {
   StreamBroadcast,
   StreamConfig,
@@ -477,14 +469,6 @@ export class HttpServerSubservicesService implements HostedService {
   private readonly broadcast = new StreamBroadcast((listeners) =>
     this.notify({ listeners }, this.uuid),
   );
-  /** Accepts the source's WebSocket; built when the first one arrives. */
-  private sourceServer: WebSocketServer | null = null;
-  private source: {
-    socket: WebSocket;
-    address: string;
-    since: number;
-    bytesReceived: number;
-  } | null = null;
 
   constructor(
     config: ServiceConfiguration,
@@ -527,8 +511,8 @@ export class HttpServerSubservicesService implements HostedService {
       }
     }
 
-    // `null`, or anything that names no path, ends the stream: listeners and
-    // source are let go, since nothing will be written to them again.
+    // `null`, or anything that names no path, ends the stream: listeners are
+    // let go, since nothing will be written to them again.
     if (config.stream !== undefined) {
       const declared = parseStreamConfig(config.stream);
       if (this.stream && !declared) {
@@ -681,13 +665,6 @@ export class HttpServerSubservicesService implements HostedService {
       common.stream = streamState(this.stream);
       Object.assign(common, this.streamAnnouncement());
       common.listenerDetails = this.broadcast.details();
-      common.source = this.source
-        ? {
-            address: this.source.address,
-            seconds: Math.round((Date.now() - this.source.since) / 100) / 10,
-            bytesReceived: this.source.bytesReceived,
-          }
-        : null;
     }
 
     // What was declared, not what it was understood as. A board that named its
@@ -824,8 +801,6 @@ export class HttpServerSubservicesService implements HostedService {
 
   private endStream(): void {
     this.broadcast.closeAll();
-    this.source?.socket.terminate();
-    this.source = null;
   }
 
   /** A GET on the stream path: a listener to keep, or a probe to answer. */
@@ -845,71 +820,6 @@ export class HttpServerSubservicesService implements HostedService {
       (closed) => this.broadcast.leave(closed),
     );
     this.broadcast.join(listener);
-  }
-
-  /** A WebSocket on the stream path: the stream's source, if it holds the key. */
-  private handleSource(
-    req: IncomingMessage,
-    socket: Duplex,
-    head: Buffer,
-  ): void {
-    const stream = this.stream!;
-    const refuse = (status: string) => {
-      socket.write(`HTTP/1.1 ${status}\r\n\r\n`);
-      socket.destroy();
-    };
-    const { value: key, problem } = resolveCredential(
-      this.host?.secrets?.(),
-      stream.ingestKey,
-      this.mount?.url ?? "http://localhost",
-    );
-    if (!stream.ingestKey || problem || !key) {
-      // Nothing to check a source against: nothing may feed this stream.
-      refuse("403 Forbidden");
-      return;
-    }
-    const presented = presentedKey(req);
-    if (!presented || !sameKey(presented, key)) {
-      refuse("401 Unauthorized");
-      return;
-    }
-
-    this.sourceServer ??= new WebSocketServer({ noServer: true });
-    this.sourceServer.handleUpgrade(req, socket, head, (ws) => {
-      // One source at a time. A new one is usually the old one back after its
-      // network dropped, before this side noticed the old connection was gone.
-      this.source?.socket.terminate();
-      const source = {
-        socket: ws,
-        address: requestAddress(req),
-        since: Date.now(),
-        bytesReceived: 0,
-      };
-      this.source = source;
-      this.notify(
-        { source: { address: source.address, seconds: 0, bytesReceived: 0 } },
-        this.uuid,
-      );
-
-      ws.on("message", (data, isBinary) => {
-        const chunk = Array.isArray(data)
-          ? Buffer.concat(data)
-          : Buffer.isBuffer(data)
-            ? data
-            : Buffer.from(data as ArrayBuffer);
-        source.bytesReceived += chunk.length;
-        if (isBinary && !this.bypass) {
-          this.broadcast.publish(chunk);
-        }
-      });
-      ws.on("close", () => {
-        if (this.source === source) {
-          this.source = null;
-          this.notify({ source: null }, this.uuid);
-        }
-      });
-      ws.on("error", () => ws.terminate());
-    });
   }
 
   destroy(): void {
@@ -952,14 +862,6 @@ export class HttpServerSubservicesService implements HostedService {
             return;
           }
           void this.handleRequest(req, res, context);
-        },
-        upgrade: (req, socket, head, context) => {
-          if (this.isStreamPath(context) && !this.bypass) {
-            this.handleSource(req, socket, head);
-            return;
-          }
-          socket.write("HTTP/1.1 404 Not Found\r\n\r\n");
-          socket.destroy();
         },
       },
       { mountName: this.mountName },
@@ -1254,33 +1156,6 @@ export class HttpServerSubservicesService implements HostedService {
   private notify(payload: unknown, instanceId?: string): void {
     this.host?.notify(payload, instanceId ?? this.uuid);
   }
-}
-
-/** The key a source presents: a bearer token, or `?key=` for a client that
- *  cannot set headers on a WebSocket (a browser). */
-function presentedKey(req: IncomingMessage): string {
-  const authorization = header(req, "authorization") ?? "";
-  const bearer = /^Bearer\s+(.+)$/i.exec(authorization);
-  if (bearer) {
-    return bearer[1].trim();
-  }
-  return (
-    new URL(req.url ?? "/", "http://localhost").searchParams.get("key") ?? ""
-  );
-}
-
-function sameKey(presented: string, expected: string): boolean {
-  const a = Buffer.from(presented);
-  const b = Buffer.from(expected);
-  return a.length === b.length && timingSafeEqual(a, b);
-}
-
-function requestAddress(req: IncomingMessage): string {
-  const forwarded = header(req, "x-forwarded-for");
-  if (forwarded) {
-    return forwarded.split(",")[0].trim();
-  }
-  return `${req.socket.remoteAddress ?? ""}:${req.socket.remotePort ?? ""}`;
 }
 
 function isJsonRecord(value: unknown): value is JsonRecord {

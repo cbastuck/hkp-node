@@ -32,6 +32,10 @@ import {
   peerServerDescriptor,
 } from "./services/peer-server";
 import {
+  WebsocketReaderService,
+  websocketReaderDescriptor,
+} from "./services/websocket-reader";
+import {
   ImapEmailService,
   imapEmailDescriptor,
 } from "./services/imap-email";
@@ -383,6 +387,13 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
       {
         descriptor: peerServerDescriptor,
         create: (config, _createService) => new PeerServerService(config),
+      },
+    ],
+    [
+      websocketReaderDescriptor.serviceId,
+      {
+        descriptor: websocketReaderDescriptor,
+        create: (config, _createService) => new WebsocketReaderService(config),
       },
     ],
     [

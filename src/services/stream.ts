@@ -25,12 +25,6 @@ export type StreamConfig = {
   burstBytes: number;
   maxQueueBytes: number;
   stallTimeoutMs: number;
-  /**
-   * What a source must present to feed the stream, usually a
-   * `{{secret.<alias>}}` reference. Without one nothing may feed it: a public
-   * endpoint that anyone could broadcast on is not a default worth having.
-   */
-  ingestKey: string;
 };
 
 const DEFAULTS = {
@@ -63,25 +57,18 @@ export function parseStreamConfig(value: unknown): StreamConfig | null {
     burstBytes: count("burstBytes", DEFAULTS.burstBytes),
     maxQueueBytes: count("maxQueueBytes", DEFAULTS.maxQueueBytes, 1),
     stallTimeoutMs: count("stallTimeoutMs", DEFAULTS.stallTimeoutMs, 1),
-    ingestKey: typeof declared.ingestKey === "string" ? declared.ingestKey : "",
   };
 }
 
 /** What a board declared, as state reports it back. */
 export function streamState(config: StreamConfig): JsonRecord {
-  const state: JsonRecord = {
+  return {
     path: config.path,
     contentType: config.contentType,
     burstBytes: config.burstBytes,
     maxQueueBytes: config.maxQueueBytes,
     stallTimeoutMs: config.stallTimeoutMs,
   };
-  if (config.ingestKey) {
-    // The reference as written, never a value: state is what a board is saved
-    // from.
-    state.ingestKey = config.ingestKey;
-  }
-  return state;
 }
 
 /**
