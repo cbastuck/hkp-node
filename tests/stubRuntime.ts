@@ -1,7 +1,7 @@
 import http from "node:http";
 import { AddressInfo, Socket } from "node:net";
 
-import { WebSocketServer } from "ws";
+import { WebSocket, WebSocketServer } from "ws";
 
 /**
  * A runtime that records what the coordinator configures on it. Stands in for a
@@ -11,6 +11,10 @@ import { WebSocketServer } from "ws";
 export type StubRuntime = {
   url: string;
   configured: Array<{ serviceUuid: string; state: Record<string, unknown> }>;
+  /** What arrived on this runtime's socket, in order. */
+  received: Array<{ raw: Buffer; isBinary: boolean }>;
+  /** Sends on every socket connected to this runtime, as its output would. */
+  emit: (frame: string | Buffer) => void;
   close: () => Promise<void>;
 };
 
@@ -63,6 +67,15 @@ export async function startStubRuntime(runtimeId: string): Promise<StubRuntime> 
   });
 
   const sockets = new WebSocketServer({ server });
+  const received: StubRuntime["received"] = [];
+  const clients = new Set<WebSocket>();
+  sockets.on("connection", (client) => {
+    clients.add(client);
+    client.on("close", () => clients.delete(client));
+    client.on("message", (raw, isBinary) => {
+      received.push({ raw: raw as Buffer, isBinary });
+    });
+  });
   // Closing an http server waits for its connections to end, and a coordinator
   // holds an open WebSocket to this one — so a test that shuts the host down
   // would wait on the very socket it is trying to take away. Track them and
@@ -78,6 +91,12 @@ export async function startStubRuntime(runtimeId: string): Promise<StubRuntime> 
   return {
     url: `http://127.0.0.1:${port}`,
     configured,
+    received,
+    emit: (frame) => {
+      for (const client of clients) {
+        client.send(frame);
+      }
+    },
     close: () =>
       new Promise<void>((resolve) => {
         sockets.close();

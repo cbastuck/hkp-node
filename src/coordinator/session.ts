@@ -11,6 +11,7 @@ import { assertRuntimeUrlAllowed } from "./urlGuard";
 import { LogStore } from "./logStore";
 import { LogEntry, LogLevel } from "../types";
 import { MOUNT_FIELD, collectMountRefs, formatMountRef } from "./mount";
+import { MessagePurpose, decodeYasMessage, encodeYasBinary } from "../yas";
 import {
   BridgeMessage,
   RuntimeSnapshot,
@@ -526,7 +527,31 @@ export class BoardSession {
       );
     });
 
-    socket.on("message", (raw) => {
+    socket.on("message", (raw, isBinary) => {
+      // A result that is bytes arrives as a YAS frame rather than JSON.
+      if (isBinary) {
+        const frame = decodeYasMessage(
+          Array.isArray(raw)
+            ? Buffer.concat(raw)
+            : Buffer.isBuffer(raw)
+              ? raw
+              : Buffer.from(raw),
+        );
+        if (
+          frame &&
+          frame.purpose !== MessagePurpose.NOTIFICATION &&
+          frame.data
+        ) {
+          this.routeResult(runtime.id, frame.data).catch((err) => {
+            console.error(
+              `[coordinator] Failed to route result from runtime "${runtime.id}":`,
+              err instanceof Error ? err.message : err,
+            );
+          });
+        }
+        return;
+      }
+
       let message: {
         type?: string;
         data?: unknown;
@@ -940,7 +965,11 @@ export class BoardSession {
         );
         return;
       }
-      nextSocket.send(JSON.stringify({ type: "processRuntime", params: data }));
+      nextSocket.send(
+        data instanceof Uint8Array
+          ? encodeYasBinary(data, MessagePurpose.RESULT)
+          : JSON.stringify({ type: "processRuntime", params: data }),
+      );
       return;
     }
 

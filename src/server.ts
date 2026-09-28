@@ -89,6 +89,7 @@ import {
   TenantRuntimes,
 } from "./runtime";
 import { MountRegistry } from "./mounts";
+import { MessagePurpose, decodeYasMessage, encodeYasBinary } from "./yas";
 import {
   AllowedOrigins,
   AuthConfig,
@@ -203,6 +204,42 @@ type WsInboundMessage = {
   /** The run this call belongs to, as its caller named it; see ProcessContext. */
   context?: unknown;
 };
+
+/**
+ * What a runtime socket frame asks for. Text frames are JSON; a binary frame is
+ * a YAS message carrying bytes, which JSON cannot — the peer sends one for a
+ * pass that is bytes (encoded audio, say), and it runs the pipeline with those
+ * bytes as a Buffer. A binary frame has no room for a run context, so its pass
+ * begins a run of its own.
+ */
+function readInbound(
+  raw: Buffer | ArrayBuffer | Buffer[],
+  isBinary: boolean,
+): WsInboundMessage | null {
+  const bytes = Array.isArray(raw)
+    ? Buffer.concat(raw)
+    : Buffer.isBuffer(raw)
+      ? raw
+      : Buffer.from(raw);
+  if (!isBinary) {
+    try {
+      return JSON.parse(bytes.toString());
+    } catch {
+      return null;
+    }
+  }
+  const message = decodeYasMessage(bytes);
+  // A NOTIFICATION frame answers a request this server never makes, and a type
+  // this server does not read has nothing a Node service could use.
+  if (
+    !message ||
+    message.purpose === MessagePurpose.NOTIFICATION ||
+    message.data === undefined
+  ) {
+    return null;
+  }
+  return { type: "processRuntime", params: message.data };
+}
 
 export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
   // Tests and local dev default to no auth; index.ts always resolves an explicit
@@ -589,6 +626,11 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
 
   function sendJsonResult(socket: WebSocket, result: unknown) {
     if (socket.readyState !== WebSocket.OPEN) {
+      return;
+    }
+    // Bytes as bytes: JSON would spell each one out as a numbered key.
+    if (result instanceof Uint8Array) {
+      socket.send(encodeYasBinary(result, MessagePurpose.RESULT));
       return;
     }
     socket.send(JSON.stringify({ type: "result", data: result }));
@@ -1163,11 +1205,12 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
         }
       });
 
-      socket.on("message", async (raw) => {
-        let message: WsInboundMessage;
-        try {
-          message = JSON.parse(raw.toString());
-        } catch {
+      // Passes enter the pipeline in the order their frames arrive: nothing
+      // is awaited before process() starts, and the pipeline runs until its
+      // first asynchronous service within that call.
+      socket.on("message", async (raw, isBinary) => {
+        const message = readInbound(raw, isBinary);
+        if (!message) {
           return;
         }
 
