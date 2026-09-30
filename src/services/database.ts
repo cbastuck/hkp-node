@@ -45,6 +45,9 @@ export type Database = {
   close(): void;
 };
 
+/** A database as a list of them shows it. */
+export type DatabaseInfo = { name: string; bytes: number };
+
 export type DatabaseStore = {
   /** The database for one board, opened on first use and kept open. */
   open(scope: RuntimeScope): Database;
@@ -69,6 +72,14 @@ export type DatabaseStore = {
    * Throws when the name is not one a board may use.
    */
   openNamed(owner: string, name: string): Database;
+  /**
+   * The owner's databases a board can name, with their size on disk.
+   *
+   * Only those: a board's derived database is filed under a hash of its title,
+   * which no board can write back as a `database`, and `shared` is the
+   * runtime's own. Sorted by name.
+   */
+  list(owner: string): DatabaseInfo[];
   /** Closes every open database. For shutdown, and for tests. */
   closeAll(): void;
 };
@@ -125,6 +136,13 @@ const namedKey = (owner: string, name: string): string =>
  * rather than a pipeline that appears to hang.
  */
 const BUSY_TIMEOUT_MS = 5000;
+
+/** What `hashed` produces, which is how a derived database's file is named. */
+const HASHED_NAME = /^[0-9a-f]{64}$/;
+
+/** Whether a file's stem is a database a board can ask for by name. */
+const isNameable = (stem: string): boolean =>
+  checkDatabaseName(stem) === null && !HASHED_NAME.test(stem);
 
 /** Names in a path are derived, never used: a board names neither of these. */
 function hashed(value: string): string {
@@ -260,6 +278,32 @@ export function createFileDatabaseStore(root: string): DatabaseStore {
       }
       return openFile(namedKey(owner, name), owner, name);
     },
+    list: (owner) => {
+      const dir = path.join(root, hashed(owner));
+      let files: string[];
+      try {
+        files = fs.readdirSync(dir);
+      } catch {
+        return [];
+      }
+      const size = (file: string): number => {
+        try {
+          return fs.statSync(path.join(dir, file)).size;
+        } catch {
+          return 0;
+        }
+      };
+      return files
+        .filter((file) => file.endsWith(".db"))
+        .map((file) => file.slice(0, -".db".length))
+        .filter(isNameable)
+        .map((name) => ({
+          name,
+          // A WAL file holds writes not yet folded into the database file.
+          bytes: size(`${name}.db`) + size(`${name}.db-wal`),
+        }))
+        .sort((a, b) => a.name.localeCompare(b.name));
+    },
     closeAll() {
       for (const db of open.values()) {
         db.close();
@@ -296,6 +340,19 @@ export function createMemoryDatabaseStore(): DatabaseStore {
         throw new Error(wrong);
       }
       return openInMemory(namedKey(owner, name));
+    },
+    list: (owner) => {
+      const found: DatabaseInfo[] = [];
+      for (const [key, db] of open) {
+        const [kind, keyOwner, name] = JSON.parse(key) as string[];
+        if (kind === "named" && keyOwner === owner) {
+          const [{ bytes }] = db.query(
+            "SELECT page_count * page_size AS bytes FROM pragma_page_count(), pragma_page_size()",
+          ) as { bytes: number }[];
+          found.push({ name, bytes });
+        }
+      }
+      return found.sort((a, b) => a.name.localeCompare(b.name));
     },
     closeAll() {
       for (const db of open.values()) {
