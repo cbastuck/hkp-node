@@ -18,6 +18,7 @@ import {
   ServiceStates,
   isBridgeMessage,
 } from "./bridgeProtocol";
+import { AssetDescriptor, referencedAssets } from "../assets";
 
 type ProvisionedRuntime = {
   descriptor: CloudRuntimeDescriptor;
@@ -405,6 +406,21 @@ export class BoardSession {
 
   // ── Private ───────────────────────────────────────────────────────────────
 
+  private assetsReferencedBy(
+    services: CloudBoardConfig["services"][string],
+  ): Record<string, AssetDescriptor> {
+    const wanted = new Set(
+      referencedAssets(services.map((svc) => svc.state ?? {})),
+    );
+    const assets: Record<string, AssetDescriptor> = {};
+    for (const descriptor of this.config.assets ?? []) {
+      if (wanted.has(descriptor.id)) {
+        assets[descriptor.id] = descriptor;
+      }
+    }
+    return assets;
+  }
+
   private async provision(
     runtime: CloudRuntimeDescriptor,
     services: CloudBoardConfig["services"][string],
@@ -447,6 +463,11 @@ export class BoardSession {
           serviceName: svc.serviceName ?? svc.name ?? svc.serviceId,
           state: svc.state ?? {},
         })),
+        // The descriptors this runtime's services reference, and no others:
+        // inline assets can be large, and a runtime holds none it has no use
+        // for. Host-local content cannot travel this way — a `file://` source
+        // is read by the runtime, inside its own volumes.
+        assets: this.assetsReferencedBy(services),
       };
 
       const response = await fetch(`${baseUrl}/runtimes`, {
@@ -748,6 +769,29 @@ export class BoardSession {
     const path = `/runtimes/${encodeURIComponent(runtime.id)}/services/${encodeURIComponent(message.serviceUuid)}`;
 
     try {
+      // A configuration may name an asset the runtime was not provisioned
+      // with; it gets the descriptor first, as it would from a browser.
+      const assets = this.assetsReferencedBy([
+        {
+          uuid: message.serviceUuid,
+          serviceId: "",
+          state: (message.config ?? {}) as Record<string, unknown>,
+        },
+      ]);
+      if (Object.keys(assets).length) {
+        await fetch(
+          `${runtime.url}/runtimes/${encodeURIComponent(runtime.id)}/assets`,
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              ...this.bearer(this.sessionTokens.get(runtime.id)),
+            },
+            body: JSON.stringify(assets),
+          },
+        );
+      }
+
       const res = await fetch(`${runtime.url}${path}`, {
         method: "POST",
         headers: {

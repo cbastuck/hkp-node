@@ -119,6 +119,7 @@ export class SubService implements HostedService {
     this.applyLogSettings();
     this.applyScope();
     this.applySecrets();
+    this.applyAssets();
     this.applySlots();
     this.applyMounts();
   }
@@ -166,6 +167,15 @@ export class SubService implements HostedService {
    */
   private applySecrets(): void {
     this.pipeline?.delegateSecrets(() => this.host?.secrets?.() ?? null);
+  }
+
+  /**
+   * Points the nested pipeline at the surrounding runtime's assets, for the same
+   * reason as secrets: nothing provisions it, so it asks outward on each
+   * lookup and sees an asset edited while the board runs.
+   */
+  private applyAssets(): void {
+    this.pipeline?.delegateAssets(() => this.host?.assets?.() ?? null);
   }
 
   /**
@@ -510,6 +520,7 @@ export class SubService implements HostedService {
     this.applyLogSettings();
     this.applyScope();
     this.applySecrets();
+    this.applyAssets();
     this.applySlots();
     this.applyMounts();
   }

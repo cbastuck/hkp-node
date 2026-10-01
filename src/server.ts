@@ -59,6 +59,8 @@ import {
 } from "./services/recordStore";
 import {
   FileStore,
+  checkFilePath,
+  checkVolumeName,
   createDiskFileStore,
   createMemoryFileStore,
 } from "./services/fileStore";
@@ -86,6 +88,7 @@ import {
 } from "./services/text-generation";
 import { InjectorService, injectorDescriptor } from "./services/injector";
 import { RssService, rssDescriptor } from "./services/rss";
+import { AssetService, assetDescriptor } from "./services/asset";
 import {
   contextFromWire,
   HostedRuntime,
@@ -114,6 +117,7 @@ import {
   ServiceConfiguration,
 } from "./types";
 import { readSecretsPayload } from "./secrets";
+import { AssetDescriptor, readAssetsPayload } from "./assets";
 
 /**
  * Per-tenant limits. Runtimes, services and timers all consume resources on a
@@ -517,6 +521,13 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
         create: (config, _createService) => new RssService(config),
       },
     ],
+    [
+      assetDescriptor.serviceId,
+      {
+        descriptor: assetDescriptor,
+        create: (config, _createService) => new AssetService(config),
+      },
+    ],
   ]);
 
   // Public service endpoints. Declared before the runtime app because runtimes
@@ -534,10 +545,31 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
     options.mountSecret,
   );
 
-  const runtimeApp = new RuntimeApp(factories, (owner, runtimeId) => ({
-    mount: (serviceUuid, handlers, options) =>
-      mounts.register(owner, runtimeId, serviceUuid, handlers, options),
-  }));
+  const runtimeApp = new RuntimeApp(
+    factories,
+    (owner, runtimeId) => ({
+      mount: (serviceUuid, handlers, options) =>
+        mounts.register(owner, runtimeId, serviceUuid, handlers, options),
+    }),
+    // A `file://` asset is a file in one of the tenant's volumes —
+    // `file:///<volume>/<path>` — read through the same store and the same
+    // checks as `filesystem`. Nothing outside a volume is ever read: a shared
+    // board naming a path on this machine is refused, not served.
+    async (scope, url) => {
+      const [volume, ...rest] = decodeURIComponent(url.pathname)
+        .split("/")
+        .filter((segment) => segment !== "");
+      if (!volume || url.host || checkVolumeName(volume)) {
+        return null;
+      }
+      const checked = checkFilePath(rest.join("/"));
+      if ("error" in checked) {
+        return null;
+      }
+      const found = await files.read({ ...scope, volume }, checked.path);
+      return found?.bytes ?? null;
+    },
+  );
   const expressApp = express();
   expressApp.use(
     cors({
@@ -843,6 +875,46 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
     const entries = readSecretsPayload(req.body);
     runtime.setSecrets(entries);
     res.json({ aliases: runtime.secrets().aliases() });
+  });
+
+  /**
+   * Descriptors for the assets this runtime's services reference.
+   *
+   * Provisioning carries them already; this is for a configuration that names
+   * one the runtime was not given, for an asset edited while the board runs —
+   * which is how an edit reaches a service without reconfiguring it — and for a
+   * re-push after a restart. It merges, and `null` removes an asset.
+   *
+   * Answers with the ids held, never content: what a runtime has can be named,
+   * and a client that wants the content has the board.
+   */
+  expressApp.post("/runtimes/:runtimeId/assets", (req, res) => {
+    const runtime = getRuntimeOr404(req, res, req.params.runtimeId);
+    if (!runtime) {
+      return;
+    }
+    runtime.setAssets(readAssetsPayload(req.body));
+    res.json({ ids: runtime.assets().ids() });
+  });
+
+  /**
+   * Whether an asset resolves here, and to what — its media type and size, or
+   * the reason it does not. A check, not a download: the content stays where
+   * it is, and a URL source is fetched from where it will actually be used.
+   */
+  expressApp.get("/runtimes/:runtimeId/assets/:assetId", async (req, res) => {
+    const runtime = getRuntimeOr404(req, res, req.params.runtimeId);
+    if (!runtime) {
+      return;
+    }
+    const { asset, problem } = await runtime
+      .assets()
+      .resolve(`hkp-asset://${req.params.assetId}`);
+    res.json(
+      asset
+        ? { ok: true, mediaType: asset.mediaType, size: asset.bytes.length }
+        : { ok: false, problem },
+    );
   });
 
   expressApp.post("/runtimes/:runtimeId/rearrange", (req, res) => {
@@ -1348,8 +1420,23 @@ function validateRuntimeConfiguration(
     // here and handed to the runtime's vault; they are never put back into any
     // service's state, and never appear in a serialized runtime.
     secrets: readSecretsPayload(value.secrets),
+    // Descriptors for the assets the services reference; a removal means
+    // nothing to a runtime being created, so only descriptors are kept.
+    assets: presentAssets(readAssetsPayload(value.assets)),
     services,
   };
+}
+
+function presentAssets(
+  entries: Record<string, AssetDescriptor | null>,
+): Record<string, AssetDescriptor> {
+  const present: Record<string, AssetDescriptor> = {};
+  for (const [id, entry] of Object.entries(entries)) {
+    if (entry) {
+      present[id] = entry;
+    }
+  }
+  return present;
 }
 
 function validateServiceConfiguration(

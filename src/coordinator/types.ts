@@ -1,3 +1,5 @@
+import { AssetDescriptor } from "../assets";
+
 export type CloudRuntimeType =
   | "browser"
   | "graphql"
@@ -40,6 +42,11 @@ export type CloudBoardConfig = {
   runtimes: CloudRuntimeDescriptor[];
   services: Record<string, CloudServiceDescriptor[]>;
   facade?: unknown;
+  /**
+   * The board's asset descriptors. Each provisioned runtime is sent the ones
+   * its services reference, the way a browser provisioning the board does.
+   */
+  assets?: AssetDescriptor[];
 };
 
 /**

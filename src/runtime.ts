@@ -20,6 +20,7 @@ import {
 } from "./types";
 import { ADDRESS_SEPARATOR, descend, splitAddress } from "./address";
 import { SecretVault } from "./secrets";
+import { AssetDescriptor, AssetStore } from "./assets";
 import { ANONYMOUS_SUB } from "./auth";
 import { MountHandle, MountHandlers } from "./mounts";
 
@@ -86,6 +87,17 @@ export type RuntimeMounts = {
   ): MountHandle | null;
 };
 
+/**
+ * How a runtime reads a `file://` asset source, supplied by the server that owns
+ * the file store. Given the runtime's scope, because a path only means
+ * something inside the tenant it belongs to. Absent: no `file://` source
+ * resolves.
+ */
+export type AssetFileReader = (
+  scope: RuntimeScope,
+  url: URL,
+) => Promise<Uint8Array | null>;
+
 export class HostedRuntime implements RuntimeHost {
   readonly id: string;
   readonly name: string;
@@ -147,6 +159,16 @@ export class HostedRuntime implements RuntimeHost {
    */
   private secretsFrom: (() => SecretVault | null) | null = null;
   /**
+   * The descriptors of the assets this runtime's services reference, and the
+   * content they resolve to. Reachable through `assets()`.
+   */
+  private readonly assetStore: AssetStore;
+  /**
+   * Where this runtime's assets actually come from, when they are not its own;
+   * see `delegateAssets`.
+   */
+  private assetsFrom: (() => AssetStore | null) | null = null;
+  /**
    * The cells services in this runtime hold values in between passes.
    *
    * Owned rather than delegated by default: a runtime is the outermost thing a
@@ -168,6 +190,7 @@ export class HostedRuntime implements RuntimeHost {
     // read from the config a client sent. Absent collapses to the single tenant
     // an unauthenticated server already uses.
     owner: string = ANONYMOUS_SUB,
+    readAssetFile?: AssetFileReader,
   ) {
     this.id = config.id;
     this.name = config.name;
@@ -186,6 +209,19 @@ export class HostedRuntime implements RuntimeHost {
     // while being configured asks for its credential during `addService`.
     if (config.secrets) {
       this.vault.replace(config.secrets);
+    }
+    // Likewise assets: a service that loads its content while being configured
+    // asks for it during `addService`.
+    this.assetStore = new AssetStore(
+      {
+        readFile: readAssetFile
+          ? (url) => readAssetFile(this.scope(), url)
+          : undefined,
+      },
+      () => this.secrets(),
+    );
+    if (config.assets) {
+      this.assetStore.replace(config.assets);
     }
 
     for (const serviceConfig of config.services) {
@@ -567,6 +603,31 @@ export class HostedRuntime implements RuntimeHost {
     this.secretsFrom = source;
   }
 
+  assets(): AssetStore {
+    return this.assetsFrom?.() ?? this.assetStore;
+  }
+
+  /**
+   * Take assets from somewhere else rather than from this runtime's own store.
+   *
+   * The same arrangement as secrets: a nested pipeline is provisioned by nobody,
+   * so it asks the runtime around it — on each lookup, so an asset edited while
+   * the board runs is what a nested service resolves next, and so nesting
+   * composes outward to the runtime that was actually given the descriptors.
+   */
+  delegateAssets(source: () => AssetStore | null): void {
+    this.assetsFrom = source;
+  }
+
+  /**
+   * Takes in descriptors for assets this runtime's services reference, or
+   * `null` for one that was deleted. Merges, like secrets, because a client
+   * edits one asset at a time.
+   */
+  setAssets(entries: Record<string, AssetDescriptor | null>): void {
+    this.assetStore.merge(entries);
+  }
+
   slots(): SlotStore {
     return this.slotsFrom?.() ?? this.ownSlots;
   }
@@ -856,6 +917,9 @@ export class RuntimeApp {
       owner: string,
       runtimeId: string,
     ) => RuntimeMounts,
+    // Supplied by the server, which owns the file store. Absent: no runtime
+    // resolves a `file://` asset.
+    private readonly readAssetFile?: AssetFileReader,
   ) {}
 
   /** A tenant-scoped view; the only way route handlers reach runtimes. */
@@ -873,6 +937,7 @@ export class RuntimeApp {
       (serviceConfig) => this.createService(serviceConfig),
       this.mountsFor?.(owner, config.id),
       owner,
+      this.readAssetFile,
     );
     owned.set(runtime.id, runtime);
     return runtime;

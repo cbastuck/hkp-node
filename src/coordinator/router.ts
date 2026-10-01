@@ -2,6 +2,7 @@ import { Router, Request, Response } from "express";
 import { BoardCoordinator } from "./coordinator";
 import { createAuthMiddleware, requireSelf } from "./auth";
 import { AuthConfig } from "../auth";
+import { AssetDescriptor, readAssetsPayload } from "../assets";
 import { CloudBoardConfig, CloudRuntimeDescriptor, CloudServiceDescriptor } from "./types";
 
 export type CoordinatorRouterOptions = {
@@ -223,10 +224,17 @@ function parseCloudBoardConfig(value: unknown): CloudBoardConfig | null {
   const runtimes = obj.runtimes as CloudRuntimeDescriptor[];
   const services = obj.services as Record<string, CloudServiceDescriptor[]>;
 
+  // Descriptors only; one that cannot be read is dropped, and the service
+  // referencing it says so by name when it resolves.
+  const assets = Object.values(readAssetsPayload(obj.assets)).filter(
+    (entry): entry is AssetDescriptor => entry !== null,
+  );
+
   return {
     boardName: obj.boardName,
     runtimes,
     services,
     facade: obj.facade,
+    ...(assets.length ? { assets } : {}),
   };
 }

@@ -47,6 +47,12 @@
  * serve a feed as XML and the next serve an audio file as audio — without which
  * an endpoint can only ever say `application/json`, whatever it is holding.
  *
+ * A `body` that is an `hkp-asset://<id>` reference is answered with that
+ * asset's content, resolved from the runtime's asset store as the answer is
+ * written, and with the asset's media type unless `meta` names one. A page an
+ * endpoint serves is therefore an asset of the board rather than a string in
+ * this service's state, and editing it changes the next response.
+ *
  * Byte answers are seekable: `Range` is honoured against the bytes the handler
  * produced, because a player dragging a scrubber asks for one and a server that
  * ignores it re-sends the whole file each time.
@@ -61,6 +67,7 @@ import { IncomingMessage, ServerResponse } from "node:http";
 
 import { newRun } from "../runtime";
 import { MountContext, MountHandle } from "../mounts";
+import { parseAssetRef } from "../assets";
 import {
   HostedService,
   JsonRecord,
@@ -1096,7 +1103,55 @@ export class HttpServerSubservicesService implements HostedService {
       this.host.emitResult(output);
     }
 
-    this.sendAnswer(req, res, answeredHere ? answer : output);
+    this.sendAnswer(
+      req,
+      res,
+      await this.resolveAssetBody(answeredHere ? answer : output),
+    );
+  }
+
+  /**
+   * An answer whose `body` is an `hkp-asset://` reference, with the asset's
+   * content in its place.
+   *
+   * Resolved as the answer is written, from the runtime's asset store, so the
+   * page an endpoint serves is whatever the asset holds now: editing it changes
+   * the next response and nothing is reconfigured. The content type is the
+   * asset's own unless the envelope named one.
+   *
+   * A reference that does not resolve is answered as a 500 naming the asset and
+   * why, and reported. Sending the reference itself as the page would be a
+   * quieter failure, and a worse one.
+   */
+  private async resolveAssetBody(value: unknown): Promise<unknown> {
+    const envelope = asResponseEnvelope(value);
+    if (!envelope || !parseAssetRef(envelope.body)) {
+      return value;
+    }
+    const meta = envelope.meta ?? {};
+    const store = this.host?.assets?.();
+    const { asset, problem } = store
+      ? await store.resolve(envelope.body as string)
+      : { asset: null, problem: "this runtime has no assets" };
+    if (!asset) {
+      this.notify({ error: problem });
+      return {
+        meta: { status: 500, contentType: "application/json" },
+        body: { error: problem },
+      };
+    }
+    const { body: _reference, ...rest } = envelope;
+    return {
+      ...rest,
+      meta: {
+        ...meta,
+        contentType:
+          typeof meta.contentType === "string" && meta.contentType
+            ? meta.contentType
+            : asset.mediaType,
+      },
+      binary: asset.bytes,
+    };
   }
 
   /**
