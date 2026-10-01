@@ -1,14 +1,15 @@
 import { afterEach, describe, expect, it } from "vitest";
 
-// The runtimes in these tests are on loopback, which the SSRF guard blocks by
-// default. Set before anything reads the policy (it is cached on first read).
-process.env.HKP_ALLOW_PRIVATE_RUNTIMES = "true";
-
 import { createRuntimeServer } from "../src/server";
-import { BoardSession } from "../src/coordinator/session";
 import { peerServerDescriptor } from "../src/services/peer-server";
 import { monitorDescriptor } from "../src/services/monitor";
-import { startStubRuntime } from "./stubRuntime";
+import { CloudBoardConfig } from "../src/coordinator/types";
+import {
+  FAST_LINKS,
+  fakeParticipants,
+  startCoordinator,
+  startSession,
+} from "./cloud";
 import {
   collectMountRefs,
   formatMountRef,
@@ -78,26 +79,52 @@ describe("coordinator mount resolution", () => {
     }
   });
 
-  async function startOwnerRuntime() {
-    const server = createRuntimeServer({
+  /**
+   * A board whose `rt-owner` is a real runtime server, connected with a ticket,
+   * and whose `rt-consumer` records what the coordinator configures on it —
+   * hkp-node has no service that consumes a mount, so the consumer side is
+   * observed at the connection rather than in a service.
+   */
+  async function startBoard(config: CloudBoardConfig, withOwner = true) {
+    const owner = createRuntimeServer({
       externalHost: "127.0.0.1",
       auth: { mode: "none" },
+      coordinatorLinkOptions: FAST_LINKS,
     });
-    cleanups.push(() => server.stop());
-    const { baseUrl } = await server.start();
-    return baseUrl;
+    cleanups.push(() => owner.stop());
+    const { baseUrl: ownerUrl } = await owner.start();
+    const host = await startCoordinator();
+    cleanups.push(host.stop);
+
+    const fakes = fakeParticipants();
+    const consumer = fakes.join("rt-consumer");
+    const session = await startSession(
+      host,
+      config,
+      withOwner ? { "rt-owner": owner } : {},
+      fakes.participants,
+    );
+    cleanups.push(() => session.destroy());
+
+    const configured = consumer.requests.flatMap((request) =>
+      request.op === "configureService"
+        ? [
+            {
+              serviceUuid: request.serviceUuid,
+              state: request.config as Record<string, unknown>,
+            },
+          ]
+        : [],
+    );
+    return { ownerUrl, configured };
   }
 
   it("hands a consumer the address of a mount on another runtime", async () => {
-    const ownerUrl = await startOwnerRuntime();
-    const consumer = await startStubRuntime("rt-consumer");
-    cleanups.push(consumer.close);
-
-    const session = new BoardSession("board-1", "user-1", {
+    const { ownerUrl, configured } = await startBoard({
       boardName: "board-1",
       runtimes: [
-        { id: "rt-owner", name: "Owner", type: "rest", url: ownerUrl },
-        { id: "rt-consumer", name: "Consumer", type: "rest", url: consumer.url },
+        { id: "rt-owner", name: "Owner", type: "rest" },
+        { id: "rt-consumer", name: "Consumer", type: "rest" },
       ],
       services: {
         "rt-owner": [
@@ -119,14 +146,11 @@ describe("coordinator mount resolution", () => {
         ],
       },
     });
-    cleanups.push(() => session.destroy());
-
-    await session.start();
 
     // A runtime cannot resolve this for itself: the reference names a service
     // on a different runtime, which only the coordinator can see.
-    expect(consumer.configured).toHaveLength(1);
-    const [call] = consumer.configured;
+    expect(configured).toHaveLength(1);
+    const [call] = configured;
     expect(call.serviceUuid).toBe("consumer-1");
     expect(call.state.__hkpMount).toMatch(
       new RegExp(`^${ownerUrl}/hosted/[0-9a-f]{32}$`),
@@ -140,15 +164,11 @@ describe("coordinator mount resolution", () => {
   it("resolves a reference written in the service's own field", async () => {
     // The field a person writes is the one the service already calls its
     // target; the reference is found by its scheme, wherever it sits.
-    const ownerUrl = await startOwnerRuntime();
-    const consumer = await startStubRuntime("rt-consumer");
-    cleanups.push(consumer.close);
-
-    const session = new BoardSession("board-1", "user-1", {
+    const { ownerUrl, configured } = await startBoard({
       boardName: "board-1",
       runtimes: [
-        { id: "rt-owner", name: "Owner", type: "rest", url: ownerUrl },
-        { id: "rt-consumer", name: "Consumer", type: "rest", url: consumer.url },
+        { id: "rt-owner", name: "Owner", type: "rest" },
+        { id: "rt-consumer", name: "Consumer", type: "rest" },
       ],
       services: {
         "rt-owner": [
@@ -167,12 +187,9 @@ describe("coordinator mount resolution", () => {
         ],
       },
     });
-    cleanups.push(() => session.destroy());
 
-    await session.start();
-
-    expect(consumer.configured).toHaveLength(1);
-    const [call] = consumer.configured;
+    expect(configured).toHaveLength(1);
+    const [call] = configured;
     expect(call.state.__hkpMount).toMatch(
       new RegExp(`^${ownerUrl}/hosted/[0-9a-f]{32}$`),
     );
@@ -181,15 +198,11 @@ describe("coordinator mount resolution", () => {
   });
 
   it("finds a reference nested inside a sub-pipeline", async () => {
-    const ownerUrl = await startOwnerRuntime();
-    const consumer = await startStubRuntime("rt-consumer");
-    cleanups.push(consumer.close);
-
-    const session = new BoardSession("board-1", "user-1", {
+    const { ownerUrl, configured } = await startBoard({
       boardName: "board-1",
       runtimes: [
-        { id: "rt-owner", name: "Owner", type: "rest", url: ownerUrl },
-        { id: "rt-consumer", name: "Consumer", type: "rest", url: consumer.url },
+        { id: "rt-owner", name: "Owner", type: "rest" },
+        { id: "rt-consumer", name: "Consumer", type: "rest" },
       ],
       services: {
         "rt-owner": [
@@ -216,41 +229,33 @@ describe("coordinator mount resolution", () => {
         ],
       },
     });
-    cleanups.push(() => session.destroy());
 
-    await session.start();
-
-    expect(consumer.configured).toHaveLength(1);
-    expect(consumer.configured[0].state.__hkpMount).toMatch(
+    expect(configured).toHaveLength(1);
+    expect(configured[0].state.__hkpMount).toMatch(
       new RegExp(`^${ownerUrl}/hosted/[0-9a-f]{32}$`),
     );
   });
 
   it("leaves a reference alone when nothing on the board owns it", async () => {
-    const consumer = await startStubRuntime("rt-consumer");
-    cleanups.push(consumer.close);
-
-    const session = new BoardSession("board-2", "user-1", {
-      boardName: "board-2",
-      runtimes: [
-        { id: "rt-consumer", name: "Consumer", type: "rest", url: consumer.url },
-      ],
-      services: {
-        "rt-consumer": [
-          {
-            uuid: "consumer-1",
-            serviceId: monitorDescriptor.serviceId,
-            state: { __hkpMount: "hkp-mount://rt-gone/peer-1" },
-          },
-        ],
+    const { configured } = await startBoard(
+      {
+        boardName: "board-2",
+        runtimes: [{ id: "rt-consumer", name: "Consumer", type: "rest" }],
+        services: {
+          "rt-consumer": [
+            {
+              uuid: "consumer-1",
+              serviceId: monitorDescriptor.serviceId,
+              state: { __hkpMount: "hkp-mount://rt-gone/peer-1" },
+            },
+          ],
+        },
       },
-    });
-    cleanups.push(() => session.destroy());
-
-    await session.start();
+      false,
+    );
 
     // Nothing to hand over, so nothing is sent — the board keeps describing
     // what it wanted rather than being blanked into an unconfigured service.
-    expect(consumer.configured).toEqual([]);
+    expect(configured).toEqual([]);
   });
 });

@@ -43,6 +43,13 @@ export type BridgeMessage =
       boardName: string;
       status: string;
       /**
+       * Why the board is not running cleanly, when it is not — which runtime
+       * is not connected, what could not be built. Sent with the status rather
+       * than fetched beside it, because both change while a browser watches:
+       * a participant dropping is something an attached browser is told.
+       */
+      errors: string[];
+      /**
        * The board as authored. Also fetchable over REST — the board list reads
        * it there for boards nobody has attached to — but sent here so that an
        * attached browser gets structure and live state as one consistent thing,

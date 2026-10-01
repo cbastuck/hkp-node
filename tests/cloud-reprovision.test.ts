@@ -1,15 +1,15 @@
 import request from "supertest";
 import { afterEach, describe, expect, it } from "vitest";
 
-// The runtimes in these tests are on loopback, which the SSRF guard blocks by
-// default. Set before anything reads the policy (it is cached on first read).
-process.env.HKP_ALLOW_PRIVATE_RUNTIMES = "true";
-
 import { createRuntimeServer } from "../src/server";
-import { BoardSession } from "../src/coordinator/session";
 import { httpServerSubservicesDescriptor } from "../src/services/http-server";
 import { monitorDescriptor } from "../src/services/monitor";
-import { startStubRuntime } from "./stubRuntime";
+import {
+  FAST_LINKS,
+  fakeParticipants,
+  startCoordinator,
+  startSession,
+} from "./cloud";
 
 /**
  * What posting a runtime means.
@@ -45,6 +45,7 @@ async function startServer() {
   const server = createRuntimeServer({
     externalHost: "127.0.0.1",
     auth: { mode: "none" },
+    coordinatorLinkOptions: FAST_LINKS,
   });
   servers.push(server);
   const { baseUrl } = await server.start();
@@ -154,30 +155,35 @@ describe("deploying a board", () => {
     // The point of deploying: the coordinator owns the board, so its runtimes
     // are not tied to whoever is watching. A viewer that never provisions
     // cannot disturb them either.
-    const { server, baseUrl } = await startServer();
-    const consumer = await startStubRuntime("rt-consumer");
-    cleanups.push(consumer.close);
+    const { server } = await startServer();
+    const host = await startCoordinator();
+    cleanups.push(host.stop);
+    const fakes = fakeParticipants();
+    const consumer = fakes.join("rt-consumer");
 
-    const session = new BoardSession("board-1", "user-1", {
-      boardName: "board-1",
-      runtimes: [
-        { id: "rt-owner", name: "Owner", type: "rest", url: baseUrl },
-        { id: "rt-consumer", name: "Consumer", type: "rest", url: consumer.url },
-      ],
-      services: {
-        "rt-owner": [endpointService],
-        "rt-consumer": [
-          {
-            uuid: "consumer-1",
-            serviceId: monitorDescriptor.serviceId,
-            state: { __hkpMount: "hkp-mount://rt-owner/http-1" },
-          },
+    const session = await startSession(
+      host,
+      {
+        boardName: "board-1",
+        runtimes: [
+          { id: "rt-owner", name: "Owner", type: "rest" },
+          { id: "rt-consumer", name: "Consumer", type: "rest" },
         ],
+        services: {
+          "rt-owner": [endpointService],
+          "rt-consumer": [
+            {
+              uuid: "consumer-1",
+              serviceId: monitorDescriptor.serviceId,
+              state: { __hkpMount: "hkp-mount://rt-owner/http-1" },
+            },
+          ],
+        },
       },
-    });
+      { "rt-owner": server },
+      fakes.participants,
+    );
     cleanups.push(() => session.destroy());
-
-    await session.start();
 
     const { body } = await request(server.httpServer)
       .get("/runtimes/rt-owner")
@@ -185,7 +191,9 @@ describe("deploying a board", () => {
     expect(body.garbageCollected).toBe(false);
 
     // And the address it resolved for the consumer is live.
-    const handedOver = String(consumer.configured[0].state.__hkpMount);
-    expect((await fetch(handedOver)).status).toBe(200);
+    const configure = consumer.requests.find(
+      (request) => request.op === "configureService",
+    ) as { config: Record<string, unknown> };
+    expect((await fetch(String(configure.config.__hkpMount))).status).toBe(200);
   });
 });

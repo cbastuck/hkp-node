@@ -1,13 +1,9 @@
 import request from "supertest";
 import { afterEach, describe, expect, it } from "vitest";
 
-// The runtimes in these tests are on loopback, which the SSRF guard blocks by
-// default. Set before anything reads the policy (it is cached on first read).
-process.env.HKP_ALLOW_PRIVATE_RUNTIMES = "true";
-
 import { createRuntimeServer } from "../src/server";
-import { BoardCoordinator } from "../src/coordinator/coordinator";
 import { monitorDescriptor } from "../src/services/monitor";
+import { CoordinatorHost, FAST_LINKS, introduce, startCoordinator } from "./cloud";
 
 /**
  * Registering the same board twice at once.
@@ -26,11 +22,11 @@ import { monitorDescriptor } from "../src/services/monitor";
 type Server = ReturnType<typeof createRuntimeServer>;
 
 const servers: Server[] = [];
-const coordinators: BoardCoordinator[] = [];
+const hosts: CoordinatorHost[] = [];
 
 afterEach(async () => {
-  while (coordinators.length) {
-    coordinators.pop()?.destroyAll();
+  while (hosts.length) {
+    await hosts.pop()?.stop();
   }
   while (servers.length) {
     await servers.pop()?.stop();
@@ -41,18 +37,25 @@ async function startRuntimeServer() {
   const server = createRuntimeServer({
     externalHost: "127.0.0.1",
     auth: { mode: "none" },
+    coordinatorLinkOptions: FAST_LINKS,
   });
   servers.push(server);
   const { baseUrl } = await server.start();
   return { server, baseUrl };
 }
 
-function boardConfig(baseUrl: string, services: number) {
+/** A coordinator with `server` connected to it as the board's runtime. */
+async function coordinatorWith(server: Server) {
+  const host = await startCoordinator();
+  hosts.push(host);
+  await introduce(host, "user-1", "board-1", { "rt-1": server });
+  return host.coordinator;
+}
+
+function boardConfig(services: number) {
   return {
     boardName: "board-1",
-    runtimes: [
-      { id: "rt-1", name: "Node", type: "rest" as const, url: baseUrl },
-    ],
+    runtimes: [{ id: "rt-1", name: "Node", type: "rest" as const }],
     services: {
       "rt-1": Array.from({ length: services }, (_, index) => ({
         uuid: `mon-${index}`,
@@ -66,22 +69,21 @@ describe("a runtime a coordinator owns", () => {
   it("survives the last socket closing", async () => {
     // A coordinator provisions without asking for cleanup, so its runtimes are
     // not tied to whoever is connected: a deployed board keeps running with
-    // nobody watching, and the coordinator's own sockets come and go as
-    // sessions are replaced. That close is also delivered late, so a
-    // connection-driven teardown could otherwise destroy a runtime a
-    // replacement session had just built.
-    const { server, baseUrl } = await startRuntimeServer();
-    const coordinator = new BoardCoordinator();
-    coordinators.push(coordinator);
+    // nobody watching, and connections come and go as sessions are replaced
+    // and networks drop. A connection-driven teardown could otherwise destroy a
+    // runtime a replacement session had just built.
+    const { server } = await startRuntimeServer();
+    const coordinator = await coordinatorWith(server);
 
     const session = await coordinator.registerBoard(
       "user-1",
-      boardConfig(baseUrl, 1),
+      boardConfig(1),
     );
     expect(session.getErrors()).toEqual([]);
     await request(server.httpServer).get("/runtimes/rt-1").expect(200);
 
-    // Every watcher goes away.
+    // Every watcher goes away — which is not what releases it.
+    await request(server.httpServer).get("/runtimes/rt-1").expect(200);
     await session.stop();
 
     // The board is stopped, so its runtimes are handed back deliberately —
@@ -92,14 +94,13 @@ describe("a runtime a coordinator owns", () => {
 
 describe("registering a board while a registration is in flight", () => {
   it("keeps the runtime the winning registration provisioned", async () => {
-    const { server, baseUrl } = await startRuntimeServer();
-    const coordinator = new BoardCoordinator();
-    coordinators.push(coordinator);
+    const { server } = await startRuntimeServer();
+    const coordinator = await coordinatorWith(server);
 
     // What the editor does when a board changes twice in quick succession.
     const [first, second] = await Promise.all([
-      coordinator.registerBoard("user-1", boardConfig(baseUrl, 1)),
-      coordinator.registerBoard("user-1", boardConfig(baseUrl, 2)),
+      coordinator.registerBoard("user-1", boardConfig(1)),
+      coordinator.registerBoard("user-1", boardConfig(2)),
     ]);
 
     expect(first.getErrors()).toEqual([]);
@@ -114,14 +115,13 @@ describe("registering a board while a registration is in flight", () => {
   it("runs them one after another rather than interleaved", async () => {
     // Each registration must see a settled board: destroy, provision, then the
     // next one starts. Interleaving is what deleted a runtime mid-provision.
-    const { baseUrl } = await startRuntimeServer();
-    const coordinator = new BoardCoordinator();
-    coordinators.push(coordinator);
+    const { server } = await startRuntimeServer();
+    const coordinator = await coordinatorWith(server);
 
     const sessions = await Promise.all([
-      coordinator.registerBoard("user-1", boardConfig(baseUrl, 1)),
-      coordinator.registerBoard("user-1", boardConfig(baseUrl, 2)),
-      coordinator.registerBoard("user-1", boardConfig(baseUrl, 3)),
+      coordinator.registerBoard("user-1", boardConfig(1)),
+      coordinator.registerBoard("user-1", boardConfig(2)),
+      coordinator.registerBoard("user-1", boardConfig(3)),
     ]);
 
     for (const session of sessions) {
@@ -134,26 +134,18 @@ describe("registering a board while a registration is in flight", () => {
   });
 
   it("lets the next registration proceed after one fails", async () => {
-    // A board pointed at a runtime that is not there fails to provision; the
-    // next attempt must not be blocked behind it.
-    const { baseUrl } = await startRuntimeServer();
-    const coordinator = new BoardCoordinator();
-    coordinators.push(coordinator);
+    // A board whose runtime cannot be built fails; the next attempt must not
+    // be blocked behind it.
+    const { server } = await startRuntimeServer();
+    const coordinator = await coordinatorWith(server);
 
     const [failed, recovered] = await Promise.all([
       coordinator.registerBoard("user-1", {
         boardName: "board-1",
-        runtimes: [
-          {
-            id: "rt-1",
-            name: "Nowhere",
-            type: "rest" as const,
-            url: "http://127.0.0.1:1",
-          },
-        ],
-        services: { "rt-1": [] },
+        runtimes: [{ id: "rt-1", name: "Node", type: "rest" as const }],
+        services: { "rt-1": [{ uuid: "x", serviceId: "no-such-service" }] },
       }),
-      coordinator.registerBoard("user-1", boardConfig(baseUrl, 1)),
+      coordinator.registerBoard("user-1", boardConfig(1)),
     ]);
 
     expect(failed.getErrors().length).toBeGreaterThan(0);
