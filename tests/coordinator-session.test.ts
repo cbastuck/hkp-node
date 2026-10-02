@@ -310,13 +310,13 @@ describe("driving the chain", () => {
 
   it("drives a runtime the board gives no address for", async () => {
     // The coordinator used to skip a remote runtime without a `url`. It reads
-    // no address now, so a runtime named by `remote` or `requires` is driven
+    // no address now, so a runtime named by `remote` is driven
     // like any other.
     const named: CloudBoardConfig = {
       boardName: "board-1",
       runtimes: [
         { id: "a", name: "A", type: "rest", remote: "Laptop" },
-        { id: "b", name: "B", type: "rest", requires: { kind: "python" } },
+        { id: "b", name: "B", type: "rest", remote: "Studio" },
       ],
       services: { a: [], b: [] },
     };

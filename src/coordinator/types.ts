@@ -26,14 +26,13 @@ export type CloudRuntimeDescriptor = {
   name: string;
   type: CloudRuntimeType;
   /**
-   * How the board says where this runtime belongs: an address, a remote's name
-   * or a requirement. All three are labels here — for the person reading the
+   * How the board says where this runtime belongs: an address or a remote's
+   * name. Both are labels here — for the person reading the
    * board, and for the client that resolved them. The coordinator dials none of
    * them: it knows a runtime by the ticket its runtime server connects with.
    */
   url?: string;
   remote?: string;
-  requires?: { kind: string };
   state?: Record<string, unknown>;
   /**
    * Set on a runtime a unit contributed: the unit's name, and the id the

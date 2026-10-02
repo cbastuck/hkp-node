@@ -96,8 +96,8 @@ async function startPython(): Promise<string> {
 const board: CloudBoardConfig = {
   boardName: "two-languages",
   runtimes: [
-    { id: "node", name: "Node", type: "rest", requires: { kind: "node" } },
-    { id: "py", name: "Python", type: "rest", requires: { kind: "python" } },
+    { id: "node", name: "Node", type: "rest", remote: "Node" },
+    { id: "py", name: "Python", type: "rest", remote: "Python" },
   ],
   services: {
     node: [
