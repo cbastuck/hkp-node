@@ -66,6 +66,12 @@ export class BoardSession {
   // What stopping could not release. Kept apart from the above because it
   // describes the run that ended, not the one being attempted.
   private residue: string[] = [];
+  // The runtimes that produced `residue`, by id. A stopped board only removes
+  // one that reconnects when it knows that runtime is a leftover from its own
+  // run. An editor may legitimately recreate the same runtime id after Stop;
+  // treating every runtime seen while stopped as residue would delete the
+  // editor's live work during the next deploy introduction.
+  private readonly pendingRelease = new Set<string>();
   // Runtimes this session has built or picked back up, whose participant is
   // connected right now.
   private readonly live = new Set<string>();
@@ -148,6 +154,7 @@ export class BoardSession {
     await this.serial(async () => {
       this.stopped = false;
       this.residue = [];
+      this.pendingRelease.clear();
       this.unsubscribe ??= this.participants.subscribe({
         onJoin: (participant) => this.onJoin(participant),
         onLeave: (runtimeId) => this.onLeave(runtimeId),
@@ -297,14 +304,32 @@ export class BoardSession {
       if (this.destroyed) {
         return;
       }
-      if (!runtime || this.stopped) {
-        // Nothing here wants that runtime running. One that is — left behind
-        // by a stop its server was not connected for — is released now.
+      if (!runtime) {
+        // The board no longer contains this runtime. Its ticket is revoked by
+        // the coordinator immediately after the old session is destroyed, but
+        // a connection already arriving is still made harmless here.
         if (participant.hello.runtimeExists) {
           await participant.request({ op: "remove" }).catch(() => undefined);
-          this.residue = this.residue.filter(
-            (line) => !line.startsWith(`Runtime "${participant.runtimeId}"`),
-          );
+        }
+        return;
+      }
+      if (this.stopped) {
+        // Only a runtime this session failed to release is ours to remove. A
+        // stopped board is also the normal state while a browser edits it, and
+        // that browser may have recreated the same runtime id on this server.
+        if (
+          participant.hello.runtimeExists &&
+          this.pendingRelease.has(participant.runtimeId)
+        ) {
+          try {
+            await participant.request({ op: "remove" });
+            this.pendingRelease.delete(participant.runtimeId);
+            this.residue = this.residue.filter(
+              (line) => !line.startsWith(`Runtime "${participant.runtimeId}"`),
+            );
+          } catch {
+            // Still residue; the status continues to say so.
+          }
         }
         return;
       }
@@ -474,6 +499,7 @@ export class BoardSession {
       [...this.built].map(async (id) => {
         const participant = this.participants.get(id);
         if (!participant) {
+          this.pendingRelease.add(id);
           unreleased.push(
             `Runtime "${id}" could not be released because its runtime server is not connected; it may still be running, and is released when that server reconnects.`,
           );
@@ -482,7 +508,9 @@ export class BoardSession {
         try {
           await participant.request({ op: "remove" });
           participant.listen(null);
+          this.pendingRelease.delete(id);
         } catch (err) {
+          this.pendingRelease.add(id);
           const reason = err instanceof Error ? err.message : String(err);
           console.error(
             `[coordinator] Failed to release runtime "${id}":`,

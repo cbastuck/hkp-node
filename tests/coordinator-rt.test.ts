@@ -411,6 +411,36 @@ describe.skipIf(!RT_BIN)("an endpoint a service exposes on hkp-rt", () => {
     expect(res.status).toBe(404);
   });
 
+  it("releases a mounted endpoint when its runtime is removed", async () => {
+    const rt = await startRt();
+    const url = await createEndpoint(rt.baseUrl);
+    expect((await fetch(`${url}/before`)).status).toBe(200);
+
+    await fetch(`${rt.baseUrl}/runtimes/rt`, { method: "DELETE" });
+
+    expect((await fetch(`${url}/after`)).status).toBe(404);
+  });
+
+  it("rotates a mounted endpoint when its mount name changes", async () => {
+    const rt = await startRt();
+    const before = await createEndpoint(rt.baseUrl);
+
+    const configured = await fetch(
+      `${rt.baseUrl}/runtimes/rt/services/hook`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ mountName: "renamed" }),
+      },
+    );
+    expect(configured.status).toBe(200);
+    const after = (await configured.json()).__hkpMount as string;
+
+    expect(after).not.toBe(before);
+    expect((await fetch(`${before}/old`)).status).toBe(404);
+    expect((await fetch(`${after}/new`)).status).toBe(200);
+  });
+
   it("keeps its address across a restart", async () => {
     const rt = await startRt();
     const before = await createEndpoint(rt.baseUrl);
@@ -488,4 +518,3 @@ describe.skipIf(!RT_BIN)("an endpoint a service exposes on hkp-rt", () => {
     socket.close();
   });
 });
-

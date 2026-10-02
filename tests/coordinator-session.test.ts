@@ -402,6 +402,28 @@ describe("acting on a board's runtimes", () => {
     expect(board.getStatus()).toBe("stopped");
   });
 
+  it("does not delete a runtime an editor recreated after the board stopped", async () => {
+    const fakes = fakeParticipants();
+    fakes.join("a");
+    fakes.join("b");
+    const board = session(fakes);
+    await board.start();
+    await board.stop();
+
+    // Editing owns the runtimes after Stop. A deploy introduction reconnects
+    // the same server before the new board session is registered, and its
+    // hello therefore sees the editor's runtime under the familiar id.
+    fakes.leave("a");
+    const editorRuntime = fakes.join("a", {
+      hello: { runtimeExists: true },
+    });
+    await settle();
+
+    expect(editorRuntime.requests).toEqual([]);
+    expect(board.getStatus()).toBe("stopped");
+    expect(board.getErrors()).toEqual([]);
+  });
+
   it("stops listening to participants once it has been replaced", async () => {
     const fakes = fakeParticipants();
     fakes.join("a");

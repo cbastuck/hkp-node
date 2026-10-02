@@ -17,7 +17,8 @@
     "withCoordinator": "COORDINATOR_ENABLED=true npm run dev",
     "test": "vitest run",
     "prepublishOnly": "npm run build",
-    "publish:npm": "npm publish --access public"
+    "publish:npm": "npm publish --access public",
+    "withPublicCoordinator": "HOST=0.0.0.0 EXTERNAL_HOST=192.168.178.62 COORDINATOR_ENABLED=true AUTH0_DOMAIN=hookitapp.eu.auth0.com AUTH0_AUDIENCE=gpk8IFPKfaOTQUzpDRO7vBajOnB72rkM ALLOWED_EMAILS=cby@mailbox.org npm run dev"
   },
   "author": "cbastuck <mail@cbastuck.de>",
   "license": "AGPL-3.0-only",
