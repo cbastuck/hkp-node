@@ -91,6 +91,11 @@ export type CoordinatorToParticipant =
   /** Run the runtime's pipeline; it answers with a `result`. */
   | { type: "processRuntime"; params: unknown; context?: unknown };
 
+/**
+ * `result.data` and `processRuntime.params` are JSON when the message is a
+ * text frame. A value holding bytes travels as a binary frame instead, and is
+ * a `BinaryPayload` here; see `binaryFrame.ts`.
+ */
 export type ParticipantToCoordinator =
   | ParticipantHello
   | { type: "response"; requestId: string; ok: true; data?: unknown }

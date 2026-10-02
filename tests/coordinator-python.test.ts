@@ -185,6 +185,86 @@ describe.skipIf(!hasPython)("a board across hkp-node and hkp-python", () => {
     watching.close();
   });
 
+  it("carries bytes into python and out again unchanged", async () => {
+    // Node makes them, python is handed them and passes them on, node receives
+    // them: two links and two implementations of the frame in between.
+    const host = await startCoordinator();
+    hosts.push(host);
+    const node = await startRuntimeServer();
+    servers.push(node.server);
+    const pythonUrl = await startPython();
+    const roundTrip: CloudBoardConfig = {
+      boardName: "bytes-round-trip",
+      runtimes: [
+        { id: "out", name: "Out", type: "rest" },
+        { id: "py", name: "Python", type: "rest" },
+        { id: "back", name: "Back", type: "rest" },
+      ],
+      services: {
+        out: [],
+        py: [{ uuid: "seen", serviceId: "monitor" }],
+        back: [],
+      },
+    };
+    const tickets = await host.coordinator.issueTickets(
+      "user-1",
+      roundTrip.boardName,
+      ["out", "py", "back"],
+    );
+    for (const [runtimeId, baseUrl] of [
+      ["out", node.baseUrl],
+      ["py", pythonUrl],
+      ["back", node.baseUrl],
+    ] as const) {
+      const res = await fetch(`${baseUrl}/coordinator-links`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          coordinatorUrl: host.url,
+          ticket: tickets[runtimeId],
+          boardName: roundTrip.boardName,
+          runtimeId,
+        }),
+      });
+      expect(res.status).toBe(201);
+    }
+    const session = await host.coordinator.registerBoard("user-1", roundTrip);
+    expect(session.getErrors()).toEqual([]);
+
+    const arrived: unknown[] = [];
+    const back = node.server.runtimeApp.getRuntime(OWNER, "back")!;
+    const process = back.process.bind(back);
+    back.process = ((input: unknown, ...rest: unknown[]) => {
+      arrived.push(input);
+      return (process as (...args: unknown[]) => unknown)(input, ...rest);
+    }) as typeof back.process;
+
+    const out = node.server.runtimeApp.getRuntime(OWNER, "out")!;
+    const sent = Uint8Array.from({ length: 70_000 }, (_, i) => (i * 7) % 256);
+    out.emitResult(sent);
+    out.emitResult({ meta: { name: "a.bin" }, binary: new Uint8Array([1, 2]) });
+    out.emitResult({
+      type: "FloatRingBuffer",
+      id: 3,
+      ts: 99,
+      binary: new Uint8Array(new Float32Array([0.5, -1]).buffer),
+    });
+
+    await eventually(() => arrived.length === 3, "all three to come back");
+    expect(arrived[0]).toEqual(sent);
+    expect(arrived[1]).toEqual({
+      meta: { name: "a.bin" },
+      binary: new Uint8Array([1, 2]),
+    });
+    // A ring buffer in python, and still one when it leaves.
+    expect(arrived[2]).toEqual({
+      type: "FloatRingBuffer",
+      id: 3,
+      ts: 99,
+      binary: new Uint8Array(new Float32Array([0.5, -1]).buffer),
+    });
+  });
+
   it("names the python runtime when its server goes away, and recovers nothing by dialling", async () => {
     const host = await startCoordinator();
     hosts.push(host);

@@ -32,7 +32,10 @@ export function attachCoordinatorJoin(
   coordinator: BoardCoordinator,
   basePath = "/coordinator",
 ): void {
-  const wss = new WebSocketServer({ noServer: true });
+  // No ceiling of the library's own: exceeding one closes the connection,
+  // which a board would read as its runtime going away. What a coordinator's
+  // operator allows is decided per frame; see ParticipantRegistry.
+  const wss = new WebSocketServer({ noServer: true, maxPayload: 0 });
 
   host.addUpgradeRoute(`${basePath}${JOIN_PATH}`, (request, socket, head) => {
     const header = request.headers.authorization;

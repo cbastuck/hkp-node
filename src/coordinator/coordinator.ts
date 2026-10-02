@@ -26,9 +26,16 @@ export class BoardCoordinator {
     private readonly store: BoardStore = createMemoryBoardStore(),
     /** Where boards' log entries are kept; absent means none are collected. */
     private readonly logStore?: LogStore,
-    participants: ParticipantRegistry = new ParticipantRegistry(),
+    participants?: ParticipantRegistry,
+    /**
+     * What this coordinator's operator allows. `maxFrameBytes` bounds a single
+     * value passed between runtimes; unset means no limit.
+     */
+    private readonly limits: { maxFrameBytes?: number } = {},
   ) {
-    this.participants = participants;
+    this.participants =
+      participants ??
+      new ParticipantRegistry({ maxFrameBytes: limits.maxFrameBytes });
   }
 
   /** Entries this board has recorded; see LogStore.read. */
@@ -74,6 +81,7 @@ export class BoardCoordinator {
         this.participants.forBoard(board.userId, board.boardName),
         { createdAt: board.createdAt, stopped },
         this.logStore,
+        this.limits,
       );
       this.userSessions(board.userId).set(board.boardName, session);
       if (!stopped) {
@@ -213,6 +221,7 @@ export class BoardCoordinator {
       this.participants.forBoard(userId, config.boardName),
       undefined,
       this.logStore,
+      this.limits,
     );
     await session.start();
 

@@ -13,6 +13,12 @@ import {
   ParticipantRequest,
   ParticipantToCoordinator,
 } from "./participantProtocol";
+import {
+  BinaryPayload,
+  decodeBinaryFrame,
+  encodeBinaryFrame,
+  frameBytes,
+} from "./binaryFrame";
 
 /**
  * Tickets, and the runtime servers that connected with one.
@@ -119,6 +125,12 @@ class SocketParticipant implements Participant {
   }
 
   process(params: unknown, context?: unknown): void {
+    if (params instanceof BinaryPayload) {
+      this.sendRaw(
+        encodeBinaryFrame({ type: "processRuntime", context }, params),
+      );
+      return;
+    }
     this.send({ type: "processRuntime", params, context });
   }
 
@@ -127,8 +139,12 @@ class SocketParticipant implements Participant {
   }
 
   send(message: CoordinatorToParticipant): void {
+    this.sendRaw(JSON.stringify(message));
+  }
+
+  private sendRaw(frame: string | Buffer): void {
     if (this.socket.readyState === WebSocket.OPEN) {
-      this.socket.send(JSON.stringify(message));
+      this.socket.send(frame);
     }
   }
 
@@ -175,6 +191,11 @@ export class ParticipantRegistry {
       helloTimeoutMs?: number;
       requestTimeoutMs?: number;
       heartbeatMs?: number;
+      /**
+       * The largest frame a participant may send that is passed on; larger
+       * ones are dropped and recorded. Unset means no limit.
+       */
+      maxFrameBytes?: number;
     } = {},
   ) {}
 
@@ -316,12 +337,45 @@ export class ParticipantRegistry {
     }, this.options.heartbeatMs ?? HEARTBEAT_MS);
     heartbeat.unref?.();
 
-    socket.on("message", (raw) => {
-      let message: ParticipantToCoordinator;
-      try {
-        message = JSON.parse(raw.toString());
-      } catch {
+    socket.on("message", (raw, isBinary) => {
+      const bytes = frameBytes(raw);
+      const limit = this.options.maxFrameBytes;
+      // Asked of a participant, not of a connection still saying what it is:
+      // a hello carries a registry, and a limit meant for values must not be
+      // what keeps a runtime server from joining.
+      if (participant && limit && bytes.length > limit) {
+        // Dropped rather than answered with a close: the participant is not
+        // gone, and a board that lost a runtime over one value would be wrong
+        // about what happened.
+        participant.receive({
+          type: "log",
+          entry: {
+            runId: "",
+            ts: new Date().toISOString(),
+            runtimeId: binding.runtimeId,
+            serviceUuid: "",
+            level: "warn",
+            event: "frame-dropped",
+            data: { bytes: bytes.length, limit },
+          },
+        });
         return;
+      }
+
+      let message: ParticipantToCoordinator;
+      if (isBinary) {
+        // Only a runtime's output travels as bytes.
+        const frame = decodeBinaryFrame(bytes);
+        if (!frame || frame.header.type !== "result") {
+          return;
+        }
+        message = { type: "result", data: frame.payload };
+      } else {
+        try {
+          message = JSON.parse(bytes.toString("utf8"));
+        } catch {
+          return;
+        }
       }
       if (!message || typeof message.type !== "string") {
         return;

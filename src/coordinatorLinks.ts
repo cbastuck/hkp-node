@@ -14,6 +14,13 @@ import {
   ProvisionResult,
   ReportedService,
 } from "./coordinator/participantProtocol";
+import {
+  decodeBinaryFrame,
+  encodeBinaryFrame,
+  frameBytes,
+  fromBinaryPayload,
+  toBinaryPayload,
+} from "./coordinator/binaryFrame";
 import { SecretEntry } from "./secrets";
 
 /**
@@ -223,6 +230,9 @@ class Link {
       socket = new WebSocket(joinUrlFor(this.record.coordinatorUrl), {
         // A header rather than the URL, which is what ends up in logs.
         headers: { Authorization: `Bearer ${this.record.ticket}` },
+        // No ceiling of the library's own: exceeding one closes the link,
+        // and the board would lose its runtime over one large value.
+        maxPayload: 0,
       });
     } catch (err) {
       this.settleFirst({
@@ -287,15 +297,29 @@ class Link {
       socket.terminate();
     });
 
-    socket.on("message", (raw) => {
+    socket.on("message", (raw, isBinary) => {
       if (socket !== this.socket) {
         return;
       }
+      const bytes = frameBytes(raw);
       let message: CoordinatorToParticipant;
-      try {
-        message = JSON.parse(raw.toString());
-      } catch {
-        return;
+      if (isBinary) {
+        // Input for the pipeline that holds bytes; see binaryFrame.ts.
+        const frame = decodeBinaryFrame(bytes);
+        if (!frame || frame.header.type !== "processRuntime") {
+          return;
+        }
+        message = {
+          type: "processRuntime",
+          params: fromBinaryPayload(frame.payload),
+          context: frame.header.context,
+        };
+      } else {
+        try {
+          message = JSON.parse(bytes.toString("utf8"));
+        } catch {
+          return;
+        }
       }
       void this.onMessage(message);
     });
@@ -361,9 +385,18 @@ class Link {
   }
 
   send(message: ParticipantToCoordinator): void {
-    if (this.socket?.readyState === WebSocket.OPEN) {
-      this.socket.send(JSON.stringify(message));
+    if (this.socket?.readyState !== WebSocket.OPEN) {
+      return;
     }
+    // A result holding bytes goes as a binary frame; as text it would arrive
+    // as an object of numbered keys.
+    const binary =
+      message.type === "result" ? toBinaryPayload(message.data) : null;
+    this.socket.send(
+      binary
+        ? encodeBinaryFrame({ type: "result" }, binary)
+        : JSON.stringify(message),
+    );
   }
 
   /** The runtime said something; only a welcomed link has anyone to tell. */

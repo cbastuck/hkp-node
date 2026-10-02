@@ -1472,7 +1472,8 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
     },
   );
 
-  const bridgeWsServer = new WebSocketServer({ noServer: true });
+  // No ceiling of the library's own; see attachCoordinatorJoin.
+  const bridgeWsServer = new WebSocketServer({ noServer: true, maxPayload: 0 });
   let bridgeUpgradeHandler:
     | ((ws: WebSocket, user: AuthenticatedUser) => void)
     | undefined;

@@ -8,6 +8,12 @@ import {
   isBrowserRuntime,
 } from "./types";
 import { LogStore } from "./logStore";
+import {
+  BinaryPayload,
+  decodeBinaryFrame,
+  encodeBinaryFrame,
+  frameBytes,
+} from "./binaryFrame";
 import { LogEntry, LogLevel } from "../types";
 import { MOUNT_FIELD, collectMountRefs, formatMountRef } from "./mount";
 import {
@@ -111,6 +117,10 @@ export class BoardSession {
     // Where this board's entries are kept. Absent means nothing is collected —
     // a session in a test, or a coordinator configured without a log root.
     private readonly logStore?: LogStore,
+    // The largest frame a browser may send that is passed on; unset means no
+    // limit. The same setting bounds what a runtime server sends, where the
+    // participants are accepted.
+    private readonly limits: { maxFrameBytes?: number } = {},
   ) {
     this.createdAt = restored?.createdAt ?? new Date().toISOString();
     this.stopped = restored?.stopped ?? false;
@@ -543,10 +553,33 @@ export class BoardSession {
     const bridge: BrowserBridge = { ws, runtimeIds: new Set(runtimeIds) };
     this.bridges.add(bridge);
 
-    ws.on("message", (raw) => {
+    ws.on("message", (raw, isBinary) => {
+      const bytes = frameBytes(raw);
+      const limit = this.limits.maxFrameBytes;
+      if (limit && bytes.length > limit) {
+        this.logStore?.append(this.userId, this.boardName, {
+          runId: "",
+          ts: new Date().toISOString(),
+          runtimeId: [...bridge.runtimeIds][0] ?? "",
+          serviceUuid: "",
+          level: "warn",
+          event: "frame-dropped",
+          data: { bytes: bytes.length, limit },
+        });
+        return;
+      }
+
       let message: BridgeMessage;
       try {
-        const parsed: unknown = JSON.parse(raw.toString());
+        // A browser runtime's output that holds bytes. The header is the
+        // message it would have sent as text; the payload goes on as it came.
+        const frame = isBinary ? decodeBinaryFrame(bytes) : null;
+        if (isBinary && !frame) {
+          return;
+        }
+        const parsed: unknown = frame
+          ? { ...frame.header, data: frame.payload }
+          : JSON.parse(bytes.toString("utf8"));
         if (!isBridgeMessage(parsed)) {
           return;
         }
@@ -946,12 +979,11 @@ export class BoardSession {
       // the same requestId are no-ops since its pending entry is already gone.
       const result = await new Promise<unknown>((resolve) => {
         this.pendingBrowserResults.set(requestId, resolve);
-        const payload = JSON.stringify({
-          type: "processRuntime",
-          runtimeId: next.id,
-          params: data,
-          requestId,
-        });
+        const header = { type: "processRuntime", runtimeId: next.id, requestId };
+        const payload =
+          data instanceof BinaryPayload
+            ? encodeBinaryFrame(header, data)
+            : JSON.stringify({ ...header, params: data });
         for (const target of targets) {
           target.ws.send(payload);
         }

@@ -140,6 +140,12 @@ async function main() {
         ? new BoardCoordinator(
             createFileBoardStore(dataDir),
             logDir ? createFileLogStore(logDir) : undefined,
+            undefined,
+            {
+              maxFrameBytes:
+                readInteger(process.env.HKP_COORDINATOR_MAX_FRAME_BYTES, 0) ||
+                undefined,
+            },
           )
         : undefined,
     });
