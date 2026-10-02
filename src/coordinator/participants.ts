@@ -32,11 +32,23 @@ import {
  * Only a hash is kept. A ticket is shown once, to the client that asked, so a
  * coordinator's memory or disk holds nothing that could be presented.
  *
- * There is one ticket per runtime of a board at a time. Asking again replaces
- * it, which is what deploying a board again does: the old ticket stops being
- * accepted at once, and whatever is connected with it gives way when the new
- * ticket's holder connects. Revoking — a board deleted, a runtime the board no
- * longer has — forgets the ticket and closes the connection.
+ * A runtime of a board has one ticket that counts, and while the board is
+ * being deployed again, a second one **pending** beside it. Asking for a
+ * ticket for a runtime that has one issues a pending ticket and changes
+ * nothing else: the runtime server holding the first stays the board's, and
+ * goes on being able to reconnect. A server that connects with a pending
+ * ticket is welcomed and waits.
+ *
+ * A pending ticket takes over — the one before it is forgotten, and the server
+ * that held it gives way — when the board is registered, which is the deploy
+ * having succeeded. Until then a deploy that fails part-way has cost the
+ * running board nothing. It also takes over as soon as the runtime has no
+ * server connected: nothing is there to protect, and the usual way that comes
+ * about is the same server being introduced again, which drops its old
+ * connection to make the new one.
+ *
+ * Revoking — a board deleted, a runtime the board no longer has — forgets both
+ * tickets and closes what connected with them.
  */
 
 /** What a ticket speaks for. */
@@ -181,9 +193,13 @@ class SocketParticipant implements Participant {
 }
 
 export class ParticipantRegistry {
+  /** Every ticket that is accepted: the one that counts, and a pending one. */
   private readonly ticketsByHash = new Map<string, TicketRecord>();
   private readonly hashByRuntime = new Map<string, string>();
+  private readonly pendingByRuntime = new Map<string, string>();
   private readonly connections = new Map<string, SocketParticipant>();
+  /** Servers connected with a pending ticket, not yet the board's. */
+  private readonly waiting = new Map<string, SocketParticipant>();
   private readonly listeners = new Map<string, Set<BoardListener>>();
 
   constructor(
@@ -196,25 +212,26 @@ export class ParticipantRegistry {
        * ones are dropped and recorded. Unset means no limit.
        */
       maxFrameBytes?: number;
+      /**
+       * Called when the ticket that counts for a runtime changed without
+       * anybody asking at that moment — a pending one took over because the
+       * runtime had no server. Whoever keeps tickets writes them down again.
+       */
+      onTicketsChanged?: (userId: string, boardName: string) => void;
     } = {},
   ) {}
 
   // ── Tickets ────────────────────────────────────────────────────────────────
 
   /**
-   * Issues the ticket for one runtime of one board, replacing any before it.
-   * Returns the ticket itself — the only time it exists outside the machine it
-   * is handed to.
+   * Issues a ticket for one runtime of one board. Returns the ticket itself —
+   * the only time it exists outside the machine it is handed to.
+   *
+   * It counts at once for a runtime that has none. For one that has, it is
+   * pending beside it, replacing any pending before it; see `promote`.
    */
   issue(binding: TicketBinding): string {
-    // The ticket before it stops being one. Whatever is connected with it
-    // stays connected until the new ticket's holder arrives and takes its
-    // place: the board must not lose a runtime to a deploy that has not
-    // happened yet, and may never happen.
-    const previous = this.hashByRuntime.get(runtimeKey(binding));
-    if (previous) {
-      this.ticketsByHash.delete(previous);
-    }
+    const key = runtimeKey(binding);
     const ticket = `${TICKET_PREFIX}${randomBytes(32).toString("base64url")}`;
     const hash = hashTicket(ticket);
     this.ticketsByHash.set(hash, {
@@ -222,8 +239,77 @@ export class ParticipantRegistry {
       hash,
       issuedAt: new Date().toISOString(),
     });
-    this.hashByRuntime.set(runtimeKey(binding), hash);
+    if (!this.hashByRuntime.has(key)) {
+      this.hashByRuntime.set(key, hash);
+      return ticket;
+    }
+    this.dropPending(key);
+    this.pendingByRuntime.set(key, hash);
     return ticket;
+  }
+
+  /** Forgets a runtime's pending ticket and whoever is waiting with it. */
+  private dropPending(key: string): void {
+    const pending = this.pendingByRuntime.get(key);
+    if (!pending) {
+      return;
+    }
+    this.ticketsByHash.delete(pending);
+    this.pendingByRuntime.delete(key);
+    const waiting = this.waiting.get(key);
+    this.waiting.delete(key);
+    waiting?.socket.close(CLOSE_TICKET_REVOKED, "ticket revoked");
+  }
+
+  /**
+   * Makes a runtime's pending ticket the one that counts. The ticket before it
+   * is forgotten, and the server waiting with the pending one becomes the
+   * board's, the one before it giving way.
+   *
+   * With nobody waiting, whatever is connected stays until the new ticket's
+   * holder arrives: the board must not lose a runtime to a server that has
+   * yet to connect.
+   */
+  private promote(binding: TicketBinding): void {
+    const key = runtimeKey(binding);
+    const pending = this.pendingByRuntime.get(key);
+    if (!pending) {
+      return;
+    }
+    const previousHash = this.hashByRuntime.get(key);
+    if (previousHash) {
+      this.ticketsByHash.delete(previousHash);
+    }
+    this.hashByRuntime.set(key, pending);
+    this.pendingByRuntime.delete(key);
+
+    const successor = this.waiting.get(key);
+    if (!successor) {
+      return;
+    }
+    this.waiting.delete(key);
+    const previous = this.connections.get(key);
+    this.connections.set(key, successor);
+    previous?.socket.close(CLOSE_REPLACED, "replaced by a newer connection");
+    for (const listener of this.listenersOf(binding)) {
+      listener.onJoin(successor);
+    }
+  }
+
+  /**
+   * Makes every pending ticket of a board the one that counts: the board has
+   * been registered, so the deploy they were issued for went through.
+   */
+  promoteBoard(userId: string, boardName: string): void {
+    for (const record of [...this.ticketsByHash.values()]) {
+      if (
+        record.userId === userId &&
+        record.boardName === boardName &&
+        this.pendingByRuntime.get(runtimeKey(record)) === record.hash
+      ) {
+        this.promote(record);
+      }
+    }
   }
 
   /** What a presented ticket speaks for, or null when it is not one of ours. */
@@ -239,9 +325,10 @@ export class ParticipantRegistry {
     return { userId, boardName, runtimeId };
   }
 
-  /** Forgets a runtime's ticket and closes whatever connected with it. */
+  /** Forgets a runtime's tickets and closes whatever connected with them. */
   revoke(binding: TicketBinding): void {
     const key = runtimeKey(binding);
+    this.dropPending(key);
     const hash = this.hashByRuntime.get(key);
     if (hash) {
       this.ticketsByHash.delete(hash);
@@ -271,10 +358,18 @@ export class ParticipantRegistry {
     }
   }
 
-  /** A board's tickets in the form they are stored. */
+  /**
+   * A board's tickets in the form they are stored: the ones that count. A
+   * pending ticket belongs to a deploy in progress, which a restart ends.
+   */
   exportTickets(userId: string, boardName: string): StoredTicket[] {
     return [...this.ticketsByHash.values()]
-      .filter((t) => t.userId === userId && t.boardName === boardName)
+      .filter(
+        (t) =>
+          t.userId === userId &&
+          t.boardName === boardName &&
+          this.hashByRuntime.get(runtimeKey(t)) === t.hash,
+      )
       .map(({ runtimeId, hash, issuedAt }) => ({ runtimeId, hash, issuedAt }));
   }
 
@@ -387,13 +482,15 @@ export class ParticipantRegistry {
         }
         clearTimeout(helloTimer);
         // The ticket may have been replaced while this socket was connecting.
-        if (this.hashByRuntime.get(key) !== hash) {
+        const pending = this.pendingByRuntime.get(key) === hash;
+        if (!pending && this.hashByRuntime.get(key) !== hash) {
           socket.close(CLOSE_TICKET_REVOKED, "ticket revoked");
           return;
         }
-        // One connection per runtime of a board. A second one is the same
-        // machine reconnecting before the first was noticed gone.
-        const previous = this.connections.get(key);
+        // One connection per ticket. A second one is the same machine
+        // reconnecting before the first was noticed gone.
+        const held = pending ? this.waiting : this.connections;
+        const previous = held.get(key);
         participant = new SocketParticipant(
           binding.runtimeId,
           {
@@ -405,15 +502,24 @@ export class ParticipantRegistry {
           socket,
           this.options.requestTimeoutMs ?? REQUEST_TIMEOUT_MS,
         );
-        this.connections.set(key, participant);
+        held.set(key, participant);
         previous?.socket.close(CLOSE_REPLACED, "replaced by a newer connection");
         participant.send({
           type: "welcome",
           boardName: binding.boardName,
           runtimeId: binding.runtimeId,
         });
-        for (const listener of this.listenersOf(binding)) {
-          listener.onJoin(participant);
+        if (!pending) {
+          for (const listener of this.listenersOf(binding)) {
+            listener.onJoin(participant);
+          }
+          return;
+        }
+        // Welcomed, and waiting for the board to be registered — unless the
+        // runtime has no server, in which case there is nothing to wait for.
+        if (!this.connections.has(key)) {
+          this.promote(binding);
+          this.options.onTicketsChanged?.(binding.userId, binding.boardName);
         }
         return;
       }
@@ -428,6 +534,10 @@ export class ParticipantRegistry {
         return;
       }
       participant.abandon();
+      if (this.waiting.get(key) === participant) {
+        this.waiting.delete(key);
+        return;
+      }
       // Only the connection that is current leaves; one that was replaced has
       // already been succeeded, and saying it left would un-join its successor.
       if (this.connections.get(key) !== participant) {
@@ -436,6 +546,11 @@ export class ParticipantRegistry {
       this.connections.delete(key);
       for (const listener of this.listenersOf(binding)) {
         listener.onLeave(binding.runtimeId);
+      }
+      // A server waiting with a pending ticket takes the place left empty.
+      if (this.waiting.has(key)) {
+        this.promote(binding);
+        this.options.onTicketsChanged?.(binding.userId, binding.boardName);
       }
     });
 
@@ -490,7 +605,10 @@ export class ParticipantRegistry {
 
   /** Closes every connection; tickets are kept, so participants may return. */
   closeAll(): void {
-    for (const connection of this.connections.values()) {
+    for (const connection of [
+      ...this.connections.values(),
+      ...this.waiting.values(),
+    ]) {
       connection.socket.close(1001, "coordinator shutting down");
     }
   }

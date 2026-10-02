@@ -905,9 +905,25 @@ export class TenantRuntimes {
   }
 }
 
+/**
+ * The space the runtimes of one deployed board live in.
+ *
+ * A runtime id is unique within a space, and there are two kinds. What a
+ * tenant's clients create over the api shares one space, named by the tenant
+ * alone. What a coordinator builds for a board gets a space per board, so two
+ * boards that both call a runtime `node` each keep their own, and neither is
+ * replaced by a client creating a runtime of that id.
+ *
+ * NUL occurs in neither part, so a board's space is never a tenant's.
+ */
+export function boardSpace(owner: string, boardName: string): string {
+  return `${owner}\u0000${boardName}`;
+}
+
 export class RuntimeApp {
-  // ownerKey → runtimeId → runtime. The owner key is the authenticated `sub`
-  // (or "anonymous" when auth is off, collapsing to a single bucket).
+  // space → runtimeId → runtime. A tenant's own space is its owner key: the
+  // authenticated `sub` (or "anonymous" when auth is off, collapsing to a
+  // single bucket). A deployed board's is `boardSpace`.
   private readonly runtimes = new Map<string, Map<string, HostedRuntime>>();
 
   constructor(
@@ -917,6 +933,7 @@ export class RuntimeApp {
     private readonly mountsFor?: (
       owner: string,
       runtimeId: string,
+      space: string,
     ) => RuntimeMounts,
     // Supplied by the server, which owns the file store. Absent: no runtime
     // resolves a `file://` asset.
@@ -930,15 +947,23 @@ export class RuntimeApp {
     return new TenantRuntimes(owner, this);
   }
 
-  createRuntime(owner: string, config: RuntimeConfiguration): HostedRuntime {
-    const owned = this.ownerRuntimes(owner);
+  /**
+   * Builds a runtime for `owner`, replacing anything under its id in `space`:
+   * the tenant's own unless a board's is named.
+   */
+  createRuntime(
+    owner: string,
+    config: RuntimeConfiguration,
+    space: string = owner,
+  ): HostedRuntime {
+    const owned = this.ownerRuntimes(space);
     const existing = owned.get(config.id);
     existing?.destroy();
 
     const runtime = new HostedRuntime(
       config,
       (serviceConfig) => this.createService(serviceConfig),
-      this.mountsFor?.(owner, config.id),
+      this.mountsFor?.(owner, config.id, space),
       owner,
       this.readAssetFile,
       this.assetLimits,
@@ -947,17 +972,30 @@ export class RuntimeApp {
     return runtime;
   }
 
-  getRuntime(owner: string, runtimeId: string): HostedRuntime | undefined {
-    return this.runtimes.get(owner)?.get(runtimeId);
+  getRuntime(space: string, runtimeId: string): HostedRuntime | undefined {
+    return this.runtimes.get(space)?.get(runtimeId);
   }
 
-  getRuntimes(owner: string): HostedRuntime[] {
-    const owned = this.runtimes.get(owner);
+  getRuntimes(space: string): HostedRuntime[] {
+    const owned = this.runtimes.get(space);
     return owned ? [...owned.values()] : [];
   }
 
-  removeRuntime(owner: string, runtimeId: string): boolean {
-    const owned = this.runtimes.get(owner);
+  /** The runtimes a tenant's deployed boards have here, whichever board. */
+  getBoardRuntimes(owner: string): HostedRuntime[] {
+    const boards = boardSpace(owner, "");
+    return [...this.runtimes]
+      .filter(([space]) => space.startsWith(boards))
+      .flatMap(([, owned]) => [...owned.values()]);
+  }
+
+  /** How many runtimes a tenant has, in its own space and its boards'. */
+  countRuntimes(owner: string): number {
+    return this.getRuntimes(owner).length + this.getBoardRuntimes(owner).length;
+  }
+
+  removeRuntime(space: string, runtimeId: string): boolean {
+    const owned = this.runtimes.get(space);
     if (!owned) {
       return false;
     }
@@ -965,11 +1003,13 @@ export class RuntimeApp {
     runtime?.destroy();
     const deleted = owned.delete(runtimeId);
     if (owned.size === 0) {
-      this.runtimes.delete(owner);
+      this.runtimes.delete(space);
     }
     return deleted;
   }
 
+  /** Removes what is in a tenant's own space; a board's runtimes are its
+   *  coordinator's to remove. */
   removeAllRuntimes(owner: string): void {
     const owned = this.runtimes.get(owner);
     if (!owned) {

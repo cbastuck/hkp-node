@@ -3,8 +3,8 @@ import { afterEach, describe, expect, it } from "vitest";
 import { assetDescriptor } from "../src/services/asset";
 import {
   CoordinatorHost,
-  OWNER,
   RuntimeServer,
+  boardRuntime,
   deploy as deployBoard,
   startCoordinator,
   startRuntimeServer,
@@ -58,8 +58,7 @@ describe("a deployed board's assets", () => {
     );
     expect(session.getErrors()).toEqual([]);
 
-    const runtimeOf = (runtimeId: string) =>
-      server.runtimeApp.getRuntime(OWNER, runtimeId)!;
+    const runtimeOf = (runtimeId: string) => boardRuntime(server, runtimeId)!;
     /** The ids a runtime holds. */
     const held = (runtimeId: string): string[] =>
       [...runtimeOf(runtimeId).assets().ids()].sort();

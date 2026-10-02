@@ -4,12 +4,11 @@ import { AddressInfo, createServer } from "node:net";
 import path from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
-import { WebSocket } from "ws";
 
 import { CloudBoardConfig } from "../src/coordinator/types";
 import {
   CoordinatorHost,
-  OWNER,
+  boardRuntime,
   RuntimeServer,
   eventually,
   startCoordinator,
@@ -156,33 +155,47 @@ describe.skipIf(!hasPython)("a board across hkp-node and hkp-python", () => {
       ["py", "python", true],
     ]);
 
-    // The python runtime exists, built from the board, as the coordinator's.
-    const built = await (await fetch(`${pythonUrl}/runtimes/py`)).json();
-    expect(built.services.map((s: { uuid: string }) => s.uuid)).toEqual(["seen"]);
-    expect(built.boardName).toBe("two-languages");
+    // The python runtime exists, built from the board, as the board's: the
+    // coordinator can ask after it, and a client of that server is not shown
+    // it among its own.
+    const python = host.coordinator.participants
+      .forBoard("user-1", board.boardName)
+      .get("py")!;
+    const built = (await python.request({ op: "describe" })) as {
+      services: Array<{ uuid: string }>;
+    };
+    expect(built.services.map((s) => s.uuid)).toEqual(["seen"]);
+    expect((await (await fetch(`${pythonUrl}/runtimes`)).json()).runtimes).toEqual(
+      [],
+    );
+    expect(
+      (await (await fetch(`${pythonUrl}/coordinator-links`)).json()).links.map(
+        (link: { boardName: string; runtimeId: string }) => [
+          link.boardName,
+          link.runtimeId,
+        ],
+      ),
+    ).toEqual([["two-languages", "py"]]);
 
-    // Watch the python runtime the way any client of that server can, then
-    // set the first runtime going. What it emits is carried to the coordinator
-    // over node's connection and on to python over python's.
-    const watching = new WebSocket(`${pythonUrl.replace("http", "ws")}/py`);
-    const said: Array<{ type?: string; instanceId?: string; value?: string }> =
+    // Set the first runtime going. What it emits is carried to the coordinator
+    // over node's connection and on to python over python's, where the monitor
+    // says what it was handed.
+    const said: Array<{ type?: string; serviceUuid?: string; payload?: unknown }> =
       [];
-    watching.on("message", (raw) => said.push(JSON.parse(raw.toString())));
-    await new Promise<void>((resolve) => watching.on("open", () => resolve()));
+    python.listen((event) => said.push(event as (typeof said)[number]));
 
-    node.server.runtimeApp.getRuntime(OWNER, "node")!.emitResult({ ping: 1 });
+    boardRuntime(node.server, "node")!.emitResult({ ping: 1 });
 
     await eventually(
       () =>
         said.some(
           (message) =>
             message.type === "notification" &&
-            message.instanceId === "seen" &&
-            String(message.value).includes("ping"),
+            message.serviceUuid === "seen" &&
+            JSON.stringify(message.payload).includes("ping"),
         ),
       "the python monitor to see what node emitted",
     );
-    watching.close();
   });
 
   it("carries bytes into python and out again unchanged", async () => {
@@ -232,14 +245,14 @@ describe.skipIf(!hasPython)("a board across hkp-node and hkp-python", () => {
     expect(session.getErrors()).toEqual([]);
 
     const arrived: unknown[] = [];
-    const back = node.server.runtimeApp.getRuntime(OWNER, "back")!;
+    const back = boardRuntime(node.server, "back")!;
     const process = back.process.bind(back);
     back.process = ((input: unknown, ...rest: unknown[]) => {
       arrived.push(input);
       return (process as (...args: unknown[]) => unknown)(input, ...rest);
     }) as typeof back.process;
 
-    const out = node.server.runtimeApp.getRuntime(OWNER, "out")!;
+    const out = boardRuntime(node.server, "out")!;
     const sent = Uint8Array.from({ length: 70_000 }, (_, i) => (i * 7) % 256);
     out.emitResult(sent);
     out.emitResult({ meta: { name: "a.bin" }, binary: new Uint8Array([1, 2]) });

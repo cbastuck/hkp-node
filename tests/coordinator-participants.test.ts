@@ -11,6 +11,7 @@ import { monitorDescriptor } from "../src/services/monitor";
 import { WebSocket } from "ws";
 import {
   CoordinatorHost,
+  boardRuntime,
   OWNER,
   RuntimeServer,
   deploy,
@@ -94,15 +95,11 @@ describe("deploying to a coordinator that never dials", () => {
 
     expect(session.getStatus()).toBe("running");
     expect(session.getErrors()).toEqual([]);
-    const { body } = await request(server.httpServer)
-      .get("/runtimes/node")
-      .expect(200);
-    expect(body.services.map((s: { uuid: string }) => s.uuid)).toEqual([
-      "mon-1",
-    ]);
+    const built = boardRuntime(server, "node")!.serialize();
+    expect(built.services.map((s) => s.uuid)).toEqual(["mon-1"]);
     // The coordinator's, until the coordinator says otherwise.
-    expect(body.garbageCollected).toBe(false);
-    expect(body.boardName).toBe("doorbell");
+    expect(built.garbageCollected).toBe(false);
+    expect(built.boardName).toBe("doorbell");
   });
 
   it("drives the chain from one runtime server to the next over their connections", async () => {
@@ -130,12 +127,11 @@ describe("deploying to a coordinator that never dials", () => {
       b: second.server,
     });
     const seen: unknown[] = [];
-    second.server.runtimeApp
-      .getRuntime(OWNER, "b")!
+    boardRuntime(second.server, "b")!
       .registerNotificationTarget((notification) => seen.push(notification.payload));
 
     // Something sets the first runtime going — here a caller of that server.
-    first.server.runtimeApp.getRuntime(OWNER, "a")!.emitResult({ ping: 1 });
+    boardRuntime(first.server, "a")!.emitResult({ ping: 1 });
 
     await eventually(() => seen.length > 0, "the second runtime to be driven");
     expect(JSON.stringify(seen)).toContain("ping");
@@ -164,7 +160,7 @@ describe("deploying to a coordinator that never dials", () => {
       () => session.getStatus() === "running",
       "the board to run",
     );
-    await request(server.httpServer).get("/runtimes/node").expect(200);
+    expect(boardRuntime(server, "node")).toBeTruthy();
   });
 
   it("keeps a board with only a browser runtime running with no browser attached", async () => {
@@ -217,7 +213,7 @@ describe("a participant that goes away", () => {
       () => session.getStatus() === "running",
       "the runtime server to reconnect",
     );
-    await request(server.httpServer).get("/runtimes/node").expect(200);
+    expect(boardRuntime(server, "node")).toBeTruthy();
   });
 
   it("picks a runtime back up rather than rebuilding it when only the connection dropped", async () => {
@@ -226,13 +222,13 @@ describe("a participant that goes away", () => {
     const host = await coordinatorHost();
     const { server } = await runtimeServer();
     const session = await deploy(host, "user-1", board(), { node: server });
-    const before = server.runtimeApp.getRuntime(OWNER, "node");
+    const before = boardRuntime(server, "node");
 
     host.coordinator.participants.closeAll();
     await eventually(() => session.getStatus() === "error", "the drop to show");
     await eventually(() => session.getStatus() === "running", "the reconnect");
 
-    expect(server.runtimeApp.getRuntime(OWNER, "node")).toBe(before);
+    expect(boardRuntime(server, "node")).toBe(before);
   });
 
   it("rebuilds the runtime from the board when its server restarted", async () => {
@@ -256,12 +252,11 @@ describe("a participant that goes away", () => {
       () => session.getStatus() === "running",
       "the restarted server to be provisioned",
     );
-    const { body } = await request(second.server.httpServer)
-      .get("/runtimes/node")
-      .expect(200);
-    expect(body.services.map((s: { uuid: string }) => s.uuid)).toEqual([
-      "mon-1",
-    ]);
+    expect(
+      boardRuntime(second.server, "node")!
+        .listServices()
+        .map((s) => s.uuid),
+    ).toEqual(["mon-1"]);
   });
 });
 
@@ -341,7 +336,10 @@ describe("tickets", () => {
     );
   });
 
-  it("stops accepting a ticket once it has been replaced", async () => {
+  it("keeps accepting a runtime's ticket while a newer one is pending", async () => {
+    // Asking again is the start of a deploy, which may yet fail. Until the
+    // board is registered the runtime server holding the first ticket can
+    // still reconnect with it.
     const host = await coordinatorHost();
     const { node: first } = await host.coordinator.issueTickets(
       "user-1",
@@ -354,10 +352,43 @@ describe("tickets", () => {
       ["node"],
     );
 
+    for (const ticket of [first, second]) {
+      const accepted = joinSocket(host, ticket);
+      expect(await outcome(accepted)).toBe("open");
+      accepted.terminate();
+    }
+  });
+
+  it("has one pending ticket per runtime, the newest", async () => {
+    const host = await coordinatorHost();
+    const issue = async () =>
+      (await host.coordinator.issueTickets("user-1", "doorbell", ["node"])).node;
+    const first = await issue();
+    const abandoned = await issue();
+    const second = await issue();
+
+    expect(await outcome(joinSocket(host, abandoned))).toBe("refused 401");
+    expect(host.coordinator.participants.resolve(first)).toBeTruthy();
+    expect(host.coordinator.participants.resolve(second)).toBeTruthy();
+  });
+
+  it("forgets the ticket before it once the board is registered", async () => {
+    const host = await coordinatorHost();
+    const issue = async () =>
+      (await host.coordinator.issueTickets("user-1", "doorbell", ["node"])).node;
+    const first = await issue();
+    const second = await issue();
+
+    await host.coordinator.registerBoard("user-1", board());
+
     expect(await outcome(joinSocket(host, first))).toBe("refused 401");
     const accepted = joinSocket(host, second);
     expect(await outcome(accepted)).toBe("open");
-    accepted.close();
+    accepted.terminate();
+    // What a restart would bring back is the ticket that counts.
+    expect(
+      host.coordinator.participants.exportTickets("user-1", "doorbell"),
+    ).toHaveLength(1);
   });
 
   it("speaks for one runtime of one board of one person", async () => {
@@ -397,7 +428,7 @@ describe("tickets", () => {
     expect(host.coordinator.participants.describe("user-1", "doorbell")).toEqual(
       [],
     );
-    await request(server.httpServer).get("/runtimes/node").expect(404);
+    expect(boardRuntime(server, "node")).toBeUndefined();
   });
 
   it("are all revoked when the board is deleted, and the runtimes released", async () => {
@@ -407,7 +438,7 @@ describe("tickets", () => {
 
     await host.coordinator.removeBoard("user-1", "doorbell");
 
-    await request(server.httpServer).get("/runtimes/node").expect(404);
+    expect(boardRuntime(server, "node")).toBeUndefined();
     await eventually(
       () => server.coordinatorLinks.list(OWNER).length === 0,
       "the runtime server to drop its link",
@@ -427,13 +458,171 @@ describe("tickets", () => {
     });
 
     expect(session.getStatus()).toBe("running");
-    await request(studio.server.httpServer).get("/runtimes/node").expect(200);
+    expect(boardRuntime(studio.server, "node")).toBeTruthy();
     await eventually(
-      async () =>
-        (await request(laptop.server.httpServer).get("/runtimes/node"))
-          .status === 404,
+      () => !boardRuntime(laptop.server, "node"),
       "the first server to let go of its copy",
     );
+  });
+});
+
+describe("deploying a running board again", () => {
+  function twoRuntimes(): CloudBoardConfig {
+    return board({
+      runtimes: [
+        { id: "a", name: "A", type: "rest" },
+        { id: "b", name: "B", type: "rest" },
+      ],
+      services: {
+        a: [{ uuid: "mon-a", serviceId: monitorDescriptor.serviceId }],
+        b: [{ uuid: "mon-b", serviceId: monitorDescriptor.serviceId }],
+      },
+    });
+  }
+
+  it("leaves it as it was when the deploy fails part-way", async () => {
+    // The second deploy gets as far as introducing one of two runtime servers
+    // and stops there; the board is never registered again.
+    const host = await coordinatorHost();
+    const first = await runtimeServer();
+    const second = await runtimeServer();
+    const tickets = await host.coordinator.issueTickets("user-1", "doorbell", [
+      "a",
+      "b",
+    ]);
+    const introduceTo = (
+      server: RuntimeServer,
+      runtimeId: string,
+      ticket: string,
+    ) =>
+      server.coordinatorLinks.introduce({
+        owner: OWNER,
+        boardName: "doorbell",
+        runtimeId,
+        coordinatorUrl: host.url,
+        ticket,
+      });
+    await introduceTo(first.server, "a", tickets.a);
+    await introduceTo(second.server, "b", tickets.b);
+    const session = await host.coordinator.registerBoard(
+      "user-1",
+      twoRuntimes(),
+    );
+    expect(session.getStatus()).toBe("running");
+
+    const again = await host.coordinator.issueTickets("user-1", "doorbell", [
+      "a",
+      "b",
+    ]);
+    await introduceTo(first.server, "a", again.a);
+
+    // The server introduced again is the board's with its new ticket; the one
+    // that was not still holds a ticket that counts.
+    await eventually(
+      () => session.getStatus() === "running" && session.getErrors().length === 0,
+      "the board to be running as before",
+    );
+    expect(
+      host.coordinator.participants
+        .describe("user-1", "doorbell")
+        .map((p) => `${p.runtimeId} ${p.connected}`)
+        .sort(),
+    ).toEqual(["a true", "b true"]);
+    expect(host.coordinator.participants.resolve(tickets.b)).toBeTruthy();
+    expect(boardRuntime(first.server, "a")).toBeTruthy();
+    expect(boardRuntime(second.server, "b")).toBeTruthy();
+    expect(host.coordinator.getBoard("user-1", "doorbell")).toBe(session);
+  });
+
+  it("moves a runtime to another server only once the board is registered", async () => {
+    const host = await coordinatorHost();
+    const laptop = await runtimeServer();
+    const studio = await runtimeServer();
+    const session = await deploy(host, "user-1", board(), {
+      node: laptop.server,
+    });
+
+    await introduce(host, "user-1", "doorbell", { node: studio.server });
+
+    // Welcomed and waiting: the board is still the laptop's to run.
+    expect(studio.server.coordinatorLinks.list(OWNER)).toMatchObject([
+      { runtimeId: "node", connected: true, running: false },
+    ]);
+    expect(laptop.server.coordinatorLinks.list(OWNER)).toMatchObject([
+      { runtimeId: "node", connected: true, running: true },
+    ]);
+    expect(session.getStatus()).toBe("running");
+
+    const moved = await host.coordinator.registerBoard("user-1", board());
+
+    expect(moved.getStatus()).toBe("running");
+    expect(boardRuntime(studio.server, "node")).toBeTruthy();
+    await eventually(
+      () => laptop.server.coordinatorLinks.list(OWNER).length === 0,
+      "the first server to drop its link",
+    );
+    expect(boardRuntime(laptop.server, "node")).toBeUndefined();
+  });
+});
+
+describe("a runtime id two boards share", () => {
+  it("is a runtime of each board on the server they share", async () => {
+    // Boards ship the same handful of ids. Deploying a second one must not
+    // take the first one's runtime.
+    const host = await coordinatorHost();
+    const { server } = await runtimeServer();
+    const doorbell = await deploy(host, "user-1", board(), { node: server });
+
+    const garden = await deploy(
+      host,
+      "user-1",
+      board({
+        boardName: "garden",
+        services: {
+          node: [{ uuid: "mon-2", serviceId: monitorDescriptor.serviceId }],
+        },
+      }),
+      { node: server },
+    );
+
+    expect(garden.getStatus()).toBe("running");
+    expect(doorbell.getStatus()).toBe("running");
+    const uuids = (boardName: string) =>
+      boardRuntime(server, "node", boardName)!
+        .listServices()
+        .map((s) => s.uuid);
+    expect(uuids("doorbell")).toEqual(["mon-1"]);
+    expect(uuids("garden")).toEqual(["mon-2"]);
+
+    await host.coordinator.stopBoard("user-1", "garden");
+
+    expect(boardRuntime(server, "node", "garden")).toBeUndefined();
+    expect(uuids("doorbell")).toEqual(["mon-1"]);
+    expect(doorbell.getStatus()).toBe("running");
+  });
+
+  it("is not the runtime a client creates under that id", async () => {
+    // What opening the same board in the playground does: it posts a runtime
+    // under the id the deployed board uses, and deletes it when it leaves.
+    const host = await coordinatorHost();
+    const { server } = await runtimeServer();
+    const session = await deploy(host, "user-1", board(), { node: server });
+    const deployed = boardRuntime(server, "node");
+
+    await request(server.httpServer)
+      .post("/runtimes")
+      .send({ id: "node", name: "Node", boardName: "doorbell", services: [] })
+      .expect(200);
+    const listed = await request(server.httpServer).get("/runtimes").expect(200);
+    await request(server.httpServer).delete("/runtimes/node").expect(200);
+    await request(server.httpServer).delete("/runtimes").expect(200);
+
+    // The client saw its own runtime and never the board's.
+    expect(
+      listed.body.runtimes.map((rt: { services: unknown[] }) => rt.services),
+    ).toEqual([[]]);
+    expect(boardRuntime(server, "node")).toBe(deployed);
+    expect(session.getStatus()).toBe("running");
   });
 });
 
@@ -495,13 +684,13 @@ describe("stopping a board", () => {
 
     expect(stopped!.getStatus()).toBe("stopped");
     expect(stopped!.getErrors()).toEqual([]);
-    await request(server.httpServer).get("/runtimes/node").expect(404);
+    expect(boardRuntime(server, "node")).toBeUndefined();
 
     // Start is registering the same config again.
     const started = await host.coordinator.registerBoard("user-1", board());
 
     expect(started.getStatus()).toBe("running");
-    await request(server.httpServer).get("/runtimes/node").expect(200);
+    expect(boardRuntime(server, "node")).toBeTruthy();
   });
 
   it("releases a runtime its server was away for, once that server reconnects", async () => {
@@ -517,8 +706,7 @@ describe("stopping a board", () => {
     await host.coordinator.stopBoard("user-1", "doorbell");
 
     await eventually(
-      async () =>
-        (await request(server.httpServer).get("/runtimes/node")).status === 404,
+      () => !boardRuntime(server, "node"),
       "the orphaned runtime to be released",
     );
     expect(session.getStatus()).toBe("stopped");

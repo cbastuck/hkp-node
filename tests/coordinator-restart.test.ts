@@ -12,6 +12,7 @@ import { createMemoryLinkStore } from "../src/coordinatorLinks";
 import { httpServerSubservicesDescriptor } from "../src/services/http-server";
 import {
   CoordinatorHost,
+  boardRuntime,
   OWNER,
   RuntimeServer,
   deploy,
@@ -106,10 +107,9 @@ function boardConfig(): CloudBoardConfig {
 }
 
 async function publishedMount(server: RuntimeServer): Promise<string> {
-  const { body } = await request(server.httpServer)
-    .get("/runtimes/node/services/http-1")
-    .expect(200);
-  return String(body.__hkpMount);
+  return String(
+    boardRuntime(server, "node")?.getService("http-1")?.getState().__hkpMount,
+  );
 }
 
 describe("a coordinator that has been restarted", () => {
@@ -145,8 +145,9 @@ describe("a coordinator that has been restarted", () => {
     // Rebuilt from the board's config, under the same id — one runtime, not two
     // — and at the address it had, so what was configured against it elsewhere
     // still reaches it.
-    const { body } = await request(server.httpServer).get("/runtimes").expect(200);
-    expect(body.runtimes.map((rt: { id: string }) => rt.id)).toEqual(["node"]);
+    expect(
+      server.runtimeApp.getBoardRuntimes(OWNER).map((runtime) => runtime.id),
+    ).toEqual(["node"]);
     expect(await publishedMount(server)).toBe(address);
     expect((await fetch(address)).status).toBe(200);
   });
@@ -179,7 +180,7 @@ describe("a coordinator that has been restarted", () => {
 
     await shutDown(first);
 
-    await request(server.httpServer).get("/runtimes/node").expect(200);
+    expect(boardRuntime(server, "node")).toBeTruthy();
     expect((await fetch(address)).status).toBe(200);
   });
 
@@ -200,7 +201,7 @@ describe("a coordinator that has been restarted", () => {
     );
 
     expect(second.coordinator.getBoards("user-1")[0].status).toBe("stopped");
-    await request(server.httpServer).get("/runtimes/node").expect(404);
+    expect(boardRuntime(server, "node")).toBeUndefined();
   });
 
   it("does not bring back a board that was deleted", async () => {
@@ -234,7 +235,7 @@ describe("a runtime server that has been restarted", () => {
     after.server.coordinatorLinks.restore();
 
     await eventually(() => session.getStatus() === "running", "the rebuild");
-    expect(after.server.runtimeApp.getRuntime(OWNER, "node")).toBeTruthy();
+    expect(boardRuntime(after.server, "node")).toBeTruthy();
     expect((await fetch(await publishedMount(after.server))).status).toBe(200);
   });
 

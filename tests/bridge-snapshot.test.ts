@@ -1,7 +1,6 @@
 import http from "node:http";
 import { AddressInfo } from "node:net";
 
-import request from "supertest";
 import { WebSocket, WebSocketServer } from "ws";
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -10,7 +9,12 @@ import { BoardSession } from "../src/coordinator/session";
 import { BridgeMessage } from "../src/coordinator/bridgeProtocol";
 import { httpServerSubservicesDescriptor } from "../src/services/http-server";
 import { monitorDescriptor } from "../src/services/monitor";
-import { FAST_LINKS, startCoordinator, startSession } from "./cloud";
+import {
+  boardRuntime,
+  FAST_LINKS,
+  startCoordinator,
+  startSession,
+} from "./cloud";
 
 /**
  * What a browser attaching to a cloud board is told, and what it may ask for.
@@ -167,10 +171,7 @@ describe("attaching to a cloud board", () => {
 
     // Run the pipeline in place: the HTTP entry point parses JSON strictly, so
     // a bare string cannot be posted through it.
-    server.runtimeApp
-      .forOwner("anonymous")
-      .getRuntime("rt-1")
-      ?.process("a plain string", () => {});
+    boardRuntime(server, "rt-1")?.process("a plain string", () => {});
 
     // The runtime also reports where a value is in the pipeline; what the
     // monitor itself said is the one carrying the value.
@@ -269,8 +270,7 @@ describe("stopping a board so it can be edited", () => {
     // The board is still the coordinator's, with the config it was given.
     expect((session.config.services["rt-1"] ?? []).length).toBe(2);
     // ...and its runtimes are gone from the runtime server.
-    const res = await request(server.httpServer).get("/runtimes/rt-1");
-    expect(res.status).toBe(404);
+    expect(boardRuntime(server, "rt-1")).toBeUndefined();
   });
 
   it("tells attached browsers that it stopped", async () => {

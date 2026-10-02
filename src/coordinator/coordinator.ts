@@ -35,7 +35,17 @@ export class BoardCoordinator {
   ) {
     this.participants =
       participants ??
-      new ParticipantRegistry({ maxFrameBytes: limits.maxFrameBytes });
+      new ParticipantRegistry({
+        maxFrameBytes: limits.maxFrameBytes,
+        // A board that exists has to remember the ticket that now counts, or
+        // a restart would bring back the one it replaced.
+        onTicketsChanged: (userId, boardName) => {
+          const session = this.getBoard(userId, boardName);
+          if (session) {
+            void this.persist(session);
+          }
+        },
+      });
   }
 
   /** Entries this board has recorded; see LogStore.read. */
@@ -91,10 +101,14 @@ export class BoardCoordinator {
   }
 
   /**
-   * Issues a ticket for each of a board's runtimes named, replacing any they
-   * had. Asked for before the board is registered: the person's client hands
-   * each ticket to the runtime server it chose, which connects with it, and
-   * only then is the board handed over.
+   * Issues a ticket for each of a board's runtimes named. Asked for before the
+   * board is registered: the person's client hands each ticket to the runtime
+   * server it chose, which connects with it, and only then is the board
+   * registered.
+   *
+   * For a board that is already running the new tickets are pending: its
+   * runtime servers stay its own until the registration that follows, so a
+   * deploy that fails part-way leaves it as it was. See ParticipantRegistry.
    */
   async issueTickets(
     userId: string,
@@ -109,8 +123,8 @@ export class BoardCoordinator {
         runtimeId,
       });
     }
-    // A board that already exists has to remember the new tickets, or a
-    // restart would bring back the ones just replaced.
+    // A board that already exists has to remember a ticket that counts at
+    // once — one for a runtime it had none for.
     const session = this.getBoard(userId, boardName);
     if (session) {
       await this.persist(session);
@@ -204,6 +218,11 @@ export class BoardCoordinator {
     if (existing) {
       await existing.destroy();
     }
+
+    // The deploy went through: the servers introduced for it are the board's
+    // from here. After the old session released its runtimes, which it did
+    // over the connections it had.
+    this.participants.promoteBoard(userId, config.boardName);
 
     // A ticket for a runtime the board no longer has stops being a way in. The
     // old session has already released that runtime, over the connection this

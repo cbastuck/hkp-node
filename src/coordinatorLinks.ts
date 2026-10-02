@@ -107,40 +107,40 @@ export function createFileLinkStore(file: string): LinkStore {
   };
 }
 
+/** The runtime a link speaks for: one runtime of one board of one tenant. */
+export type LinkedRuntime = {
+  owner: string;
+  boardName: string;
+  runtimeId: string;
+};
+
 /**
  * What a link may do on this server — exactly the runtime it speaks for, as
  * the tenant that introduced it. Supplied by the server, which owns runtimes.
+ *
+ * The runtime is the board's: it shares its id with nothing a client created
+ * here, nor with another board's runtime of the same id.
  */
 export type LinkHost = {
   kind: string;
   registry(): unknown[];
-  runtimeExists(owner: string, runtimeId: string): boolean;
-  /** Builds the runtime, replacing anything under its id. May throw. */
+  runtimeExists(runtime: LinkedRuntime): boolean;
+  /** Builds the runtime, replacing the one this board had under its id. May throw. */
   provision(
-    owner: string,
-    runtimeId: string,
+    runtime: LinkedRuntime,
     payload: ProvisionPayload,
     secrets: Record<string, SecretEntry>,
   ): ProvisionResult;
-  describe(
-    owner: string,
-    runtimeId: string,
-  ): { services: ReportedService[] } | null;
+  describe(runtime: LinkedRuntime): { services: ReportedService[] } | null;
   configureService(
-    owner: string,
-    runtimeId: string,
+    runtime: LinkedRuntime,
     serviceUuid: string,
     config: unknown,
   ): Promise<unknown>;
-  setState(
-    owner: string,
-    runtimeId: string,
-    state: Record<string, unknown>,
-  ): unknown;
-  remove(owner: string, runtimeId: string): void;
+  setState(runtime: LinkedRuntime, state: Record<string, unknown>): unknown;
+  remove(runtime: LinkedRuntime): void;
   process(
-    owner: string,
-    runtimeId: string,
+    runtime: LinkedRuntime,
     params: unknown,
     context: unknown,
   ): Promise<unknown>;
@@ -173,10 +173,10 @@ export function joinUrlFor(coordinatorUrl: string): string {
   return url.toString();
 }
 
-// Runtime ids are unique per tenant, and a runtime belongs to one board at a
-// time, so this is also what a link is keyed by. NUL occurs in neither part.
-function linkKey(owner: string, runtimeId: string): string {
-  return `${owner}\u0000${runtimeId}`;
+// A runtime id is unique within a board, and a board's name within a tenant.
+// NUL occurs in none of the parts.
+function linkKey(runtime: LinkedRuntime): string {
+  return `${runtime.owner}\u0000${runtime.boardName}\u0000${runtime.runtimeId}`;
 }
 
 type FirstOutcome = { ok: true } | { ok: false; reason: string };
@@ -269,10 +269,7 @@ class Link {
         type: "hello",
         server: this.host.kind,
         registry: this.host.registry(),
-        runtimeExists: this.host.runtimeExists(
-          this.record.owner,
-          this.record.runtimeId,
-        ),
+        runtimeExists: this.host.runtimeExists(this.record),
       });
     });
 
@@ -407,7 +404,7 @@ class Link {
   }
 
   private async onMessage(message: CoordinatorToParticipant): Promise<void> {
-    const { owner, runtimeId } = this.record;
+    const { runtimeId } = this.record;
 
     if (message.type === "welcome") {
       this.welcomed = true;
@@ -422,8 +419,7 @@ class Link {
       }
       try {
         const result = await this.host.process(
-          owner,
-          runtimeId,
+          this.record,
           message.params,
           message.context,
         );
@@ -454,21 +450,20 @@ class Link {
   }
 
   private async serve(request: ParticipantRequest): Promise<unknown> {
-    const { owner, runtimeId } = this.record;
+    const runtime = this.record;
     switch (request.op) {
       case "provision": {
         const { op: _op, ...payload } = request;
         return this.host.provision(
-          owner,
-          runtimeId,
+          runtime,
           // The board this link was introduced for, whatever the request says:
           // a ticket speaks for one board.
-          { ...payload, boardName: this.record.boardName },
+          { ...payload, boardName: runtime.boardName },
           this.secrets,
         );
       }
       case "describe": {
-        const described = this.host.describe(owner, runtimeId);
+        const described = this.host.describe(runtime);
         if (!described) {
           throw new Error("the runtime is not running");
         }
@@ -476,15 +471,14 @@ class Link {
       }
       case "configureService":
         return this.host.configureService(
-          owner,
-          runtimeId,
+          runtime,
           request.serviceUuid,
           request.config,
         );
       case "setState":
-        return this.host.setState(owner, runtimeId, request.state ?? {});
+        return this.host.setState(runtime, request.state ?? {});
       case "remove":
-        this.host.remove(owner, runtimeId);
+        this.host.remove(runtime);
         return {};
       default:
         throw new Error(
@@ -527,7 +521,7 @@ export class CoordinatorLinks {
     // a runtime the link it already has.
     joinUrlFor(record.coordinatorUrl);
 
-    const key = linkKey(record.owner, record.runtimeId);
+    const key = linkKey(record);
     this.links.get(key)?.dispose();
 
     const link = this.createLink(record);
@@ -559,7 +553,7 @@ export class CoordinatorLinks {
   /** Reconnects with the tickets kept from before this process started. */
   restore(): void {
     for (const record of this.store.load()) {
-      const key = linkKey(record.owner, record.runtimeId);
+      const key = linkKey(record);
       if (this.links.has(key)) {
         continue;
       }
@@ -569,12 +563,17 @@ export class CoordinatorLinks {
     }
   }
 
-  /** A tenant's links, without their tickets. */
+  /**
+   * A tenant's links, without their tickets. `running` is whether the runtime
+   * the link is for has been built: a board's runtimes are not among those a
+   * client lists, so this is where they are seen.
+   */
   list(owner: string): Array<{
     boardName: string;
     runtimeId: string;
     coordinatorUrl: string;
     connected: boolean;
+    running: boolean;
   }> {
     return [...this.links.values()]
       .filter((link) => link.record.owner === owner)
@@ -583,39 +582,35 @@ export class CoordinatorLinks {
         runtimeId: link.record.runtimeId,
         coordinatorUrl: link.record.coordinatorUrl,
         connected: link.connected,
+        running: this.host.runtimeExists(link.record),
       }));
   }
 
   /** Leaves a board: drops the link and the runtime it was for. */
-  remove(owner: string, runtimeId: string): boolean {
-    const key = linkKey(owner, runtimeId);
+  remove(runtime: LinkedRuntime): boolean {
+    const key = linkKey(runtime);
     const link = this.links.get(key);
     if (!link) {
       return false;
     }
     link.dispose();
     this.links.delete(key);
-    this.host.remove(owner, runtimeId);
+    this.host.remove(link.record);
     this.persist();
     return true;
   }
 
   /** Carries a runtime's output to its coordinator, when it has one. */
-  emit(
-    owner: string,
-    runtimeId: string,
-    message: ParticipantToCoordinator,
-  ): void {
-    this.links.get(linkKey(owner, runtimeId))?.emit(message);
+  emit(runtime: LinkedRuntime, message: ParticipantToCoordinator): void {
+    this.links.get(linkKey(runtime))?.emit(message);
   }
 
   /** Merges values into what a link's runtime is built with. */
   setSecrets(
-    owner: string,
-    runtimeId: string,
+    runtime: LinkedRuntime,
     secrets: Record<string, SecretEntry>,
   ): void {
-    const link = this.links.get(linkKey(owner, runtimeId));
+    const link = this.links.get(linkKey(runtime));
     if (link) {
       link.secrets = { ...link.secrets, ...secrets };
     }
@@ -634,12 +629,12 @@ export class CoordinatorLinks {
       // The coordinator no longer holds this ticket, so the runtime it was
       // for is nobody's: it was built to outlive its clients, and the only
       // party that would have released it has just said it is not theirs.
-      const key = linkKey(record.owner, record.runtimeId);
+      const key = linkKey(record);
       if (this.links.get(key) !== rejected) {
         return;
       }
       this.links.delete(key);
-      this.host.remove(record.owner, record.runtimeId);
+      this.host.remove(record);
       this.persist();
     });
   }

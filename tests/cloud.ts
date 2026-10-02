@@ -30,6 +30,25 @@ export type RuntimeServer = ReturnType<typeof createRuntimeServer>;
 export const OWNER = ownerKeyOf(undefined);
 
 /** Reconnects in milliseconds rather than seconds, so a test can wait for one. */
+/**
+ * The runtime a server holds for a deployed board. It is the board's, so it is
+ * not among the runtimes the server's clients created; a test that deploys one
+ * board to a server finds it by id alone.
+ */
+export function boardRuntime(
+  server: RuntimeServer,
+  runtimeId: string,
+  boardName?: string,
+) {
+  return server.runtimeApp
+    .getBoardRuntimes(OWNER)
+    .find(
+      (runtime) =>
+        runtime.id === runtimeId &&
+        (boardName === undefined || runtime.scope().boardName === boardName),
+    );
+}
+
 export const FAST_LINKS = { reconnectDelayMs: 20, maxReconnectDelayMs: 40 };
 
 export async function startRuntimeServer(

@@ -90,6 +90,7 @@ import { InjectorService, injectorDescriptor } from "./services/injector";
 import { RssService, rssDescriptor } from "./services/rss";
 import { AssetService, assetDescriptor } from "./services/asset";
 import {
+  boardSpace,
   contextFromWire,
   HostedRuntime,
   RuntimeApp,
@@ -125,6 +126,7 @@ import {
 import {
   CoordinatorLinks,
   CoordinatorLinksOptions,
+  LinkedRuntime,
   LinkStore,
   createFileLinkStore,
   createMemoryLinkStore,
@@ -626,9 +628,12 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
 
   const runtimeApp = new RuntimeApp(
     factories,
-    (owner, runtimeId) => ({
+    (owner, runtimeId, space) => ({
       mount: (serviceUuid, handlers, options) =>
-        mounts.register(owner, runtimeId, serviceUuid, handlers, options),
+        mounts.register(owner, runtimeId, serviceUuid, handlers, {
+          ...options,
+          space,
+        }),
     }),
     // A `file://` asset is a file in one of the tenant's volumes —
     // `file:///<volume>/<path>` — read through the same store and the same
@@ -795,6 +800,20 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
 
   // Tear a runtime down and drop any session tokens it issued, so a dead
   // runtime's tokens can't linger as valid credentials.
+  /** Removes a board's runtime; nothing a client created is touched. */
+  function removeLinkedRuntime(linked: LinkedRuntime): void {
+    const space = boardSpace(linked.owner, linked.boardName);
+    runtimeApp.removeRuntime(space, linked.runtimeId);
+    mounts.releaseRuntime(space, linked.runtimeId);
+  }
+
+  function linkedRuntime(linked: LinkedRuntime): HostedRuntime | undefined {
+    return runtimeApp.getRuntime(
+      boardSpace(linked.owner, linked.boardName),
+      linked.runtimeId,
+    );
+  }
+
   function removeRuntimeAndSessions(owner: string, runtimeId: string): void {
     runtimeApp.removeRuntime(owner, runtimeId);
     mounts.releaseRuntime(owner, runtimeId);
@@ -807,8 +826,11 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
 
   /**
    * Builds a runtime for a tenant, replacing anything under that id, and wires
-   * what it says to whoever is listening: the sockets watching it, and the
-   * coordinator it belongs to when it has one.
+   * what it says to whoever is listening.
+   *
+   * A runtime a client asked for lives in the tenant's own space and speaks to
+   * the sockets watching it. One built for a coordinator (`linked`) lives in
+   * its board's space and speaks to that coordinator; see `boardSpace`.
    *
    * Provisioning creates. Attaching to a runtime that is already running is a
    * different intent and has its own verb — GET /runtimes/:id, which a client
@@ -823,15 +845,16 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
   function provisionRuntime(
     owner: string,
     config: RuntimeConfiguration,
+    linked?: LinkedRuntime,
   ): HostedRuntime {
-    const tenant = runtimeApp.forOwner(owner);
-    const replacing = tenant.getRuntime(config.id);
+    const space = linked ? boardSpace(linked.owner, linked.boardName) : owner;
+    const replacing = runtimeApp.getRuntime(space, config.id);
 
     // Quotas apply only to genuinely new runtimes — replacing one that already
     // exists must never be refused for being over the limit.
     if (
       !replacing &&
-      atQuota(tenant.getRuntimes().length, quotas.maxRuntimesPerUser)
+      atQuota(runtimeApp.countRuntimes(owner), quotas.maxRuntimesPerUser)
     ) {
       throw new QuotaError(
         `Runtime limit reached (${quotas.maxRuntimesPerUser})`,
@@ -843,22 +866,31 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
       );
     }
 
-    const runtime = tenant.createRuntime(config);
+    const runtime = runtimeApp.createRuntime(owner, config, space);
+    if (linked) {
+      runtime.registerNotificationTarget((notification) => {
+        coordinatorLinks.emit(linked, {
+          type: "notification",
+          serviceUuid: notification.instanceId,
+          payload: notification.payload,
+        });
+      });
+      runtime.registerLogTarget((entry) => {
+        coordinatorLinks.emit(linked, { type: "log", entry });
+      });
+      runtime.registerResultTarget((result) => {
+        coordinatorLinks.emit(linked, { type: "result", data: result });
+      });
+      return runtime;
+    }
     const socketKey = tenantKey(owner, runtime.id);
     runtime.registerNotificationTarget((notification) => {
       sendJsonNotification(socketKey, notification);
-      coordinatorLinks.emit(owner, runtime.id, {
-        type: "notification",
-        serviceUuid: notification.instanceId,
-        payload: notification.payload,
-      });
     });
     runtime.registerLogTarget((entry) => {
       sendJsonLog(socketKey, entry);
-      coordinatorLinks.emit(owner, runtime.id, { type: "log", entry });
     });
     runtime.registerResultTarget((result) => {
-      coordinatorLinks.emit(owner, runtime.id, { type: "result", data: result });
       const sockets = runtimeSockets.get(socketKey);
       if (!sockets) return;
       for (const socket of sockets) {
@@ -877,11 +909,10 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
     {
       kind: RUNTIME_SERVER_KIND,
       registry: () => runtimeApp.getRegistry(),
-      runtimeExists: (owner, runtimeId) =>
-        !!runtimeApp.getRuntime(owner, runtimeId),
-      provision: (owner, runtimeId, payload, secrets) => {
+      runtimeExists: (linked) => !!linkedRuntime(linked),
+      provision: (linked, payload, secrets) => {
         const config = validateRuntimeConfiguration({
-          id: runtimeId,
+          id: linked.runtimeId,
           name: payload.name,
           boardName: payload.boardName,
           // The coordinator's until it says otherwise: a deployed board keeps
@@ -897,7 +928,7 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
         // The values this server was handed for the runtime, by the person's
         // own client. They do not come from the coordinator and never go to it.
         config.secrets = secrets;
-        const runtime = provisionRuntime(owner, config);
+        const runtime = provisionRuntime(linked.owner, config, linked);
         const held = new Set(runtime.secrets().aliases());
         const missingSecrets = referencedSecrets(
           config.services.map((service) => service.state),
@@ -908,12 +939,12 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
           missingSecrets,
         };
       },
-      describe: (owner, runtimeId) => {
-        const runtime = runtimeApp.getRuntime(owner, runtimeId);
+      describe: (linked) => {
+        const runtime = linkedRuntime(linked);
         return runtime ? { services: runtime.listServices() } : null;
       },
-      configureService: async (owner, runtimeId, serviceUuid, config) => {
-        const runtime = runtimeApp.getRuntime(owner, runtimeId);
+      configureService: async (linked, serviceUuid, config) => {
+        const runtime = linkedRuntime(linked);
         if (!runtime) {
           throw new Error("the runtime is not running");
         }
@@ -925,16 +956,16 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
         }
         return waitForServiceActivationState(runtime, serviceUuid);
       },
-      setState: (owner, runtimeId, state) => {
-        const runtime = runtimeApp.getRuntime(owner, runtimeId);
+      setState: (linked, state) => {
+        const runtime = linkedRuntime(linked);
         if (!runtime) {
           throw new Error("the runtime is not running");
         }
         return applyRuntimeState(runtime, state);
       },
-      remove: (owner, runtimeId) => removeRuntimeAndSessions(owner, runtimeId),
-      process: async (owner, runtimeId, params, context) => {
-        const runtime = runtimeApp.getRuntime(owner, runtimeId);
+      remove: (linked) => removeLinkedRuntime(linked),
+      process: async (linked, params, context) => {
+        const runtime = linkedRuntime(linked);
         if (!runtime) {
           throw new Error("the runtime is not running");
         }
@@ -1033,11 +1064,12 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
   });
 
   /** Leaves a board: drops the link and the runtime it was for. */
-  expressApp.delete("/coordinator-links/:runtimeId", (req, res) => {
-    const removed = coordinatorLinks.remove(
-      ownerKeyOf(req.authenticatedUser),
-      req.params.runtimeId,
-    );
+  expressApp.delete("/coordinator-links/:boardName/:runtimeId", (req, res) => {
+    const removed = coordinatorLinks.remove({
+      owner: ownerKeyOf(req.authenticatedUser),
+      boardName: req.params.boardName,
+      runtimeId: req.params.runtimeId,
+    });
     res.sendStatus(removed ? 200 : 404);
   });
 

@@ -17,7 +17,7 @@ import { BoardSession } from "../src/coordinator/session";
 import { CloudBoardConfig } from "../src/coordinator/types";
 import {
   CoordinatorHost,
-  OWNER,
+  boardRuntime,
   RuntimeServer,
   deploy,
   eventually,
@@ -222,7 +222,7 @@ async function attachBrowser(session: BoardSession, runtimeIds = ["ui"]) {
 /** What a runtime on `server` is handed as input, in the order it arrives. */
 function arrivals(server: RuntimeServer, runtimeId: string): unknown[] {
   const seen: unknown[] = [];
-  const runtime = server.runtimeApp.getRuntime(OWNER, runtimeId)!;
+  const runtime = boardRuntime(server, runtimeId)!;
   const process = runtime.process.bind(runtime);
   runtime.process = ((input: unknown, ...rest: unknown[]) => {
     seen.push(input);
@@ -270,7 +270,7 @@ describe("bytes across a deployed board", () => {
     const seen = arrivals(b, "b");
     const sent = Uint8Array.from({ length: 4096 }, (_, i) => i % 256);
 
-    a.runtimeApp.getRuntime(OWNER, "a")!.emitResult(sent);
+    boardRuntime(a, "a")!.emitResult(sent);
 
     await eventually(() => seen.length === 1, "bytes to arrive");
     expect(seen[0]).toBeInstanceOf(Uint8Array);
@@ -282,7 +282,7 @@ describe("bytes across a deployed board", () => {
     const seen = arrivals(b, "b");
     const sent = { meta: { name: "clip.mp3", size: 3 }, binary: bytes(7, 8, 9) };
 
-    a.runtimeApp.getRuntime(OWNER, "a")!.emitResult(sent);
+    boardRuntime(a, "a")!.emitResult(sent);
 
     await eventually(() => seen.length === 1, "the object to arrive");
     expect(seen[0]).toEqual(sent);
@@ -292,7 +292,7 @@ describe("bytes across a deployed board", () => {
     const { a, b } = await twoServers(chain);
     const seen = arrivals(b, "b");
 
-    a.runtimeApp.getRuntime(OWNER, "a")!.emitResult({ n: 1, list: [1, 2] });
+    boardRuntime(a, "a")!.emitResult({ n: 1, list: [1, 2] });
 
     await eventually(() => seen.length === 1, "the value to arrive");
     expect(seen[0]).toEqual({ n: 1, list: [1, 2] });
@@ -303,7 +303,7 @@ describe("bytes across a deployed board", () => {
     const browser = await attachBrowser(session);
     const seen = arrivals(b, "b");
 
-    a.runtimeApp.getRuntime(OWNER, "a")!.emitResult(bytes(5, 6));
+    boardRuntime(a, "a")!.emitResult(bytes(5, 6));
 
     await eventually(
       () => browser.frames.some((f) => f.isBinary),
@@ -337,7 +337,7 @@ describe("bytes across a deployed board", () => {
     );
     const { host, a, b, session } = await twoServers(chain, coordinator);
     const seen = arrivals(b, "b");
-    const runtime = a.runtimeApp.getRuntime(OWNER, "a")!;
+    const runtime = boardRuntime(a, "a")!;
 
     runtime.emitResult(new Uint8Array(256 * 1024));
     runtime.emitResult(bytes(1));

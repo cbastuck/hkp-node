@@ -45,6 +45,8 @@ export type MountHandle = {
 
 type MountRecord = {
   owner: string;
+  /** The space the runtime lives in; see `boardSpace`. */
+  space: string;
   runtimeId: string;
   serviceUuid: string;
   handlers: MountHandlers;
@@ -132,7 +134,7 @@ export class MountRegistry {
     // What the mount is called, and the board's, so the address survives a
     // reload. A service that names nothing is identified by its own uuid, which
     // is stable in a board file too.
-    options: { boardName?: string; mountName?: string } = {},
+    options: { boardName?: string; mountName?: string; space?: string } = {},
   ): MountHandle | null {
     const mountId = this.deriveId(
       owner,
@@ -146,12 +148,23 @@ export class MountRegistry {
       return null;
     }
 
-    this.mounts.set(mountId, { owner, runtimeId, serviceUuid, handlers });
+    const record: MountRecord = {
+      owner,
+      space: options.space ?? owner,
+      runtimeId,
+      serviceUuid,
+      handlers,
+    };
+    this.mounts.set(mountId, record);
     return {
       url,
       path: mountPath,
+      // This claim and no other: the address is derived, so a later claim to
+      // it takes it over, and releasing the earlier one then removes nothing.
       release: () => {
-        this.mounts.delete(mountId);
+        if (this.mounts.get(mountId) === record) {
+          this.mounts.delete(mountId);
+        }
       },
     };
   }
@@ -161,17 +174,19 @@ export class MountRegistry {
    * on destroy; this is the backstop so a torn-down runtime can never leave a
    * publicly reachable endpoint behind.
    */
-  releaseRuntime(owner: string, runtimeId: string): void {
+  releaseRuntime(space: string, runtimeId: string): void {
     for (const [mountId, record] of this.mounts) {
-      if (record.owner === owner && record.runtimeId === runtimeId) {
+      if (record.space === space && record.runtimeId === runtimeId) {
         this.mounts.delete(mountId);
       }
     }
   }
 
+  /** Drops the mounts of what a tenant's clients created; a deployed board's
+   *  go with its runtimes. */
   releaseOwner(owner: string): void {
     for (const [mountId, record] of this.mounts) {
-      if (record.owner === owner) {
+      if (record.space === owner) {
         this.mounts.delete(mountId);
       }
     }

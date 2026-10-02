@@ -17,6 +17,7 @@ import { monitorDescriptor } from "../src/services/monitor";
 import {
   CoordinatorHost,
   FAST_LINKS,
+  boardRuntime,
   OWNER,
   RuntimeServer,
   deploy,
@@ -129,6 +130,8 @@ describe("being introduced to a coordinator", () => {
         runtimeId: "node",
         coordinatorUrl: host.url,
         connected: true,
+        // Introduced, and not yet built by the coordinator.
+        running: false,
       },
     ]);
     expect(JSON.stringify(body)).not.toContain(ticket);
@@ -225,10 +228,8 @@ describe("what a link is able to do", () => {
       services: [],
     });
 
-    const { body } = await request(server.httpServer)
-      .get("/runtimes/node")
-      .expect(200);
-    expect(body.boardName).toBe("doorbell");
+    expect(boardRuntime(server, "node")?.scope().boardName).toBe("doorbell");
+    expect(boardRuntime(server, "node", "someone-elses-board")).toBeUndefined();
   });
 
   it("answers an operation it does not know with an error rather than silence", async () => {
@@ -254,8 +255,7 @@ describe("what a link is able to do", () => {
       .get("node")!
       .listen((event) => heard.push(event));
 
-    void server.runtimeApp
-      .getRuntime(OWNER, "node")!
+    void boardRuntime(server, "node")!
       .process({ hello: "there" }, () => {});
 
     await eventually(
@@ -275,12 +275,12 @@ describe("what a link is able to do", () => {
     const { server } = await runtimeServer();
     const session = await deploy(host, "user-1", board, { node: server });
 
-    await request(server.httpServer).delete("/coordinator-links/node").expect(200);
+    await request(server.httpServer).delete("/coordinator-links/doorbell/node").expect(200);
 
-    await request(server.httpServer).get("/runtimes/node").expect(404);
+    expect(boardRuntime(server, "node")).toBeUndefined();
     expect(server.coordinatorLinks.list(OWNER)).toEqual([]);
     await eventually(() => session.getStatus() === "error", "the board to notice");
-    await request(server.httpServer).delete("/coordinator-links/node").expect(404);
+    await request(server.httpServer).delete("/coordinator-links/doorbell/node").expect(404);
   });
 });
 
@@ -422,7 +422,7 @@ describe("credentials for a runtime a coordinator builds", () => {
 
     expect(session.getStatus()).toBe("running");
     expect(
-      server.runtimeApp.getRuntime(OWNER, "node")!.secrets().aliases(),
+      boardRuntime(server, "node")!.secrets().aliases(),
     ).toEqual(["api.key"]);
   });
 

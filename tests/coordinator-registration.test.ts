@@ -1,9 +1,14 @@
-import request from "supertest";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { createRuntimeServer } from "../src/server";
 import { monitorDescriptor } from "../src/services/monitor";
-import { CoordinatorHost, FAST_LINKS, introduce, startCoordinator } from "./cloud";
+import {
+  boardRuntime,
+  CoordinatorHost,
+  FAST_LINKS,
+  introduce,
+  startCoordinator,
+} from "./cloud";
 
 /**
  * Registering the same board twice at once.
@@ -80,15 +85,15 @@ describe("a runtime a coordinator owns", () => {
       boardConfig(1),
     );
     expect(session.getErrors()).toEqual([]);
-    await request(server.httpServer).get("/runtimes/rt-1").expect(200);
+    expect(boardRuntime(server, "rt-1")).toBeTruthy();
 
     // Every watcher goes away — which is not what releases it.
-    await request(server.httpServer).get("/runtimes/rt-1").expect(200);
+    expect(boardRuntime(server, "rt-1")).toBeTruthy();
     await session.stop();
 
     // The board is stopped, so its runtimes are handed back deliberately —
     // which is the coordinator's decision, not a side effect of a disconnect.
-    await request(server.httpServer).get("/runtimes/rt-1").expect(404);
+    expect(boardRuntime(server, "rt-1")).toBeUndefined();
   });
 });
 
@@ -109,7 +114,7 @@ describe("registering a board while a registration is in flight", () => {
     // The board that ended up registered is the one whose runtime is running.
     const live = coordinator.getBoard("user-1", "board-1");
     expect(live).toBeTruthy();
-    await request(server.httpServer).get("/runtimes/rt-1").expect(200);
+    expect(boardRuntime(server, "rt-1")).toBeTruthy();
   });
 
   it("runs them one after another rather than interleaved", async () => {

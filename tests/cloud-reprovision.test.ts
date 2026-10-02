@@ -5,6 +5,7 @@ import { createRuntimeServer } from "../src/server";
 import { httpServerSubservicesDescriptor } from "../src/services/http-server";
 import { monitorDescriptor } from "../src/services/monitor";
 import {
+  boardRuntime,
   FAST_LINKS,
   fakeParticipants,
   startCoordinator,
@@ -185,10 +186,7 @@ describe("deploying a board", () => {
     );
     cleanups.push(() => session.destroy());
 
-    const { body } = await request(server.httpServer)
-      .get("/runtimes/rt-owner")
-      .expect(200);
-    expect(body.garbageCollected).toBe(false);
+    expect(boardRuntime(server, "rt-owner")?.garbageCollected).toBe(false);
 
     // And the address it resolved for the consumer is live.
     const configure = consumer.requests.find(

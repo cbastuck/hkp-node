@@ -9,7 +9,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { CloudBoardConfig } from "../src/coordinator/types";
 import {
   CoordinatorHost,
-  OWNER,
+  boardRuntime,
   RuntimeServer,
   eventually,
   startCoordinator,
@@ -132,7 +132,7 @@ async function introduceOver(
 /** What a runtime on a node server is handed as input, in order. */
 function arrivals(server: RuntimeServer, runtimeId: string): unknown[] {
   const seen: unknown[] = [];
-  const runtime = server.runtimeApp.getRuntime(OWNER, runtimeId)!;
+  const runtime = boardRuntime(server, runtimeId)!;
   const process = runtime.process.bind(runtime);
   runtime.process = ((input: unknown, ...rest: unknown[]) => {
     seen.push(input);
@@ -198,12 +198,17 @@ describe.skipIf(!RT_BIN)("a board across hkp-node and hkp-rt", () => {
       ["back", "node", true],
     ]);
 
-    // The C++ runtime exists, built from the board, as the coordinator's.
-    const built = await (await fetch(`${rt.baseUrl}/runtimes/cpp`)).json();
-    expect(built.services.map((s: { uuid: string }) => s.uuid)).toEqual([
-      "stamp",
-    ]);
-    expect(built.boardName).toBe("through-cpp");
+    // The C++ runtime exists, built from the board, as the board's: the
+    // coordinator can ask after it, and a client of that server is not shown
+    // it among its own.
+    const built = (await host.coordinator.participants
+      .forBoard("user-1", roundTrip.boardName)
+      .get("cpp")!
+      .request({ op: "describe" })) as { services: Array<{ uuid: string }> };
+    expect(built.services.map((s) => s.uuid)).toEqual(["stamp"]);
+    expect((await (await fetch(`${rt.baseUrl}/runtimes`)).json()).runtimes).toEqual(
+      [],
+    );
     expect((await (await fetch(`${rt.baseUrl}/coordinator-links`)).json()).links)
       .toEqual([
         {
@@ -211,11 +216,12 @@ describe.skipIf(!RT_BIN)("a board across hkp-node and hkp-rt", () => {
           runtimeId: "cpp",
           coordinatorUrl: host.url,
           connected: true,
+          running: true,
         },
       ]);
 
     const arrived = arrivals(node.server, "back");
-    node.server.runtimeApp.getRuntime(OWNER, "out")!.emitResult({ ping: 1 });
+    boardRuntime(node.server, "out")!.emitResult({ ping: 1 });
 
     await eventually(() => arrived.length === 1, "the value to come back");
     expect(arrived[0]).toEqual({ ping: 1, via: "cpp" });
@@ -240,7 +246,7 @@ describe.skipIf(!RT_BIN)("a board across hkp-node and hkp-rt", () => {
     const session = await host.coordinator.registerBoard("user-1", plain);
     expect(session.getErrors()).toEqual([]);
     const arrived = arrivals(node.server, "back");
-    const out = node.server.runtimeApp.getRuntime(OWNER, "out")!;
+    const out = boardRuntime(node.server, "out")!;
     const sent = Uint8Array.from({ length: 70_000 }, (_, i) => (i * 7) % 256);
     const samples = new Uint8Array(new Float32Array([0.5, -1, 0.25]).buffer);
 
@@ -301,10 +307,11 @@ describe.skipIf(!RT_BIN)("a board across hkp-node and hkp-rt", () => {
       "the board to recover",
       10_000,
     );
-    const rebuilt = await (await fetch(`${again.baseUrl}/runtimes/cpp`)).json();
-    expect(rebuilt.services.map((s: { uuid: string }) => s.uuid)).toEqual([
-      "seen",
-    ]);
+    const rebuilt = (await host.coordinator.participants
+      .forBoard("user-1", cppOnly.boardName)
+      .get("cpp")!
+      .request({ op: "describe" })) as { services: Array<{ uuid: string }> };
+    expect(rebuilt.services.map((s) => s.uuid)).toEqual(["seen"]);
   });
 
   it("releases the runtime and forgets the ticket when the board is deleted", async () => {
@@ -318,14 +325,14 @@ describe.skipIf(!RT_BIN)("a board across hkp-node and hkp-rt", () => {
     };
     await introduceOver(host, cppOnly.boardName, [["cpp", rt.baseUrl]]);
     await host.coordinator.registerBoard("user-1", cppOnly);
-    expect((await fetch(`${rt.baseUrl}/runtimes/cpp`)).status).toBe(200);
+    const links = async () =>
+      (await (await fetch(`${rt.baseUrl}/coordinator-links`)).json()).links;
+    expect((await links()).map((link: { running: boolean }) => link.running))
+      .toEqual([true]);
 
     await host.coordinator.removeBoard("user-1", "cpp-deleted");
 
-    await eventually(
-      async () => (await fetch(`${rt.baseUrl}/runtimes/cpp`)).status === 404,
-      "the runtime to be released",
-    );
+    // Rejected with its ticket, the server drops the link and what it was for.
     await eventually(
       async () =>
         (await (await fetch(`${rt.baseUrl}/coordinator-links`)).json()).links
