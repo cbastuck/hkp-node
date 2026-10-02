@@ -1085,6 +1085,11 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
       // POST /coordinator-links. Said here so a client can tell before it
       // deploys a board that needs it.
       coordinatorLinks: true,
+      // A runtime built for a coordinator is kept apart from the ones a client
+      // creates, so a client deleting its own does not delete a deployed
+      // board's. A client checks for this before it deploys: against a server
+      // that keeps them together, leaving the board it deployed would stop it.
+      boardRuntimes: true,
     });
   });
 

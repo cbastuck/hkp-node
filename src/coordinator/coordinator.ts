@@ -132,6 +132,22 @@ export class BoardCoordinator {
     return tickets;
   }
 
+  /**
+   * Takes back the tickets of a deploy that did not go through.
+   *
+   * For a board that is running these are its pending ones; its servers and
+   * the tickets they hold are untouched. A board that was never registered
+   * has nothing else, so all of its tickets go, and the servers introduced
+   * for it are let go.
+   */
+  cancelTickets(userId: string, boardName: string): void {
+    if (this.getBoard(userId, boardName)) {
+      this.participants.cancelPending(userId, boardName);
+    } else {
+      this.participants.revokeBoard(userId, boardName);
+    }
+  }
+
   /** Writes a board down, with its tickets and whether it is stopped. */
   private async persist(session: BoardSession): Promise<void> {
     try {
@@ -219,9 +235,9 @@ export class BoardCoordinator {
       await existing.destroy();
     }
 
-    // The deploy went through: the servers introduced for it are the board's
-    // from here. After the old session released its runtimes, which it did
-    // over the connections it had.
+    // The deploy went through: a server introduced for it and waiting is the
+    // board's from here. After the old session released its runtimes, which
+    // it did over the connections it had.
     this.participants.promoteBoard(userId, config.boardName);
 
     // A ticket for a runtime the board no longer has stops being a way in. The

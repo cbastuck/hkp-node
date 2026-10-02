@@ -63,6 +63,20 @@ export function createCoordinatorRouter(
   );
 
   /**
+   * Takes back the tickets of a deploy that did not go through: the client
+   * asked for them, could not introduce every runtime server, and will not
+   * register the board. See BoardCoordinator.cancelTickets.
+   */
+  router.delete(
+    "/users/:username/boards/:boardName/tickets",
+    (req: Request, res: Response) => {
+      const { username, boardName } = req.params as Record<string, string>;
+      coordinator.cancelTickets(username, boardName);
+      res.sendStatus(204);
+    },
+  );
+
+  /**
    * Which of a board's runtimes hold a ticket, and whether the runtime server
    * holding it is connected. Never the tickets themselves — a coordinator
    * keeps only what recognises one.

@@ -41,11 +41,16 @@ import {
  *
  * A pending ticket takes over — the one before it is forgotten, and the server
  * that held it gives way — when the board is registered, which is the deploy
- * having succeeded. Until then a deploy that fails part-way has cost the
- * running board nothing. It also takes over as soon as the runtime has no
- * server connected: nothing is there to protect, and the usual way that comes
- * about is the same server being introduced again, which drops its old
- * connection to make the new one.
+ * having succeeded, and only if a server is waiting with it. One nobody
+ * connected with is dropped then: a runtime server that is already the
+ * board's keeps the connection and the ticket it has when it is introduced
+ * again. A deploy that fails drops its pending tickets (`cancel`), so it
+ * leaves a running board's servers and tickets exactly as they were.
+ *
+ * The one exception is a runtime with no server connected when the pending
+ * ticket's holder arrives. It takes over at once: nothing is running there to
+ * protect, and it is how a runtime whose server left is given one again
+ * without deploying the board.
  *
  * Revoking — a board deleted, a runtime the board no longer has — forgets both
  * tickets and closes what connected with them.
@@ -296,19 +301,39 @@ export class ParticipantRegistry {
     }
   }
 
-  /**
-   * Makes every pending ticket of a board the one that counts: the board has
-   * been registered, so the deploy they were issued for went through.
-   */
-  promoteBoard(userId: string, boardName: string): void {
-    for (const record of [...this.ticketsByHash.values()]) {
-      if (
+  private pendingOf(userId: string, boardName: string): TicketRecord[] {
+    return [...this.ticketsByHash.values()].filter(
+      (record) =>
         record.userId === userId &&
         record.boardName === boardName &&
-        this.pendingByRuntime.get(runtimeKey(record)) === record.hash
-      ) {
+        this.pendingByRuntime.get(runtimeKey(record)) === record.hash,
+    );
+  }
+
+  /**
+   * Settles a board's pending tickets: it has been registered, so the deploy
+   * they were issued for went through. One a server is waiting with becomes
+   * the one that counts; one nobody connected with is dropped, and the runtime
+   * keeps the ticket and the server it had.
+   */
+  promoteBoard(userId: string, boardName: string): void {
+    for (const record of this.pendingOf(userId, boardName)) {
+      const key = runtimeKey(record);
+      if (this.waiting.has(key)) {
         this.promote(record);
+      } else {
+        this.dropPending(key);
       }
+    }
+  }
+
+  /**
+   * Drops a board's pending tickets and closes the servers waiting with them:
+   * the deploy they were issued for did not go through.
+   */
+  cancelPending(userId: string, boardName: string): void {
+    for (const record of this.pendingOf(userId, boardName)) {
+      this.dropPending(runtimeKey(record));
     }
   }
 
@@ -547,11 +572,9 @@ export class ParticipantRegistry {
       for (const listener of this.listenersOf(binding)) {
         listener.onLeave(binding.runtimeId);
       }
-      // A server waiting with a pending ticket takes the place left empty.
-      if (this.waiting.has(key)) {
-        this.promote(binding);
-        this.options.onTicketsChanged?.(binding.userId, binding.boardName);
-      }
+      // A server waiting with a pending ticket goes on waiting: the one that
+      // left may be back, and what it left is not the waiting one's until the
+      // board is registered.
     });
 
     socket.on("error", () => {

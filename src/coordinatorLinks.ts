@@ -512,6 +512,13 @@ export class CoordinatorLinks {
    * keeps nothing — when it has not: an introduction is made by somebody
    * waiting to hear whether it worked, so this is the one connection attempt
    * that is not retried.
+   *
+   * A runtime that is already connected to that coordinator stays as it is:
+   * the link it has is kept, the ticket handed over goes unused, and only the
+   * secrets are taken. Being introduced is the first step of a deploy that
+   * may yet fail, and must not change what is running. One connected to a
+   * *different* coordinator is refused — a board's runtime here belongs to
+   * one coordinator at a time, and the other is named.
    */
   async introduce(
     record: LinkRecord,
@@ -519,10 +526,20 @@ export class CoordinatorLinks {
   ): Promise<void> {
     // Validated before anything is replaced: a malformed address must not cost
     // a runtime the link it already has.
-    joinUrlFor(record.coordinatorUrl);
+    const joinUrl = joinUrlFor(record.coordinatorUrl);
 
     const key = linkKey(record);
-    this.links.get(key)?.dispose();
+    const existing = this.links.get(key);
+    if (existing?.connected) {
+      if (joinUrlFor(existing.record.coordinatorUrl) !== joinUrl) {
+        throw new Error(
+          `"${record.boardName}" is already deployed here by ${existing.record.coordinatorUrl}`,
+        );
+      }
+      existing.secrets = secrets;
+      return;
+    }
+    existing?.dispose();
 
     const link = this.createLink(record);
     link.secrets = secrets;

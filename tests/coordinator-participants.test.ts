@@ -10,6 +10,10 @@ import { mapDescriptor } from "../src/services/map";
 import { monitorDescriptor } from "../src/services/monitor";
 import { WebSocket } from "ws";
 import {
+  CLOSE_REPLACED,
+  CLOSE_TICKET_REVOKED,
+} from "../src/coordinator/participantProtocol";
+import {
   CoordinatorHost,
   boardRuntime,
   OWNER,
@@ -73,6 +77,37 @@ function joinSocket(host: CoordinatorHost, ticket?: string) {
     `${host.url.replace("http", "ws")}${JOIN_PATH}`,
     ticket ? { headers: { Authorization: `Bearer ${ticket}` } } : {},
   );
+}
+
+/**
+ * Connects with a ticket and says hello; resolves once welcomed. Answers
+ * whatever it is then asked as a runtime server with nothing on it would.
+ */
+function joinAs(host: CoordinatorHost, ticket: string): Promise<WebSocket> {
+  const socket = joinSocket(host, ticket);
+  return new Promise((resolve, reject) => {
+    socket.on("open", () =>
+      socket.send(JSON.stringify({ type: "hello", server: "test", registry: [] })),
+    );
+    socket.on("message", (raw) => {
+      const message = JSON.parse(raw.toString());
+      if (message.type === "welcome") {
+        resolve(socket);
+      }
+      if (message.type === "request") {
+        socket.send(
+          JSON.stringify({
+            type: "response",
+            requestId: message.requestId,
+            ok: true,
+            data: { registry: [], services: [], missingSecrets: [] },
+          }),
+        );
+      }
+    });
+    socket.on("error", reject);
+    socket.on("unexpected-response", () => reject(new Error("refused")));
+  });
 }
 
 function outcome(socket: WebSocket): Promise<string> {
@@ -372,23 +407,113 @@ describe("tickets", () => {
     expect(host.coordinator.participants.resolve(second)).toBeTruthy();
   });
 
-  it("forgets the ticket before it once the board is registered", async () => {
+  it("makes a pending ticket the one that counts once the board is registered, when a server came with it", async () => {
     const host = await coordinatorHost();
     const issue = async () =>
       (await host.coordinator.issueTickets("user-1", "doorbell", ["node"])).node;
     const first = await issue();
+    const holder = await joinAs(host, first);
     const second = await issue();
+    const successor = await joinAs(host, second);
+    const gaveWay = new Promise<number>((resolve) =>
+      holder.on("close", (code) => resolve(code)),
+    );
 
     await host.coordinator.registerBoard("user-1", board());
 
+    expect(await gaveWay).toBe(CLOSE_REPLACED);
     expect(await outcome(joinSocket(host, first))).toBe("refused 401");
-    const accepted = joinSocket(host, second);
-    expect(await outcome(accepted)).toBe("open");
-    accepted.terminate();
+    expect(host.coordinator.participants.resolve(second)).toBeTruthy();
     // What a restart would bring back is the ticket that counts.
     expect(
       host.coordinator.participants.exportTickets("user-1", "doorbell"),
     ).toHaveLength(1);
+    successor.terminate();
+  });
+
+  it("drops a pending ticket nobody connected with when the board is registered", async () => {
+    // A runtime server that is already the board's keeps its connection when
+    // it is introduced again, so the ticket issued for that goes unused — and
+    // the one the server holds has to go on counting.
+    const host = await coordinatorHost();
+    const issue = async () =>
+      (await host.coordinator.issueTickets("user-1", "doorbell", ["node"])).node;
+    const first = await issue();
+    const unused = await issue();
+
+    await host.coordinator.registerBoard("user-1", board());
+
+    expect(await outcome(joinSocket(host, unused))).toBe("refused 401");
+    expect(host.coordinator.participants.resolve(first)).toBeTruthy();
+  });
+
+  it("keeps a server waiting with a pending ticket waiting when the board's server drops", async () => {
+    // A deploy that got this far and no further must not take effect later,
+    // the next time the connection it would have replaced blinks.
+    const host = await coordinatorHost();
+    const issue = async () =>
+      (await host.coordinator.issueTickets("user-1", "doorbell", ["node"])).node;
+    const first = await issue();
+    const holder = await joinAs(host, first);
+    const waiting = await joinAs(host, await issue());
+
+    holder.terminate();
+    await eventually(
+      () =>
+        !host.coordinator.participants
+          .describe("user-1", "doorbell")
+          .some((p) => p.connected),
+      "the runtime to have no server",
+    );
+
+    // Still the first ticket's place to come back to.
+    const back = await joinAs(host, first);
+    expect(
+      host.coordinator.participants
+        .describe("user-1", "doorbell")
+        .map((p) => p.connected),
+    ).toEqual([true]);
+    expect(waiting.readyState).toBe(WebSocket.OPEN);
+    back.terminate();
+    waiting.terminate();
+  });
+
+  it("takes back a failed deploy's tickets and lets the servers waiting with them go", async () => {
+    const host = await coordinatorHost();
+    const issue = async () =>
+      (await host.coordinator.issueTickets("user-1", "doorbell", ["node"])).node;
+    const first = await issue();
+    const holder = await joinAs(host, first);
+    await host.coordinator.registerBoard("user-1", board());
+    const second = await issue();
+    const waiting = await joinAs(host, second);
+    const letGo = new Promise<number>((resolve) =>
+      waiting.on("close", (code) => resolve(code)),
+    );
+
+    await request(host.url.replace("/coordinator", ""))
+      .delete("/coordinator/users/user-1/boards/doorbell/tickets")
+      .expect(204);
+
+    expect(await letGo).toBe(CLOSE_TICKET_REVOKED);
+    expect(host.coordinator.participants.resolve(second)).toBeNull();
+    expect(host.coordinator.participants.resolve(first)).toBeTruthy();
+    expect(holder.readyState).toBe(WebSocket.OPEN);
+    holder.terminate();
+  });
+
+  it("takes back every ticket of a board that was never registered", async () => {
+    // A first deploy that failed: nothing else holds these tickets together.
+    const host = await coordinatorHost();
+    const { node: ticket } = await host.coordinator.issueTickets(
+      "user-1",
+      "doorbell",
+      ["node"],
+    );
+
+    host.coordinator.cancelTickets("user-1", "doorbell");
+
+    expect(host.coordinator.participants.resolve(ticket)).toBeNull();
   });
 
   it("speaks for one runtime of one board of one person", async () => {
@@ -515,23 +640,47 @@ describe("deploying a running board again", () => {
       "b",
     ]);
     await introduceTo(first.server, "a", again.a);
+    // ...and gives up, as a person's client does when an introduction fails.
+    host.coordinator.cancelTickets("user-1", "doorbell");
 
-    // The server introduced again is the board's with its new ticket; the one
-    // that was not still holds a ticket that counts.
-    await eventually(
-      () => session.getStatus() === "running" && session.getErrors().length === 0,
-      "the board to be running as before",
-    );
+    // Nothing moved: each server holds the ticket it had, which still counts,
+    // and the tickets of the deploy that failed are no way in.
+    expect(host.coordinator.participants.resolve(tickets.a)).toBeTruthy();
+    expect(host.coordinator.participants.resolve(tickets.b)).toBeTruthy();
+    expect(host.coordinator.participants.resolve(again.a)).toBeNull();
+    expect(host.coordinator.participants.resolve(again.b)).toBeNull();
+    expect(session.getStatus()).toBe("running");
+    expect(session.getErrors()).toEqual([]);
     expect(
       host.coordinator.participants
         .describe("user-1", "doorbell")
         .map((p) => `${p.runtimeId} ${p.connected}`)
         .sort(),
     ).toEqual(["a true", "b true"]);
-    expect(host.coordinator.participants.resolve(tickets.b)).toBeTruthy();
     expect(boardRuntime(first.server, "a")).toBeTruthy();
     expect(boardRuntime(second.server, "b")).toBeTruthy();
     expect(host.coordinator.getBoard("user-1", "doorbell")).toBe(session);
+  });
+
+  it("does not move a runtime when the deploy that would have is given up", async () => {
+    const host = await coordinatorHost();
+    const laptop = await runtimeServer();
+    const studio = await runtimeServer();
+    const session = await deploy(host, "user-1", board(), {
+      node: laptop.server,
+    });
+    await introduce(host, "user-1", "doorbell", { node: studio.server });
+
+    host.coordinator.cancelTickets("user-1", "doorbell");
+
+    await eventually(
+      () => studio.server.coordinatorLinks.list(OWNER).length === 0,
+      "the server that was waiting to drop its link",
+    );
+    expect(laptop.server.coordinatorLinks.list(OWNER)).toMatchObject([
+      { runtimeId: "node", connected: true, running: true },
+    ]);
+    expect(session.getStatus()).toBe("running");
   });
 
   it("moves a runtime to another server only once the board is registered", async () => {

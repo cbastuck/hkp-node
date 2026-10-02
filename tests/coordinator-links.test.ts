@@ -137,6 +137,56 @@ describe("being introduced to a coordinator", () => {
     expect(JSON.stringify(body)).not.toContain(ticket);
   });
 
+  it("keeps the connection it has when it is introduced again for a runtime it already serves", async () => {
+    // Being introduced is the first step of a deploy that may yet fail.
+    const host = await coordinatorHost();
+    const { server } = await runtimeServer();
+    const introduction = (ticket: string) =>
+      request(server.httpServer).post("/coordinator-links").send({
+        coordinatorUrl: host.url,
+        ticket,
+        boardName: "doorbell",
+        runtimeId: "node",
+      });
+    const first = await ticketFor(host);
+    await introduction(first).expect(201);
+    const connection = host.coordinator.participants
+      .forBoard("user-1", "doorbell")
+      .get("node");
+
+    // Not even a ticket the coordinator would refuse costs it the link.
+    await introduction("hkpt_never-presented").expect(201);
+
+    expect(
+      host.coordinator.participants.forBoard("user-1", "doorbell").get("node"),
+    ).toBe(connection);
+    expect(server.coordinatorLinks.list(OWNER)).toMatchObject([
+      { runtimeId: "node", connected: true },
+    ]);
+  });
+
+  it("refuses to be another coordinator's for a runtime it already serves, naming the first", async () => {
+    const first = await coordinatorHost();
+    const second = await coordinatorHost();
+    const { server } = await runtimeServer();
+    const introduction = (host: CoordinatorHost, ticket: string) =>
+      request(server.httpServer).post("/coordinator-links").send({
+        coordinatorUrl: host.url,
+        ticket,
+        boardName: "doorbell",
+        runtimeId: "node",
+      });
+    await introduction(first, await ticketFor(first)).expect(201);
+
+    const refused = await introduction(second, await ticketFor(second)).expect(502);
+
+    expect(refused.body.error).toContain("already deployed here by");
+    expect(refused.body.error).toContain(first.url);
+    expect(server.coordinatorLinks.list(OWNER)).toMatchObject([
+      { coordinatorUrl: first.url, connected: true },
+    ]);
+  });
+
   it("says why when the coordinator does not accept the ticket, and keeps nothing", async () => {
     const host = await coordinatorHost();
     const { server } = await runtimeServer();

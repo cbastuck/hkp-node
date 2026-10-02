@@ -218,6 +218,40 @@ describe("a coordinator that has been restarted", () => {
   });
 });
 
+describe("a deployed board somebody opens", () => {
+  it("goes on answering at its address while it is open elsewhere, and after", async () => {
+    // What the playground does with a board: it builds the same runtimes
+    // under the same ids on the same server, and removes them on leaving.
+    // Their endpoints derive the address the deployed board's have.
+    const root = await freshRoot();
+    const { server } = await runtimeServer();
+    const host = await coordinatorOn(root);
+    await deploy(host, "user-1", boardConfig(), { node: server });
+    const address = await publishedMount(server);
+    const config = boardConfig();
+    const copy = {
+      ...config.runtimes[0],
+      boardName: config.boardName,
+      services: config.services.node,
+    };
+
+    const opened = await request(server.httpServer)
+      .post("/runtimes")
+      .send(copy)
+      .expect(200);
+    const state = await request(server.httpServer)
+      .get("/runtimes/node/services/http-1")
+      .expect(200);
+    expect(opened.body.runtimes).toHaveLength(1);
+    expect(state.body.__hkpMount).toBe(address);
+    expect((await fetch(address)).status).toBe(200);
+
+    await request(server.httpServer).delete("/runtimes/node").expect(200);
+
+    expect((await fetch(address)).status).toBe(200);
+  });
+});
+
 describe("a runtime server that has been restarted", () => {
   it("reconnects with the ticket it kept and is given its runtime again", async () => {
     const root = await freshRoot();
