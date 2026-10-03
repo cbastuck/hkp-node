@@ -50,9 +50,14 @@
  * Byte answers are seekable: `Range` is honoured against the bytes the handler
  * produced, because a player dragging a scrubber asks for one and a server that
  * ignores it re-sends the whole file each time.
+ *
+ * **A stream is the one answer that keeps coming** (see `./stream`). With
+ * `stream: { path, … }` declared, a GET on that path is a listener to keep, and
+ * what every pass produces is written to all of them. What a pass is — the
+ * previous service's output, a message a `websocket-reader` received, the
+ * result of the runtime before — is the board's business, not the endpoint's.
  */
 import { IncomingMessage, ServerResponse } from "node:http";
-import { randomUUID } from "node:crypto";
 
 import { newRun } from "../runtime";
 import { MountContext, MountHandle } from "../mounts";
@@ -68,6 +73,17 @@ import {
   SlotStore,
 } from "../types";
 import { NestedPipeline } from "./nested-pipeline";
+import {
+  StreamBroadcast,
+  StreamConfig,
+  StreamListener,
+  answerRangeProbe,
+  boundedRange,
+  parseStreamConfig,
+  sameStream,
+  streamBytes,
+  streamState,
+} from "./stream";
 
 export const httpServerSubservicesDescriptor: ServiceRegistryEntry = {
   serviceId: "http-server-subservices",
@@ -89,7 +105,9 @@ export const httpServerSubservicesDescriptor: ServiceRegistryEntry = {
  *   was given.
  */
 type HttpServerMode =
-  "process_on_session" | "process_on_data" | "process_on_both";
+  | "process_on_session"
+  | "process_on_data"
+  | "process_on_both";
 
 /**
  * The two ways into this service, named.
@@ -305,7 +323,9 @@ function toAnswer(value: unknown): Answer {
     return {
       status,
       headers,
-      payload: new Uint8Array(Buffer.from(JSON.stringify(body ?? null), "utf8")),
+      payload: new Uint8Array(
+        Buffer.from(JSON.stringify(body ?? null), "utf8"),
+      ),
     };
   }
 
@@ -446,6 +466,11 @@ export class HttpServerSubservicesService implements HostedService {
   private readonly createService: ServiceCreator;
   private host: RuntimeHost | null = null;
 
+  private stream: StreamConfig | null = null;
+  private readonly broadcast = new StreamBroadcast((listeners) =>
+    this.notify({ listeners }, this.uuid),
+  );
+
   constructor(
     config: ServiceConfiguration,
     createService: ServiceCreator,
@@ -485,6 +510,21 @@ export class HttpServerSubservicesService implements HostedService {
       if (renamed && this.mount) {
         this.releaseMount();
       }
+    }
+
+    // A different stream, or `null` / anything that names no path, ends the
+    // one there was: its listeners were answered under the old path and
+    // content type, and what it kept for late joiners and probes belongs to
+    // it. The same declaration again — a board re-sending its state — changes
+    // nothing.
+    if (config.stream !== undefined) {
+      const declared = parseStreamConfig(config.stream);
+      if (this.stream && !sameStream(this.stream, declared)) {
+        this.endStream();
+      }
+      this.stream = declared;
+      this.broadcast.setBurstBytes(declared?.burstBytes ?? 0);
+      this.notify(this.streamAnnouncement(), this.uuid);
     }
 
     if (
@@ -619,12 +659,17 @@ export class HttpServerSubservicesService implements HostedService {
   }
 
   getState(): JsonRecord {
-    const common = {
+    const common: JsonRecord = {
       bypass: this.bypass,
       mountName: this.mountName,
       __hkpMount: this.mount?.url ?? "",
       forwardHeaders: this.forwardHeaders,
     };
+    if (this.stream) {
+      common.stream = streamState(this.stream);
+      Object.assign(common, this.streamAnnouncement());
+      common.listenerDetails = this.broadcast.details();
+    }
 
     // What was declared, not what it was understood as. A board that named its
     // entries gets them back; one that carries a `mode` keeps it, because that
@@ -641,11 +686,15 @@ export class HttpServerSubservicesService implements HostedService {
     }
 
     const state: HttpServerSubservicesState = {
-      ...common,
+      ...(common as Pick<
+        HttpServerSubservicesState,
+        "bypass" | "mountName" | "__hkpMount" | "forwardHeaders"
+      >),
       mode: this.mode,
       pipeline: this.legacy?.state() ?? [],
     };
-    return state;
+    // The stream fields ride along when declared; see getState's top.
+    return { ...common, ...state };
   }
 
   /** Passes the scope on to the nested pipelines; see SubService.setScope. */
@@ -721,13 +770,60 @@ export class HttpServerSubservicesService implements HostedService {
 
     const entry = this.bypass ? null : this.entryFor("onProcess");
     if (!entry) {
+      this.publish(input);
       return input;
     }
     // Routing only: what the pass's own pipeline returns carries on down the
     // chain. Whatever has to survive until a request arrives — a value this
     // side produces and the other reads — belongs in a slot, which is a
-    // service's job and not this one's.
-    return this.runEntry(entry, input);
+    // service's job and not this one's. It is also what the stream carries.
+    return this.runEntry(entry, input).then((output) => {
+      this.publish(output);
+      return output;
+    });
+  }
+
+  /** What a pass produced, to whoever is listening, where it is bytes. */
+  private publish(value: unknown): void {
+    if (!this.stream || this.bypass) {
+      return;
+    }
+    const bytes = streamBytes(value);
+    if (bytes) {
+      this.broadcast.publish(bytes);
+    }
+  }
+
+  /** Where a player connects, and how many have: what changes as it runs. */
+  private streamAnnouncement(): JsonRecord {
+    return {
+      streamUrl:
+        this.stream && this.mount ? `${this.mount.url}${this.stream.path}` : "",
+      listeners: this.broadcast.count,
+    };
+  }
+
+  private endStream(): void {
+    this.broadcast.closeAll();
+  }
+
+  /** A GET on the stream path: a listener to keep, or a probe to answer. */
+  private handleListener(req: IncomingMessage, res: ServerResponse): void {
+    const stream = this.stream!;
+    const range = boundedRange(header(req, "range"));
+    if (range && this.broadcast.last) {
+      answerRangeProbe(res, stream.contentType, range, this.broadcast.last);
+      return;
+    }
+    const listener: StreamListener = new StreamListener(
+      req,
+      res,
+      stream.contentType,
+      stream.maxQueueBytes,
+      stream.stallTimeoutMs,
+      (closed) => this.broadcast.leave(closed),
+    );
+    this.broadcast.join(listener);
   }
 
   destroy(): void {
@@ -761,6 +857,14 @@ export class HttpServerSubservicesService implements HostedService {
       this.uuid,
       {
         request: (req, res, context) => {
+          if (
+            this.isStreamPath(context) &&
+            req.method === "GET" &&
+            !this.bypass
+          ) {
+            this.handleListener(req, res);
+            return;
+          }
           void this.handleRequest(req, res, context);
         },
       },
@@ -769,12 +873,31 @@ export class HttpServerSubservicesService implements HostedService {
 
     // A board reads the assigned endpoint from here (or from state), since it
     // is not knowable at design time.
-    this.notify({ __hkpMount: this.mount?.url ?? "" }, this.uuid);
+    this.notify(
+      {
+        __hkpMount: this.mount?.url ?? "",
+        ...(this.stream ? this.streamAnnouncement() : {}),
+      },
+      this.uuid,
+    );
+  }
+
+  private isStreamPath(context: MountContext): boolean {
+    if (!this.stream) {
+      return false;
+    }
+    return (
+      new URL(context.subPath, "http://localhost").pathname === this.stream.path
+    );
   }
 
   private releaseMount(): void {
     this.mount?.release();
     this.mount = null;
+    this.endStream();
+    if (this.stream) {
+      this.notify({ __hkpMount: "", ...this.streamAnnouncement() }, this.uuid);
+    }
   }
 
   /**
@@ -964,7 +1087,12 @@ export class HttpServerSubservicesService implements HostedService {
     if (this.host) {
       // No-op: the runtime already fans these out to its notification targets.
       // Re-notifying through the host would deliver every one twice.
-      output = await this.host.processFrom(this.uuid, output, () => {}, runContext);
+      output = await this.host.processFrom(
+        this.uuid,
+        output,
+        () => {},
+        runContext,
+      );
       this.host.emitResult(output);
     }
 
@@ -1037,4 +1165,3 @@ export class HttpServerSubservicesService implements HostedService {
 function isJsonRecord(value: unknown): value is JsonRecord {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
-
