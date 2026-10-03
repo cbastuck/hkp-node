@@ -101,6 +101,12 @@ async function main() {
       maxRequestBodyBytes: process.env.HKP_MAX_REQUEST_BODY_BYTES
         ? readInteger(process.env.HKP_MAX_REQUEST_BODY_BYTES, 0)
         : undefined,
+      // Unset or 0 keeps the server's own default.
+      maxInlineAssetBytes: readInteger(process.env.HKP_MAX_INLINE_ASSET_BYTES, 0),
+      maxAssetRequestBodyBytes: readInteger(
+        process.env.HKP_MAX_ASSET_REQUEST_BODY_BYTES,
+        0,
+      ),
     },
   });
 

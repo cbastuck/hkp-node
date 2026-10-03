@@ -18,7 +18,7 @@ import {
   ServiceStates,
   isBridgeMessage,
 } from "./bridgeProtocol";
-import { AssetDescriptor, referencedAssets } from "../assets";
+import { AssetDescriptor } from "../assets";
 
 type ProvisionedRuntime = {
   descriptor: CloudRuntimeDescriptor;
@@ -406,15 +406,22 @@ export class BoardSession {
 
   // ── Private ───────────────────────────────────────────────────────────────
 
-  private assetsReferencedBy(
-    services: CloudBoardConfig["services"][string],
-  ): Record<string, AssetDescriptor> {
-    const wanted = new Set(
-      referencedAssets(services.map((svc) => svc.state ?? {})),
-    );
+  /**
+   * The assets a runtime is given: every one the board declares, unless an
+   * asset names the runtimes it is for. Not only the ones its services name —
+   * which asset a service uses can be decided as it runs, by its input or by a
+   * request, and a reference that reaches a runtime has to resolve there.
+   *
+   * None for a runtime a unit contributed: it resolves against that unit's
+   * assets, which are not the board's.
+   */
+  private assetsFor(runtime: CloudRuntimeDescriptor): Record<string, AssetDescriptor> {
     const assets: Record<string, AssetDescriptor> = {};
+    if (runtime.unit) {
+      return assets;
+    }
     for (const descriptor of this.config.assets ?? []) {
-      if (wanted.has(descriptor.id)) {
+      if (!descriptor.runtimes || descriptor.runtimes.includes(runtime.id)) {
         assets[descriptor.id] = descriptor;
       }
     }
@@ -463,11 +470,10 @@ export class BoardSession {
           serviceName: svc.serviceName ?? svc.name ?? svc.serviceId,
           state: svc.state ?? {},
         })),
-        // The descriptors this runtime's services reference, and no others:
-        // inline assets can be large, and a runtime holds none it has no use
-        // for. Host-local content cannot travel this way — a `file://` source
-        // is read by the runtime, inside its own volumes.
-        assets: this.assetsReferencedBy(services),
+        // Every asset this runtime is given, named by a service or not.
+        // Host-local content cannot travel this way — a `file://` source is
+        // read by the runtime, inside its own volumes.
+        assets: this.assetsFor(runtime),
       };
 
       const response = await fetch(`${baseUrl}/runtimes`, {
@@ -769,29 +775,6 @@ export class BoardSession {
     const path = `/runtimes/${encodeURIComponent(runtime.id)}/services/${encodeURIComponent(message.serviceUuid)}`;
 
     try {
-      // A configuration may name an asset the runtime was not provisioned
-      // with; it gets the descriptor first, as it would from a browser.
-      const assets = this.assetsReferencedBy([
-        {
-          uuid: message.serviceUuid,
-          serviceId: "",
-          state: (message.config ?? {}) as Record<string, unknown>,
-        },
-      ]);
-      if (Object.keys(assets).length) {
-        await fetch(
-          `${runtime.url}/runtimes/${encodeURIComponent(runtime.id)}/assets`,
-          {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              ...this.bearer(this.sessionTokens.get(runtime.id)),
-            },
-            body: JSON.stringify(assets),
-          },
-        );
-      }
-
       const res = await fetch(`${runtime.url}${path}`, {
         method: "POST",
         headers: {

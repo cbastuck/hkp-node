@@ -20,7 +20,7 @@ import {
 } from "./types";
 import { ADDRESS_SEPARATOR, descend, splitAddress } from "./address";
 import { SecretVault } from "./secrets";
-import { AssetDescriptor, AssetStore } from "./assets";
+import { AssetDescriptor, AssetStore, AssetStoreOptions } from "./assets";
 import { ANONYMOUS_SUB } from "./auth";
 import { MountHandle, MountHandlers } from "./mounts";
 
@@ -191,6 +191,7 @@ export class HostedRuntime implements RuntimeHost {
     // an unauthenticated server already uses.
     owner: string = ANONYMOUS_SUB,
     readAssetFile?: AssetFileReader,
+    assetLimits?: AssetStoreOptions,
   ) {
     this.id = config.id;
     this.name = config.name;
@@ -218,7 +219,7 @@ export class HostedRuntime implements RuntimeHost {
           ? (url) => readAssetFile(this.scope(), url)
           : undefined,
       },
-      () => this.secrets(),
+      assetLimits,
     );
     if (config.assets) {
       this.assetStore.replace(config.assets);
@@ -920,6 +921,8 @@ export class RuntimeApp {
     // Supplied by the server, which owns the file store. Absent: no runtime
     // resolves a `file://` asset.
     private readonly readAssetFile?: AssetFileReader,
+    // What an asset may weigh, which the server also sizes its requests by.
+    private readonly assetLimits?: AssetStoreOptions,
   ) {}
 
   /** A tenant-scoped view; the only way route handlers reach runtimes. */
@@ -938,6 +941,7 @@ export class RuntimeApp {
       this.mountsFor?.(owner, config.id),
       owner,
       this.readAssetFile,
+      this.assetLimits,
     );
     owned.set(runtime.id, runtime);
     return runtime;

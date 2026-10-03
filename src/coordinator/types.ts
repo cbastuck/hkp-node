@@ -27,6 +27,13 @@ export type CloudRuntimeDescriptor = {
   type: CloudRuntimeType;
   url?: string;
   state?: Record<string, unknown>;
+  /**
+   * Set on a runtime a unit contributed: the unit's name, and the id the
+   * runtime has in that unit. Such a runtime resolves against the unit's own
+   * assets, not the board's.
+   */
+  unit?: string;
+  unitRuntimeId?: string;
 };
 
 export type CloudServiceDescriptor = {
@@ -43,8 +50,9 @@ export type CloudBoardConfig = {
   services: Record<string, CloudServiceDescriptor[]>;
   facade?: unknown;
   /**
-   * The board's asset descriptors. Each provisioned runtime is sent the ones
-   * its services reference, the way a browser provisioning the board does.
+   * The board's asset descriptors. Each provisioned runtime of the board's own
+   * is sent all of them, less the ones kept to other runtimes, the way a
+   * browser provisioning the board does.
    */
   assets?: AssetDescriptor[];
 };

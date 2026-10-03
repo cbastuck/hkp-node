@@ -117,7 +117,11 @@ import {
   ServiceConfiguration,
 } from "./types";
 import { readSecretsPayload } from "./secrets";
-import { AssetDescriptor, readAssetsPayload } from "./assets";
+import {
+  AssetDescriptor,
+  DEFAULT_MAX_INLINE_ASSET_BYTES,
+  readAssetsPayload,
+} from "./assets";
 
 /**
  * Per-tenant limits. Runtimes, services and timers all consume resources on a
@@ -131,6 +135,20 @@ export type Quotas = {
   minTimerIntervalMs?: number;
   /** Largest accepted request body on a public service endpoint; 0 disables. */
   maxRequestBodyBytes?: number;
+  /**
+   * Largest content an asset descriptor may carry itself (`text`, `base64`).
+   * Unset keeps the default. Content past it is named by URL, which a runtime
+   * fetches for itself.
+   */
+  maxInlineAssetBytes?: number;
+  /**
+   * Largest body of a request that carries asset descriptors: creating a
+   * runtime, pushing assets to one, deploying a board. In effect how much
+   * inline content one runtime — or one deployed board — may be handed at
+   * once, counted as it travels: base64 for bytes, JSON-escaped for text.
+   * Unset keeps the default.
+   */
+  maxAssetRequestBodyBytes?: number;
 };
 
 /**
@@ -140,6 +158,45 @@ export type Quotas = {
  * dangerous choice the automatic one.
  */
 const DEFAULT_MAX_REQUEST_BODY_BYTES = 25 * 1024 * 1024;
+
+/**
+ * What a request carrying asset descriptors may weigh when nothing says
+ * otherwise. A quota of its own rather than a multiple of the inline limit: a
+ * runtime's create payload carries every asset its services reference and a
+ * deployed board carries all of its own, so this is what bounds how much
+ * inline content a board may hold, however many assets it is spread over.
+ */
+const DEFAULT_MAX_ASSET_REQUEST_BODY_BYTES = 32 * 1024 * 1024;
+
+/**
+ * The largest body a request carrying asset descriptors may have, in bytes.
+ * What was configured, as it stands. Left to the default it is never less
+ * than one asset at the inline limit takes to travel — base64, four
+ * characters for three bytes, and room for the rest of the request — so that
+ * raising the inline limit alone does not leave it out of reach.
+ */
+function assetRequestBodyLimit(quotas: Quotas, maxInlineAssetBytes: number): number {
+  if (quotas.maxAssetRequestBodyBytes && quotas.maxAssetRequestBodyBytes > 0) {
+    return quotas.maxAssetRequestBodyBytes;
+  }
+  return Math.max(
+    DEFAULT_MAX_ASSET_REQUEST_BODY_BYTES,
+    Math.ceil((maxInlineAssetBytes * 4) / 3) + 1024 * 1024,
+  );
+}
+
+/**
+ * Whether a request is one that carries asset descriptors: provisioning a
+ * runtime, pushing to one, and deploying a board to a coordinator.
+ */
+function carriesAssets(req: Request): boolean {
+  return (
+    req.method === "POST" &&
+    (req.path === "/runtimes" ||
+      /^\/runtimes\/[^/]+\/assets$/.test(req.path) ||
+      /^\/coordinator\/users\/[^/]+\/boards$/.test(req.path))
+  );
+}
 
 /**
  * Which runtime server this is, reported beside the runtimes so a client can
@@ -274,6 +331,10 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
   const externalHost = options.externalHost ?? options.host ?? "127.0.0.1";
   const externalSecure = options.externalSecure ?? false;
   const quotas = options.quotas ?? {};
+  const maxInlineAssetBytes =
+    quotas.maxInlineAssetBytes && quotas.maxInlineAssetBytes > 0
+      ? quotas.maxInlineAssetBytes
+      : DEFAULT_MAX_INLINE_ASSET_BYTES;
   // Databases follow records below: one store for the whole server, scoped per
   // call, and an empty path saying "keep nothing on disk" rather than naming
   // the working directory as a root.
@@ -569,6 +630,7 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
       const found = await files.read({ ...scope, volume }, checked.path);
       return found?.bytes ?? null;
     },
+    { maxInlineBytes: maxInlineAssetBytes },
   );
   const expressApp = express();
   expressApp.use(
@@ -585,8 +647,24 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
   // 400. The process routes tell the two apart themselves: no body at all is
   // `undefined` and refused, `null` runs the pipeline with nothing on its
   // input. Every other route already checks the shape it needs.
-  expressApp.use(express.json({ strict: false }));
+  //
+  // Requests that carry asset descriptors are larger than any other control
+  // request, by design: inline content travels in them. They get a limit of
+  // their own, derived from the largest inline asset a runtime takes — and
+  // only once the caller is known, so that the larger body is not something
+  // anyone can make this server read.
+  const controlBody = express.json({ strict: false });
+  const assetBody = express.json({
+    strict: false,
+    limit: assetRequestBodyLimit(quotas, maxInlineAssetBytes),
+  });
+  expressApp.use((req, res, next) =>
+    carriesAssets(req) ? next() : controlBody(req, res, next),
+  );
   expressApp.use(authenticator.middleware);
+  expressApp.use((req, res, next) =>
+    carriesAssets(req) ? assetBody(req, res, next) : next(),
+  );
 
   // Mounts are matched before Express so they bypass CORS and the auth
   // middleware entirely: they exist to be called by outside parties (webhooks,
@@ -1163,9 +1241,20 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
   );
 
   expressApp.use(
-    (err: Error, _req: Request, res: Response, _next: NextFunction) => {
+    (err: Error, req: Request, res: Response, _next: NextFunction) => {
       if (err instanceof SyntaxError) {
         res.sendStatus(400);
+        return;
+      }
+      // Said in words: the caller is a board editor, and "too large" is
+      // something its author can act on.
+      if ((err as { type?: string }).type === "entity.too.large") {
+        const limit = (err as { limit?: number }).limit;
+        res.status(413).json({
+          error: carriesAssets(req)
+            ? `Request body is larger than ${limit} bytes, which is what the assets sent at once may weigh here. Name larger content by url.`
+            : `Request body is larger than ${limit} bytes`,
+        });
         return;
       }
       // Don't leak internal error details (paths, stack hints) to clients.

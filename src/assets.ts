@@ -7,27 +7,35 @@
  * the content itself. `getState` therefore echoes the reference, and saving a
  * board writes back what was configured: there is no round trip to undo.
  *
- * The descriptors arrive the way secrets do — with the runtime's create
- * payload, or on `POST /runtimes/:id/assets` — plus again whenever an asset is
- * edited, which is the point: a service resolves its reference at the moment it
- * uses it, so the next use gets the new content without anything being
- * reconfigured.
+ * The descriptors arrive with the runtime's create payload, or on
+ * `POST /runtimes/:id/assets` — and again whenever an asset is edited, which is
+ * the point: a service resolves its reference at the moment it uses it, so the
+ * next use gets the new content without anything being reconfigured. A runtime
+ * is given every asset of its board that is not kept to other runtimes, named
+ * by its services or not: which one a service uses can be decided as it runs.
  *
  * Where the content comes from depends on the source:
  *
- *   `text`, `base64`   already in the descriptor
- *   `http(s)://`       fetched by this runtime, cached by `sha256` or ETag
+ *   `text`, `base64`   already in the descriptor, up to the inline limit: a
+ *                      descriptor travels in the requests that configure a
+ *                      runtime, so content past that size is named by URL
+ *   `http(s)://`       fetched by this runtime as anyone would fetch it,
+ *                      cached by `sha256` or ETag
  *   `file://`          read only through the host's file store, which keeps it
  *                      inside the tenant's volumes; refused where there is none
  *
  * Anything else is refused by name rather than guessed at.
+ *
+ * An asset carries no request headers and names no secret. It is resolved
+ * without anyone looking, by every runtime holding it, which is no place for a
+ * credential; content that needs one is fetched by a service that says where
+ * it sends it.
  *
  * The format matches `hkp-frontend/src/runtime/board/assets.ts`: a board
  * written against one runtime has to open against another.
  */
 import { createHash } from "node:crypto";
 
-import { SecretVault, resolveCredential } from "./secrets";
 
 export const ASSET_SCHEME = "hkp-asset://";
 
@@ -36,10 +44,7 @@ const ID = "[A-Za-z0-9_.-]+";
 const WHOLE_REFERENCE = new RegExp(`^${escape(ASSET_SCHEME)}(${ID})$`);
 const ANY_REFERENCE = new RegExp(`${escape(ASSET_SCHEME)}(${ID})`, "g");
 
-export type AssetSource =
-  | { text: string }
-  | { base64: string }
-  | { url: string; headers?: Record<string, string> };
+export type AssetSource = { text: string } | { base64: string } | { url: string };
 
 export type AssetDescriptor = {
   id: string;
@@ -48,6 +53,12 @@ export type AssetDescriptor = {
   /** Identity of the version: cache key and integrity check. */
   sha256?: string;
   size?: number;
+  /**
+   * The runtimes that are given this asset, by their id in the board declaring
+   * it. Absent: every one. Read by whoever provisions a board's runtimes; a
+   * runtime holding the descriptor has no use for it.
+   */
+  runtimes?: string[];
 } & AssetSource;
 
 /** An asset's content, for one use. */
@@ -77,6 +88,13 @@ export type AssetSources = {
 export type AssetStoreOptions = {
   /** Upper bound on one asset's content, in bytes. */
   maxBytes?: number;
+  /**
+   * Upper bound on content a descriptor carries itself (`text`, `base64`), in
+   * bytes. Smaller than `maxBytes`, which is what a runtime will fetch or
+   * read: inline content rides in control requests, whose size the server
+   * derives from this.
+   */
+  maxInlineBytes?: number;
   /** Upper bound on everything held in the cache, in bytes. */
   maxCacheBytes?: number;
   /** How long a URL source may take to answer. */
@@ -84,6 +102,7 @@ export type AssetStoreOptions = {
 };
 
 const DEFAULT_MAX_BYTES = 64 * 1024 * 1024;
+export const DEFAULT_MAX_INLINE_ASSET_BYTES = 8 * 1024 * 1024;
 const DEFAULT_MAX_CACHE_BYTES = 128 * 1024 * 1024;
 const DEFAULT_TIMEOUT_MS = 30_000;
 
@@ -105,7 +124,6 @@ export class AssetStore {
 
   constructor(
     private readonly sources: AssetSources = {},
-    private readonly secrets: () => SecretVault | null = () => null,
     private readonly options: AssetStoreOptions = {},
   ) {}
 
@@ -221,10 +239,11 @@ export class AssetStore {
     cached: CacheEntry | undefined,
   ): Promise<{ bytes: Uint8Array; etag?: string } | { problem: string }> {
     if ("text" in descriptor) {
-      return { bytes: new Uint8Array(Buffer.from(descriptor.text, "utf8")) };
+      return this.inline(new Uint8Array(Buffer.from(descriptor.text, "utf8")));
     }
     if ("base64" in descriptor) {
-      return { bytes: new Uint8Array(Buffer.from(descriptor.base64, "base64")) };
+      const bytes = decodeBase64(descriptor.base64);
+      return bytes ? this.inline(bytes) : { problem: "its content is not base64" };
     }
 
     let url: URL;
@@ -237,7 +256,7 @@ export class AssetStore {
     switch (url.protocol) {
       case "http:":
       case "https:":
-        return this.fetchUrl(descriptor, url, cached);
+        return this.fetchUrl(url, cached);
       case "file:": {
         if (!this.sources.readFile) {
           return { problem: "file:// sources cannot be read by this runtime" };
@@ -250,23 +269,24 @@ export class AssetStore {
     }
   }
 
+  /** Inline content, or why it is not taken: it is past what a descriptor may carry. */
+  private inline(bytes: Uint8Array): { bytes: Uint8Array } | { problem: string } {
+    const limit = Math.min(
+      this.options.maxInlineBytes ?? DEFAULT_MAX_INLINE_ASSET_BYTES,
+      this.maxBytes(),
+    );
+    return bytes.length > limit
+      ? { problem: `inline content is larger than ${limit} bytes; host it and name it by url` }
+      : { bytes };
+  }
+
   private async fetchUrl(
-    descriptor: AssetDescriptor & { url: string; headers?: Record<string, string> },
     url: URL,
     cached: CacheEntry | undefined,
   ): Promise<{ bytes: Uint8Array; etag?: string } | { problem: string }> {
-    const { value: headers, problem } = resolveCredential(
-      this.secrets(),
-      descriptor.headers ?? {},
-      url.href,
-    );
-    if (problem) {
-      return { problem };
-    }
-    const request: Record<string, string> = { ...headers };
-    if (cached?.etag) {
-      request["if-none-match"] = cached.etag;
-    }
+    const headers: Record<string, string> = cached?.etag
+      ? { "if-none-match": cached.etag }
+      : {};
 
     const controller = new AbortController();
     const timer = setTimeout(
@@ -275,7 +295,7 @@ export class AssetStore {
     );
     try {
       const response = await (this.sources.fetch ?? fetch)(url.href, {
-        headers: request,
+        headers,
         signal: controller.signal,
       });
       if (response.status === 304 && cached) {
@@ -368,6 +388,26 @@ export class AssetStore {
  */
 function needsRevalidation(descriptor: AssetDescriptor, _cached: CacheEntry): boolean {
   return "url" in descriptor && !descriptor.sha256;
+}
+
+/**
+ * The bytes base64 text stands for, or null when it is not base64.
+ *
+ * `Buffer.from(…, "base64")` skips what it does not recognise and decodes the
+ * rest, so text that is not base64 would come out as some other bytes. What is
+ * taken here is what a browser's `atob` takes — ASCII whitespace ignored, the
+ * standard alphabet, padding optional — so that a descriptor resolves to the
+ * same content, or the same refusal, on every runtime.
+ */
+export function decodeBase64(value: string): Uint8Array | null {
+  let text = value.replace(/[\t\n\f\r ]+/g, "");
+  if (text.length % 4 === 0) {
+    text = text.replace(/={1,2}$/, "");
+  }
+  if (text.length % 4 === 1 || !/^[A-Za-z0-9+/]*$/.test(text)) {
+    return null;
+  }
+  return new Uint8Array(Buffer.from(text, "base64"));
 }
 
 async function readLimited(response: Response, limit: number): Promise<Uint8Array | null> {
@@ -484,17 +524,11 @@ export function readAssetDescriptor(value: unknown, fallbackId?: string): AssetD
   if (typeof record.size === "number" && Number.isFinite(record.size)) {
     descriptor.size = record.size;
   }
+  if (Array.isArray(record.runtimes)) {
+    descriptor.runtimes = record.runtimes.filter((id) => typeof id === "string");
+  }
   const source = sources[0];
   descriptor[source] = record[source];
-  if (source === "url" && record.headers && typeof record.headers === "object" && !Array.isArray(record.headers)) {
-    const headers: Record<string, string> = {};
-    for (const [name, header] of Object.entries(record.headers as Record<string, unknown>)) {
-      if (typeof header === "string") {
-        headers[name] = header;
-      }
-    }
-    descriptor.headers = headers;
-  }
   return descriptor as AssetDescriptor;
 }
 

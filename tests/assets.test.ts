@@ -7,12 +7,12 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import {
   AssetStore,
+  decodeBase64,
   parseAssetRef,
   readAssetsPayload,
   referencedAssets,
 } from "../src/assets";
 import { HostedRuntime } from "../src/runtime";
-import { SecretVault } from "../src/secrets";
 import { createRuntimeServer } from "../src/server";
 import { createMemoryFileStore } from "../src/services/fileStore";
 import { httpServerSubservicesDescriptor } from "../src/services/http-server";
@@ -63,6 +63,23 @@ describe("the payload", () => {
     expect(Object.keys(entries).sort()).toEqual(["gone", "page"]);
     expect(entries.page).toEqual({ id: "page", mediaType: "text/html", text: "<p>hi</p>" });
     expect(entries.gone).toBeNull();
+  });
+
+  it("keeps which runtimes an asset is for, and no headers", () => {
+    const entries = readAssetsPayload({
+      model: {
+        mediaType: "application/octet-stream",
+        url: "https://example.com/m.bin",
+        runtimes: ["node", 7],
+        headers: { authorization: "Bearer {{secret.token}}" },
+      },
+    });
+    expect(entries.model).toEqual({
+      id: "model",
+      mediaType: "application/octet-stream",
+      url: "https://example.com/m.bin",
+      runtimes: ["node"],
+    });
   });
 
   it("reads a list as readily as a map", () => {
@@ -129,9 +146,48 @@ describe("the store", () => {
   });
 
   it("refuses content larger than it may hold", async () => {
-    const store = new AssetStore({}, () => null, { maxBytes: 4 });
+    const store = new AssetStore({}, { maxBytes: 4 });
     store.replace({ big: { id: "big", mediaType: "text/plain", text: "too large" } });
     expect((await store.resolve("hkp-asset://big")).problem).toMatch(/larger than 4 bytes/);
+  });
+
+  it("refuses base64 that is not, rather than decoding what it recognises", async () => {
+    const store = new AssetStore();
+    store.replace({ logo: { id: "logo", mediaType: "image/png", base64: "not base64!" } });
+    expect((await store.resolve("hkp-asset://logo")).problem).toBe(
+      'asset "logo": its content is not base64',
+    );
+  });
+
+  it("reads base64 as a browser does: wrapped, padded or not", () => {
+    expect([...decodeBase64("AQID")!]).toEqual([1, 2, 3]);
+    expect([...decodeBase64("AQ ID\nBA==\n")!]).toEqual([1, 2, 3, 4]);
+    expect([...decodeBase64("AQIDBA")!]).toEqual([1, 2, 3, 4]);
+    expect([...decodeBase64("")!]).toEqual([]);
+    // One character over a group of four stands for no byte at all.
+    expect(decodeBase64("AQIDB")).toBeNull();
+    expect(decodeBase64("AQ=ID")).toBeNull();
+    expect(decodeBase64("AQID-_")).toBeNull();
+  });
+
+  it("refuses inline content past what a descriptor may carry, and not a URL's", async () => {
+    const store = new AssetStore(
+      { fetch: (async () => new Response("fetched content")) as unknown as typeof fetch },
+      { maxInlineBytes: 4 },
+    );
+    store.replace({
+      inline: { id: "inline", mediaType: "text/plain", text: "too large" },
+      packed: { id: "packed", mediaType: "image/png", base64: Buffer.from("too large").toString("base64") },
+      small: { id: "small", mediaType: "text/plain", text: "fits" },
+      remote: { id: "remote", mediaType: "text/plain", url: "https://example.com/a.txt" },
+    });
+
+    expect((await store.resolve("hkp-asset://inline")).problem).toMatch(
+      /inline content is larger than 4 bytes; host it and name it by url/,
+    );
+    expect((await store.resolve("hkp-asset://packed")).problem).toMatch(/larger than 4 bytes/);
+    expect(text((await store.resolve("hkp-asset://small")).asset?.bytes)).toBe("fits");
+    expect(text((await store.resolve("hkp-asset://remote")).asset?.bytes)).toBe("fetched content");
   });
 
   describe("with a URL source", () => {
@@ -143,6 +199,12 @@ describe("the store", () => {
     beforeAll(async () => {
       server = http.createServer((req, res) => {
         requests.push(req.headers);
+        if (req.url === "/moved") {
+          res.statusCode = 302;
+          res.setHeader("location", "/a.txt");
+          res.end();
+          return;
+        }
         const etag = `"${sha256(body)}"`;
         if (req.headers["if-none-match"] === etag) {
           res.statusCode = 304;
@@ -177,6 +239,14 @@ describe("the store", () => {
       expect(text((await store.resolve("hkp-asset://remote")).asset?.bytes)).toBe("remote v2");
     });
 
+    it("follows a redirect to where the content is", async () => {
+      const store = new AssetStore();
+      store.replace({ remote: { id: "remote", mediaType: "text/plain", url: `${base}/moved` } });
+
+      expect(text((await store.resolve("hkp-asset://remote")).asset?.bytes)).toBe("remote v1");
+      expect(requests).toHaveLength(2);
+    });
+
     it("does not ask again for content pinned by its hash", async () => {
       const store = new AssetStore();
       store.replace({
@@ -187,23 +257,21 @@ describe("the store", () => {
       expect(requests).toHaveLength(1);
     });
 
-    it("sends a header's secret only where its audience allows", async () => {
-      const vault = new SecretVault();
-      vault.replace({ token: { value: "s3cret", audience: ["127.0.0.1"] } });
-      const store = new AssetStore({}, () => vault);
-      store.replace({
-        remote: {
-          id: "remote",
-          mediaType: "text/plain",
-          url: `${base}/a.txt`,
-          headers: { authorization: "Bearer {{secret.token}}" },
-        },
-      });
-      await store.resolve("hkp-asset://remote");
-      expect(requests[0].authorization).toBe("Bearer s3cret");
+    it("is fetched as anyone would fetch it: no headers of the board's, no credentials", async () => {
+      const store = new AssetStore();
+      store.replace(
+        readAssetsPayload({
+          remote: {
+            mediaType: "text/plain",
+            url: `${base}/a.txt`,
+            headers: { authorization: "Bearer {{secret.token}}", "x-api-key": "literal" },
+          },
+        }) as Record<string, never>,
+      );
 
-      vault.replace({ token: { value: "s3cret", audience: ["elsewhere.example"] } });
-      expect((await store.resolve("hkp-asset://remote")).problem).toMatch(/may not be sent/);
+      expect(text((await store.resolve("hkp-asset://remote")).asset?.bytes)).toBe("remote v1");
+      expect(requests[0].authorization).toBeUndefined();
+      expect(requests[0]["x-api-key"]).toBeUndefined();
     });
   });
 });
@@ -413,6 +481,141 @@ describe("over the wire", () => {
     expect((await check("escape")).body.ok).toBe(false);
     expect((await check("remote")).body.ok).toBe(false);
     expect((await check("missing")).body.problem).toMatch(/not known/);
+  });
+
+  describe("a request carrying descriptors", () => {
+    const INLINE = 64 * 1024;
+    // Small, so that what is past it is small too: a refusal is answered
+    // without the body being read, and a client still sending a large one may
+    // see the connection close instead of the answer.
+    const CAP = 4 * 1024;
+    const content = (bytes: number) => "x".repeat(bytes);
+
+    async function runtimeServer(options?: Parameters<typeof createRuntimeServer>[0]) {
+      const server = createRuntimeServer({
+        externalHost: "127.0.0.1",
+        quotas: { maxInlineAssetBytes: INLINE },
+        ...options,
+      });
+      servers.push(server);
+      await server.start();
+      return server;
+    }
+
+    it("may be larger than any other control request, when provisioning and when pushing", async () => {
+      const server = await runtimeServer();
+      // Past the 100 KB every other JSON route takes, within what an asset may hold.
+      const page = { mediaType: "text/plain", text: content(INLINE) };
+
+      await request(server.httpServer)
+        .post("/runtimes")
+        .send({ id: "rt-1", name: "Node", services: [], assets: { page, second: page } })
+        .expect(200);
+      await request(server.httpServer)
+        .post("/runtimes/rt-1/assets")
+        .send({ third: page })
+        .expect(200);
+
+      const check = await request(server.httpServer).get("/runtimes/rt-1/assets/third").expect(200);
+      expect(check.body).toEqual({ ok: true, mediaType: "text/plain", size: INLINE });
+    });
+
+    it("is refused in words past what the assets sent at once may weigh", async () => {
+      const server = await runtimeServer({
+        quotas: { maxInlineAssetBytes: INLINE, maxAssetRequestBodyBytes: CAP },
+      });
+      await request(server.httpServer)
+        .post("/runtimes")
+        .send({ id: "rt-1", name: "Node", services: [] })
+        .expect(200);
+
+      const refused = await request(server.httpServer)
+        .post("/runtimes/rt-1/assets")
+        .send({ page: { mediaType: "text/plain", text: content(2 * CAP) } })
+        .expect(413);
+      expect(refused.body.error).toBe(
+        `Request body is larger than ${CAP} bytes, which is what the assets sent at once may weigh here. Name larger content by url.`,
+      );
+    });
+
+    it("has room for one asset at the inline limit when only that limit was raised", async () => {
+      // Past the default for such a request, which would otherwise put the
+      // inline limit that was asked for out of reach.
+      const inline = 33 * 1024 * 1024;
+      const server = await runtimeServer({ quotas: { maxInlineAssetBytes: inline } });
+      await request(server.httpServer)
+        .post("/runtimes")
+        .send({ id: "rt-1", name: "Node", services: [] })
+        .expect(200);
+
+      await request(server.httpServer)
+        .post("/runtimes/rt-1/assets")
+        .send({
+          blob: {
+            mediaType: "application/octet-stream",
+            base64: Buffer.alloc(inline, 7).toString("base64"),
+          },
+        })
+        .expect(200);
+
+      const check = await request(server.httpServer).get("/runtimes/rt-1/assets/blob").expect(200);
+      expect(check.body).toEqual({ ok: true, mediaType: "application/octet-stream", size: inline });
+    });
+
+    it("takes a descriptor past the inline limit, and says so where it is used", async () => {
+      const server = await runtimeServer();
+      await request(server.httpServer)
+        .post("/runtimes")
+        .send({
+          id: "rt-1",
+          name: "Node",
+          services: [],
+          assets: { page: { mediaType: "text/plain", text: content(INLINE + 1) } },
+        })
+        .expect(200);
+
+      const check = await request(server.httpServer).get("/runtimes/rt-1/assets/page").expect(200);
+      expect(check.body.ok).toBe(false);
+      expect(check.body.problem).toMatch(/inline content is larger than/);
+    });
+
+    it("leaves every other route at the ordinary limit", async () => {
+      const server = await runtimeServer();
+      await request(server.httpServer)
+        .post("/runtimes")
+        .send({
+          id: "rt-1",
+          name: "Node",
+          services: [{ serviceId: assetDescriptor.serviceId, uuid: "a" }],
+        })
+        .expect(200);
+
+      const refused = await request(server.httpServer)
+        .post("/runtimes/rt-1/services/a")
+        .send({ asset: content(200 * 1024) })
+        .expect(413);
+      expect(refused.body.error).toMatch(/^Request body is larger than \d+ bytes$/);
+    });
+
+    it("is not read from a caller that is not let in", async () => {
+      const server = await runtimeServer({
+        quotas: { maxInlineAssetBytes: INLINE, maxAssetRequestBodyBytes: CAP },
+        auth: { mode: "required", domain: "tenant.example", audience: "hkp" },
+        buildAuthenticator: () => ({
+          middleware: (_req: unknown, res: { sendStatus: (status: number) => void }) => {
+            res.sendStatus(401);
+          },
+          verifyToken: async () => null,
+        }),
+      } as never);
+
+      // Refused for who is asking, not for the size of what was sent: the body
+      // is past the limit, and was not parsed to find that out.
+      await request(server.httpServer)
+        .post("/runtimes/rt-1/assets")
+        .send({ page: { mediaType: "text/plain", text: content(2 * CAP) } })
+        .expect(401);
+    });
   });
 
   it("answers 404 for a runtime that does not exist", async () => {
