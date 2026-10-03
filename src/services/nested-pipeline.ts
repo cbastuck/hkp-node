@@ -64,6 +64,7 @@ export class NestedPipeline {
     this.applyLogSettings();
     this.applyScope();
     this.applySecrets();
+    this.applyAssets();
     this.applySlots();
     this.applyMounts();
   }
@@ -246,6 +247,7 @@ export class NestedPipeline {
     this.applyLogSettings();
     this.applyScope();
     this.applySecrets();
+    this.applyAssets();
     this.applySlots();
     this.applyMounts();
   }
@@ -277,6 +279,15 @@ export class NestedPipeline {
    */
   private applySecrets(): void {
     this.runtime?.delegateSecrets(() => this.host?.secrets?.() ?? null);
+  }
+
+  /**
+   * Points the nested runtime at the surrounding runtime's assets, for the same
+   * reason as secrets: nothing provisions it, so it asks outward on each
+   * lookup and sees an asset edited while the board runs.
+   */
+  private applyAssets(): void {
+    this.runtime?.delegateAssets(() => this.host?.assets?.() ?? null);
   }
 
   /**

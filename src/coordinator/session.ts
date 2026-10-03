@@ -18,6 +18,7 @@ import {
   ServiceStates,
   isBridgeMessage,
 } from "./bridgeProtocol";
+import { AssetDescriptor } from "../assets";
 
 type ProvisionedRuntime = {
   descriptor: CloudRuntimeDescriptor;
@@ -405,6 +406,28 @@ export class BoardSession {
 
   // ── Private ───────────────────────────────────────────────────────────────
 
+  /**
+   * The assets a runtime is given: every one the board declares, unless an
+   * asset names the runtimes it is for. Not only the ones its services name —
+   * which asset a service uses can be decided as it runs, by its input or by a
+   * request, and a reference that reaches a runtime has to resolve there.
+   *
+   * None for a runtime a unit contributed: it resolves against that unit's
+   * assets, which are not the board's.
+   */
+  private assetsFor(runtime: CloudRuntimeDescriptor): Record<string, AssetDescriptor> {
+    const assets: Record<string, AssetDescriptor> = {};
+    if (runtime.unit) {
+      return assets;
+    }
+    for (const descriptor of this.config.assets ?? []) {
+      if (!descriptor.runtimes || descriptor.runtimes.includes(runtime.id)) {
+        assets[descriptor.id] = descriptor;
+      }
+    }
+    return assets;
+  }
+
   private async provision(
     runtime: CloudRuntimeDescriptor,
     services: CloudBoardConfig["services"][string],
@@ -447,6 +470,10 @@ export class BoardSession {
           serviceName: svc.serviceName ?? svc.name ?? svc.serviceId,
           state: svc.state ?? {},
         })),
+        // Every asset this runtime is given, named by a service or not.
+        // Host-local content cannot travel this way — a `file://` source is
+        // read by the runtime, inside its own volumes.
+        assets: this.assetsFor(runtime),
       };
 
       const response = await fetch(`${baseUrl}/runtimes`, {

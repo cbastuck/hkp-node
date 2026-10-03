@@ -52,7 +52,7 @@ import {
   ServiceRegistryEntry,
 } from "../types";
 import { MOUNT_FIELD, parseMountRef } from "../coordinator/mount";
-import { resolveCredential } from "../secrets";
+import { fetchWithCredentials } from "../credentialedFetch";
 
 export const httpClientDescriptor: ServiceRegistryEntry = {
   serviceId: "http-client",
@@ -362,27 +362,7 @@ export class HttpClientService implements HostedService {
 
     try {
       const request = this.requestBody(input);
-      // Headers are a free-form map, and a credential is as likely to be part
-      // of one — `Bearer <token>` — as to be a field of its own. Resolved
-      // against the address being called, so a header bound to one host cannot
-      // be sent to another by repointing this service.
-      const { value: resolvedHeaders, problem } = resolveCredential(
-        this.host?.secrets?.(),
-        this.headers,
-        url,
-      );
-      if (problem) {
-        notify({
-          requesting: false,
-          method,
-          url,
-          status: 0,
-          error: problem,
-        });
-        this.inFlight -= 1;
-        return;
-      }
-      const headers: Record<string, string> = { ...resolvedHeaders };
+      const headers: Record<string, string> = { ...this.headers };
       if (request?.contentType && !headers["content-type"]) {
         headers["content-type"] = request.contentType;
       }
@@ -390,14 +370,30 @@ export class HttpClientService implements HostedService {
         headers["user-agent"] = this.userAgent;
       }
 
-      const response = await fetch(url, {
-        method: method.toUpperCase(),
+      // Headers are a free-form map, and a credential is as likely to be part
+      // of one — `Bearer <token>` — as to be a field of its own. Resolved
+      // against the address being called, and again for each address a
+      // redirect leads to, so a header bound to one host cannot be sent to
+      // another by repointing this service or by the host it calls.
+      const sent = await fetchWithCredentials(this.host?.secrets?.(), url, {
+        method,
         headers,
         // Node's fetch takes a Uint8Array body; the DOM lib's BodyInit, which
         // these types come from, only admits the browser's set.
         body: request?.body as BodyInit | undefined,
         signal: controller.signal,
       });
+      if ("problem" in sent) {
+        notify({
+          requesting: false,
+          method,
+          url,
+          status: 0,
+          error: sent.problem,
+        });
+        return;
+      }
+      const { response } = sent;
 
       const result = await this.readResponse(url, response);
       notify({

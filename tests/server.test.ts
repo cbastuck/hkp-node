@@ -31,6 +31,7 @@ import { joinDescriptor } from "../src/services/join";
 import { documentExtractDescriptor } from "../src/services/document-extract";
 import { injectorDescriptor } from "../src/services/injector";
 import { rssDescriptor } from "../src/services/rss";
+import { assetDescriptor } from "../src/services/asset";
 
 describe("hkp-node runtime server", () => {
   const server = createRuntimeServer({ externalHost: "127.0.0.1" });
@@ -89,6 +90,7 @@ describe("hkp-node runtime server", () => {
       documentExtractDescriptor,
       injectorDescriptor,
       rssDescriptor,
+      assetDescriptor,
     ]);
     expect(response.body.runtimes).toHaveLength(1);
     expect(response.body.runtimes[0]).toMatchObject({

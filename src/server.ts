@@ -59,6 +59,8 @@ import {
 } from "./services/recordStore";
 import {
   FileStore,
+  checkFilePath,
+  checkVolumeName,
   createDiskFileStore,
   createMemoryFileStore,
 } from "./services/fileStore";
@@ -86,6 +88,7 @@ import {
 } from "./services/text-generation";
 import { InjectorService, injectorDescriptor } from "./services/injector";
 import { RssService, rssDescriptor } from "./services/rss";
+import { AssetService, assetDescriptor } from "./services/asset";
 import {
   contextFromWire,
   HostedRuntime,
@@ -114,6 +117,11 @@ import {
   ServiceConfiguration,
 } from "./types";
 import { readSecretsPayload } from "./secrets";
+import {
+  AssetDescriptor,
+  DEFAULT_MAX_INLINE_ASSET_BYTES,
+  readAssetsPayload,
+} from "./assets";
 
 /**
  * Per-tenant limits. Runtimes, services and timers all consume resources on a
@@ -127,6 +135,20 @@ export type Quotas = {
   minTimerIntervalMs?: number;
   /** Largest accepted request body on a public service endpoint; 0 disables. */
   maxRequestBodyBytes?: number;
+  /**
+   * Largest content an asset descriptor may carry itself (`text`, `base64`).
+   * Unset keeps the default. Content past it is named by URL, which a runtime
+   * fetches for itself.
+   */
+  maxInlineAssetBytes?: number;
+  /**
+   * Largest body of a request that carries asset descriptors: creating a
+   * runtime, pushing assets to one, deploying a board. In effect how much
+   * inline content one runtime — or one deployed board — may be handed at
+   * once, counted as it travels: base64 for bytes, JSON-escaped for text.
+   * Unset keeps the default.
+   */
+  maxAssetRequestBodyBytes?: number;
 };
 
 /**
@@ -136,6 +158,45 @@ export type Quotas = {
  * dangerous choice the automatic one.
  */
 const DEFAULT_MAX_REQUEST_BODY_BYTES = 25 * 1024 * 1024;
+
+/**
+ * What a request carrying asset descriptors may weigh when nothing says
+ * otherwise. A quota of its own rather than a multiple of the inline limit: a
+ * runtime's create payload carries every asset its services reference and a
+ * deployed board carries all of its own, so this is what bounds how much
+ * inline content a board may hold, however many assets it is spread over.
+ */
+const DEFAULT_MAX_ASSET_REQUEST_BODY_BYTES = 32 * 1024 * 1024;
+
+/**
+ * The largest body a request carrying asset descriptors may have, in bytes.
+ * What was configured, as it stands. Left to the default it is never less
+ * than one asset at the inline limit takes to travel — base64, four
+ * characters for three bytes, and room for the rest of the request — so that
+ * raising the inline limit alone does not leave it out of reach.
+ */
+function assetRequestBodyLimit(quotas: Quotas, maxInlineAssetBytes: number): number {
+  if (quotas.maxAssetRequestBodyBytes && quotas.maxAssetRequestBodyBytes > 0) {
+    return quotas.maxAssetRequestBodyBytes;
+  }
+  return Math.max(
+    DEFAULT_MAX_ASSET_REQUEST_BODY_BYTES,
+    Math.ceil((maxInlineAssetBytes * 4) / 3) + 1024 * 1024,
+  );
+}
+
+/**
+ * Whether a request is one that carries asset descriptors: provisioning a
+ * runtime, pushing to one, and deploying a board to a coordinator.
+ */
+function carriesAssets(req: Request): boolean {
+  return (
+    req.method === "POST" &&
+    (req.path === "/runtimes" ||
+      /^\/runtimes\/[^/]+\/assets$/.test(req.path) ||
+      /^\/coordinator\/users\/[^/]+\/boards$/.test(req.path))
+  );
+}
 
 /**
  * Which runtime server this is, reported beside the runtimes so a client can
@@ -270,6 +331,10 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
   const externalHost = options.externalHost ?? options.host ?? "127.0.0.1";
   const externalSecure = options.externalSecure ?? false;
   const quotas = options.quotas ?? {};
+  const maxInlineAssetBytes =
+    quotas.maxInlineAssetBytes && quotas.maxInlineAssetBytes > 0
+      ? quotas.maxInlineAssetBytes
+      : DEFAULT_MAX_INLINE_ASSET_BYTES;
   // Databases follow records below: one store for the whole server, scoped per
   // call, and an empty path saying "keep nothing on disk" rather than naming
   // the working directory as a root.
@@ -517,6 +582,13 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
         create: (config, _createService) => new RssService(config),
       },
     ],
+    [
+      assetDescriptor.serviceId,
+      {
+        descriptor: assetDescriptor,
+        create: (config, _createService) => new AssetService(config),
+      },
+    ],
   ]);
 
   // Public service endpoints. Declared before the runtime app because runtimes
@@ -534,10 +606,32 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
     options.mountSecret,
   );
 
-  const runtimeApp = new RuntimeApp(factories, (owner, runtimeId) => ({
-    mount: (serviceUuid, handlers, options) =>
-      mounts.register(owner, runtimeId, serviceUuid, handlers, options),
-  }));
+  const runtimeApp = new RuntimeApp(
+    factories,
+    (owner, runtimeId) => ({
+      mount: (serviceUuid, handlers, options) =>
+        mounts.register(owner, runtimeId, serviceUuid, handlers, options),
+    }),
+    // A `file://` asset is a file in one of the tenant's volumes —
+    // `file:///<volume>/<path>` — read through the same store and the same
+    // checks as `filesystem`. Nothing outside a volume is ever read: a shared
+    // board naming a path on this machine is refused, not served.
+    async (scope, url) => {
+      const [volume, ...rest] = decodeURIComponent(url.pathname)
+        .split("/")
+        .filter((segment) => segment !== "");
+      if (!volume || url.host || checkVolumeName(volume)) {
+        return null;
+      }
+      const checked = checkFilePath(rest.join("/"));
+      if ("error" in checked) {
+        return null;
+      }
+      const found = await files.read({ ...scope, volume }, checked.path);
+      return found?.bytes ?? null;
+    },
+    { maxInlineBytes: maxInlineAssetBytes },
+  );
   const expressApp = express();
   expressApp.use(
     cors({
@@ -553,8 +647,24 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
   // 400. The process routes tell the two apart themselves: no body at all is
   // `undefined` and refused, `null` runs the pipeline with nothing on its
   // input. Every other route already checks the shape it needs.
-  expressApp.use(express.json({ strict: false }));
+  //
+  // Requests that carry asset descriptors are larger than any other control
+  // request, by design: inline content travels in them. They get a limit of
+  // their own, derived from the largest inline asset a runtime takes — and
+  // only once the caller is known, so that the larger body is not something
+  // anyone can make this server read.
+  const controlBody = express.json({ strict: false });
+  const assetBody = express.json({
+    strict: false,
+    limit: assetRequestBodyLimit(quotas, maxInlineAssetBytes),
+  });
+  expressApp.use((req, res, next) =>
+    carriesAssets(req) ? next() : controlBody(req, res, next),
+  );
   expressApp.use(authenticator.middleware);
+  expressApp.use((req, res, next) =>
+    carriesAssets(req) ? assetBody(req, res, next) : next(),
+  );
 
   // Mounts are matched before Express so they bypass CORS and the auth
   // middleware entirely: they exist to be called by outside parties (webhooks,
@@ -845,6 +955,46 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
     res.json({ aliases: runtime.secrets().aliases() });
   });
 
+  /**
+   * Descriptors for the assets this runtime's services reference.
+   *
+   * Provisioning carries them already; this is for a configuration that names
+   * one the runtime was not given, for an asset edited while the board runs —
+   * which is how an edit reaches a service without reconfiguring it — and for a
+   * re-push after a restart. It merges, and `null` removes an asset.
+   *
+   * Answers with the ids held, never content: what a runtime has can be named,
+   * and a client that wants the content has the board.
+   */
+  expressApp.post("/runtimes/:runtimeId/assets", (req, res) => {
+    const runtime = getRuntimeOr404(req, res, req.params.runtimeId);
+    if (!runtime) {
+      return;
+    }
+    runtime.setAssets(readAssetsPayload(req.body));
+    res.json({ ids: runtime.assets().ids() });
+  });
+
+  /**
+   * Whether an asset resolves here, and to what — its media type and size, or
+   * the reason it does not. A check, not a download: the content stays where
+   * it is, and a URL source is fetched from where it will actually be used.
+   */
+  expressApp.get("/runtimes/:runtimeId/assets/:assetId", async (req, res) => {
+    const runtime = getRuntimeOr404(req, res, req.params.runtimeId);
+    if (!runtime) {
+      return;
+    }
+    const { asset, problem } = await runtime
+      .assets()
+      .resolve(`hkp-asset://${req.params.assetId}`);
+    res.json(
+      asset
+        ? { ok: true, mediaType: asset.mediaType, size: asset.bytes.length }
+        : { ok: false, problem },
+    );
+  });
+
   expressApp.post("/runtimes/:runtimeId/rearrange", (req, res) => {
     const runtime = getRuntimeOr404(req, res, req.params.runtimeId);
     if (!runtime) {
@@ -1091,9 +1241,20 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
   );
 
   expressApp.use(
-    (err: Error, _req: Request, res: Response, _next: NextFunction) => {
+    (err: Error, req: Request, res: Response, _next: NextFunction) => {
       if (err instanceof SyntaxError) {
         res.sendStatus(400);
+        return;
+      }
+      // Said in words: the caller is a board editor, and "too large" is
+      // something its author can act on.
+      if ((err as { type?: string }).type === "entity.too.large") {
+        const limit = (err as { limit?: number }).limit;
+        res.status(413).json({
+          error: carriesAssets(req)
+            ? `Request body is larger than ${limit} bytes, which is what the assets sent at once may weigh here. Name larger content by url.`
+            : `Request body is larger than ${limit} bytes`,
+        });
         return;
       }
       // Don't leak internal error details (paths, stack hints) to clients.
@@ -1348,8 +1509,23 @@ function validateRuntimeConfiguration(
     // here and handed to the runtime's vault; they are never put back into any
     // service's state, and never appear in a serialized runtime.
     secrets: readSecretsPayload(value.secrets),
+    // Descriptors for the assets the services reference; a removal means
+    // nothing to a runtime being created, so only descriptors are kept.
+    assets: presentAssets(readAssetsPayload(value.assets)),
     services,
   };
+}
+
+function presentAssets(
+  entries: Record<string, AssetDescriptor | null>,
+): Record<string, AssetDescriptor> {
+  const present: Record<string, AssetDescriptor> = {};
+  for (const [id, entry] of Object.entries(entries)) {
+    if (entry) {
+      present[id] = entry;
+    }
+  }
+  return present;
 }
 
 function validateServiceConfiguration(

@@ -1,5 +1,6 @@
 import { MountHandle, MountHandlers } from "./mounts";
 import { SecretVault } from "./secrets";
+import { AssetDescriptor, AssetStore } from "./assets";
 
 export type JsonRecord = Record<string, unknown>;
 
@@ -51,6 +52,17 @@ export type RuntimeConfiguration = {
    * the wire.
    */
   secrets?: Record<string, { value: string; audience?: string[] }>;
+  /**
+   * Descriptors for the `hkp-asset://<id>` references this runtime's services
+   * carry, by id.
+   *
+   * With the create payload for the reason secrets are: provisioning is one
+   * call, and a service that loads its content while being configured needs
+   * the descriptor by then. Only what this runtime's services reference — a
+   * board's inline assets can be large, and a runtime holds none it has no use
+   * for. They go into the runtime's asset store and never into service state.
+   */
+  assets?: Record<string, AssetDescriptor>;
   /**
    * Whether this runtime records anything at all.
    *
@@ -364,6 +376,15 @@ export interface RuntimeHost {
    * saved from, which is the whole thing this arrangement exists to prevent.
    */
   secrets(): SecretVault;
+  /**
+   * The runtime's assets, for a service that consumes content by reference.
+   *
+   * A service holds `hkp-asset://<id>` and resolves it here at the moment it
+   * uses it, so an asset edited while the board runs is what the next use
+   * gets. The content is used and dropped, never put into state. Optional
+   * because a host that was not provisioned with any has nothing to answer.
+   */
+  assets?(): AssetStore;
   /**
    * The slots this pipeline's values may be held in, or nothing where no store
    * has been provided.
