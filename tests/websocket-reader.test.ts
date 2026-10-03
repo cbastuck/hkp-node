@@ -133,7 +133,60 @@ describe("websocket-reader", () => {
     await expect(
       connect(url, { authorization: "Bearer wrong" }),
     ).rejects.toThrow("401");
-    await connect(`${url}?key=${KEY}`, {});
+    await connect(url);
+  });
+
+  it("does not take the key in the query string", async () => {
+    // Where proxies and access logs would keep it.
+    const { url } = await reader();
+    await expect(connect(`${url}?key=${KEY}`, {})).rejects.toThrow("401");
+  });
+
+  it("lets go of its clients when the key changes", async () => {
+    const { server, url, state } = await reader();
+    const client = await connect(url);
+    const closed = new Promise((resolve) => client.once("close", resolve));
+
+    await request(server.httpServer)
+      .post("/runtimes/rt/services/in")
+      .send({ key: "something-else" })
+      .expect(200);
+    await closed;
+    expect((await state()).connections).toEqual([]);
+  });
+
+  it("keeps its clients when the same key is configured again", async () => {
+    // A board re-sending its state is not a new key.
+    const { server, url, state } = await reader();
+    await connect(url);
+    await request(server.httpServer)
+      .post("/runtimes/rt/services/in")
+      .send({ key: "{{secret.ingest}}" })
+      .expect(200);
+    expect((await state()).connections).toHaveLength(1);
+  });
+
+  it("takes no more from a client once the secret has a new value", async () => {
+    const { server, url, outputUrl, state } = await reader();
+    const received = await results(outputUrl);
+    const client = await connect(url);
+    client.send("before");
+    await eventually(() => received.includes("before"));
+
+    await request(server.httpServer)
+      .post("/runtimes/rt/secrets")
+      .send({ ingest: { value: "rotated" } })
+      .expect(200);
+    const closed = new Promise<number>((resolve) =>
+      client.once("close", (code) => resolve(code)),
+    );
+    client.send("after");
+    expect(await closed).toBe(1008);
+    expect(received).not.toContain("after");
+    expect((await state()).connections).toEqual([]);
+    // And the new value is what lets a client in now.
+    await expect(connect(url)).rejects.toThrow("401");
+    await connect(url, { authorization: "Bearer rotated" });
   });
 
   it("lets nobody in without a key", async () => {

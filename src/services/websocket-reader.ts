@@ -18,11 +18,16 @@
  * every hkp-node endpoint.
  *
  * **Only a client holding `key` is let in**, presented as
- * `Authorization: Bearer <key>` or as `?key=<key>` for a client that cannot set
- * headers (a browser). The mount address is public by design, so without a key
- * anyone who learnt it could feed the pipeline: an unset key admits nobody.
- * `key` is usually a `{{secret.<alias>}}` reference, resolved at each
- * connection and never kept.
+ * `Authorization: Bearer <key>`. The mount address is public by design, so
+ * without a key anyone who learnt it could feed the pipeline: an unset key
+ * admits nobody. Not accepted in the query string, where proxies and logs keep
+ * it: this is a lasting credential, not a token that expires.
+ *
+ * `key` is usually a `{{secret.<alias>}}` reference, resolved when it is needed
+ * and never kept. **Replacing the key lets go of everyone it let in**: changing
+ * `key` closes every connection, and each message is checked against the
+ * current value, so a secret given a new value admits no further messages from
+ * a client holding the old one.
  *
  * **`exclusive`** admits one client at a time, a new one closing the one
  * before — what a client reconnecting after its network dropped looks like
@@ -32,7 +37,7 @@
  * Messages enter the pipeline in the order they arrive.
  */
 import { IncomingMessage } from "node:http";
-import { timingSafeEqual } from "node:crypto";
+import { createHash, timingSafeEqual } from "node:crypto";
 
 import { WebSocket, WebSocketServer } from "ws";
 
@@ -57,6 +62,8 @@ type Connection = {
   since: number;
   messages: number;
   bytesReceived: number;
+  /** A digest of the key it presented, to check against the current one. */
+  presented: Buffer;
 };
 
 export class WebsocketReaderService implements HostedService {
@@ -92,8 +99,10 @@ export class WebsocketReaderService implements HostedService {
   configure(config: JsonRecord): JsonRecord {
     // `host`, `port` and `path` are accepted and ignored: hkp-rt's reader binds
     // a port of its own, while this one is served at an assigned path.
-    if (typeof config.key === "string") {
+    if (typeof config.key === "string" && config.key !== this.key) {
       this.key = config.key;
+      // Whoever the old key let in is not let in by this one.
+      this.dropConnections();
     }
     if (typeof config.exclusive === "boolean") {
       this.exclusive = config.exclusive;
@@ -185,13 +194,33 @@ export class WebsocketReaderService implements HostedService {
   }
 
   private releaseMount(): void {
-    for (const connection of this.connections) {
-      connection.socket.terminate();
-    }
+    this.connections.forEach((connection) => connection.socket.terminate());
     this.connections.clear();
     this.mount?.release();
     this.mount = null;
     this.notify({ __hkpMount: "", connections: [] });
+  }
+
+  private dropConnections(): void {
+    if (!this.connections.size) {
+      return;
+    }
+    this.connections.forEach((connection) => connection.socket.terminate());
+    this.connections.clear();
+    this.notify({ connections: [] });
+  }
+
+  /** A digest of the key as it currently resolves, or null when it does not. */
+  private expectedKey(): Buffer | null {
+    const { value: expected, problem } = resolveCredential(
+      this.host?.secrets?.(),
+      this.key,
+      this.mount?.url ?? "http://localhost",
+    );
+    if (!this.key || problem || !expected) {
+      return null;
+    }
+    return digest(expected);
   }
 
   /** Why a connection is refused, or nothing when it may connect. */
@@ -199,20 +228,22 @@ export class WebsocketReaderService implements HostedService {
     if (this.bypass) {
       return "404 Not Found";
     }
-    const { value: expected, problem } = resolveCredential(
-      this.host?.secrets?.(),
-      this.key,
-      this.mount?.url ?? "http://localhost",
-    );
-    if (!this.key || problem || !expected) {
+    const expected = this.expectedKey();
+    if (!expected) {
       // Nothing to check a client against, so nobody is let in.
       return "403 Forbidden";
     }
     const presented = presentedKey(req);
-    if (!presented || !sameKey(presented, expected)) {
+    if (!presented || !timingSafeEqual(digest(presented), expected)) {
       return "401 Unauthorized";
     }
     return null;
+  }
+
+  /** Whether the key a connection presented is still the key. */
+  private stillAdmitted(connection: Connection): boolean {
+    const expected = this.expectedKey();
+    return expected !== null && timingSafeEqual(connection.presented, expected);
   }
 
   private accept(socket: WebSocket, req: IncomingMessage): void {
@@ -228,11 +259,21 @@ export class WebsocketReaderService implements HostedService {
       since: Date.now(),
       messages: 0,
       bytesReceived: 0,
+      presented: digest(presentedKey(req)),
     };
     this.connections.add(connection);
     this.notify({ connections: this.describeConnections() });
 
     socket.on("message", (raw, isBinary) => {
+      if (!this.stillAdmitted(connection)) {
+        // 1008: policy violation, the closest a close code comes to "your
+        // credential is no longer valid".
+        socket.close(1008, "key replaced");
+        if (this.connections.delete(connection)) {
+          this.notify({ connections: this.describeConnections() });
+        }
+        return;
+      }
       const bytes = Array.isArray(raw)
         ? Buffer.concat(raw)
         : Buffer.isBuffer(raw)
@@ -298,22 +339,19 @@ function parseText(text: string): unknown {
   }
 }
 
-/** The key a client presents: a bearer token, or `?key=`. */
+/** The key a client presents as a bearer token, or empty. */
 function presentedKey(req: IncomingMessage): string {
   const authorization = req.headers.authorization ?? "";
   const bearer = /^Bearer\s+(.+)$/i.exec(authorization);
-  if (bearer) {
-    return bearer[1].trim();
-  }
-  return (
-    new URL(req.url ?? "/", "http://localhost").searchParams.get("key") ?? ""
-  );
+  return bearer ? bearer[1].trim() : "";
 }
 
-function sameKey(presented: string, expected: string): boolean {
-  const a = Buffer.from(presented);
-  const b = Buffer.from(expected);
-  return a.length === b.length && timingSafeEqual(a, b);
+/**
+ * Keys are compared as digests: equal lengths for timingSafeEqual whatever was
+ * presented, and what a connection keeps to be checked again is not the key.
+ */
+function digest(key: string): Buffer {
+  return createHash("sha256").update(key).digest();
 }
 
 function requestAddress(req: IncomingMessage): string {

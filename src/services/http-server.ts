@@ -80,6 +80,7 @@ import {
   answerRangeProbe,
   boundedRange,
   parseStreamConfig,
+  sameStream,
   streamBytes,
   streamState,
 } from "./stream";
@@ -511,11 +512,14 @@ export class HttpServerSubservicesService implements HostedService {
       }
     }
 
-    // `null`, or anything that names no path, ends the stream: listeners are
-    // let go, since nothing will be written to them again.
+    // A different stream, or `null` / anything that names no path, ends the
+    // one there was: its listeners were answered under the old path and
+    // content type, and what it kept for late joiners and probes belongs to
+    // it. The same declaration again — a board re-sending its state — changes
+    // nothing.
     if (config.stream !== undefined) {
       const declared = parseStreamConfig(config.stream);
-      if (this.stream && !declared) {
+      if (this.stream && !sameStream(this.stream, declared)) {
         this.endStream();
       }
       this.stream = declared;

@@ -60,6 +60,18 @@ export function parseStreamConfig(value: unknown): StreamConfig | null {
   };
 }
 
+/** Whether two declarations describe the same stream. */
+export function sameStream(a: StreamConfig, b: StreamConfig | null): boolean {
+  return (
+    b !== null &&
+    a.path === b.path &&
+    a.contentType === b.contentType &&
+    a.burstBytes === b.burstBytes &&
+    a.maxQueueBytes === b.maxQueueBytes &&
+    a.stallTimeoutMs === b.stallTimeoutMs
+  );
+}
+
 /** What a board declared, as state reports it back. */
 export function streamState(config: StreamConfig): JsonRecord {
   return {
@@ -73,7 +85,8 @@ export function streamState(config: StreamConfig): JsonRecord {
 
 /**
  * The bounds of a `bytes=first-last` Range header, or null where it is absent,
- * open-ended or not of that form.
+ * open-ended or not of that form. Offsets too large to count exactly are not
+ * of that form either: they would come back rounded, or as Infinity.
  */
 export function boundedRange(header: string | undefined): [number, number] | null {
   const match = /^bytes=(\d+)-(\d+)$/.exec(header ?? "");
@@ -82,6 +95,9 @@ export function boundedRange(header: string | undefined): [number, number] | nul
   }
   const first = Number(match[1]);
   const last = Number(match[2]);
+  if (!Number.isSafeInteger(first) || !Number.isSafeInteger(last)) {
+    return null;
+  }
   return last >= first ? [first, last] : null;
 }
 

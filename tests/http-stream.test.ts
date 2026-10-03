@@ -197,6 +197,43 @@ describe("an endpoint's stream", () => {
     expect((await state()).listeners).toBe(0);
   });
 
+  it("ends the stream when a different one is declared", async () => {
+    const { server, streamUrl, ingestUrl, state } = await relay({ ...radio, burstBytes: 8 });
+    const feed = await source(ingestUrl);
+    feed.send(Buffer.from("old!"));
+    const listener = await listen(streamUrl);
+    await eventually(() => listener.received.toString() === "old!");
+
+    await request(server.httpServer)
+      .post("/runtimes/relay/services/radio")
+      .send({ stream: { ...radio, path: "/new.mp3", burstBytes: 8 } })
+      .expect(200);
+    await eventually(() => listener.ended);
+    const current = await state();
+    expect(current.listeners).toBe(0);
+    expect(current.streamUrl).toMatch(/\/new\.mp3$/);
+
+    // Nothing the old stream kept reaches the new one.
+    const probe = await fetch(current.streamUrl, { headers: { range: "bytes=0-1" } });
+    expect(probe.status).not.toBe(206);
+    await probe.body?.cancel();
+    const late = await listen(current.streamUrl);
+    feed.send(Buffer.from("new!"));
+    await eventually(() => late.received.toString() === "new!");
+  });
+
+  it("keeps the stream when the same one is declared again", async () => {
+    const { server, streamUrl, state } = await relay(radio);
+    const listener = await listen(streamUrl);
+    await eventually(async () => (await state()).listeners === 1);
+    await request(server.httpServer)
+      .post("/runtimes/relay/services/radio")
+      .send({ stream: radio })
+      .expect(200);
+    expect((await state()).listeners).toBe(1);
+    expect(listener.ended).toBe(false);
+  });
+
   it("still answers other paths as requests", async () => {
     const { mount } = await relay(radio, {
       onRequest: [
@@ -232,5 +269,9 @@ describe("the pieces", () => {
     expect(boundedRange("bytes=0-")).toBeNull();
     expect(boundedRange("bytes=5-1")).toBeNull();
     expect(boundedRange(undefined)).toBeNull();
+    // Offsets that cannot be counted exactly are malformed, not rounded.
+    expect(boundedRange(`bytes=0-${Number.MAX_SAFE_INTEGER}`)).toEqual([0, Number.MAX_SAFE_INTEGER]);
+    expect(boundedRange("bytes=0-9007199254740993")).toBeNull();
+    expect(boundedRange(`bytes=0-${"9".repeat(400)}`)).toBeNull();
   });
 });
