@@ -7,7 +7,11 @@ import path from "path";
 import { randomBytes } from "crypto";
 import { config as loadEnv } from "dotenv";
 import { createRuntimeServer } from "./server";
-import { BoardCoordinator, createCoordinatorRouter } from "./coordinator";
+import {
+  BoardCoordinator,
+  attachCoordinatorJoin,
+  createCoordinatorRouter,
+} from "./coordinator";
 import { createFileBoardStore } from "./coordinator/fileBoardStore";
 import { createFileLogStore } from "./coordinator/logStore";
 import { AllowedOrigins, AuthConfig, isLoopbackHost } from "./auth";
@@ -90,6 +94,12 @@ async function main() {
     files:
       process.env.HKP_FILES_DIR ??
       path.join(os.homedir(), ".hkp", "node", "files"),
+    // The tickets this server reconnects to coordinators with, beside the
+    // mount secret. HKP_COORDINATOR_LINKS_FILE="" keeps them in memory, so a
+    // restart leaves every deployed board waiting to be deployed again.
+    coordinatorLinks:
+      process.env.HKP_COORDINATOR_LINKS_FILE ??
+      path.join(os.homedir(), ".hkp", "node", "coordinator-links.json"),
     quotas: {
       maxRuntimesPerUser: readInteger(process.env.HKP_MAX_RUNTIMES_PER_USER, 0),
       maxServicesPerRuntime: readInteger(
@@ -130,6 +140,12 @@ async function main() {
         ? new BoardCoordinator(
             createFileBoardStore(dataDir),
             logDir ? createFileLogStore(logDir) : undefined,
+            undefined,
+            {
+              maxFrameBytes:
+                readInteger(process.env.HKP_COORDINATOR_MAX_FRAME_BYTES, 0) ||
+                undefined,
+            },
           )
         : undefined,
     });
@@ -145,6 +161,9 @@ async function main() {
       console.log(`hkp-node coordinator board logs: ${logDir}`);
     }
     server.expressApp.use("/coordinator", coordinatorRouter);
+    // Where runtime servers connect in with their tickets. The coordinator
+    // reaches a board's runtimes over those connections and no other way.
+    attachCoordinatorJoin(server, coordinator);
     server.setBridgeUpgradeHandler((ws, user) => {
       ws.once("message", (raw) => {
         const text = raw.toString();
@@ -219,6 +238,9 @@ async function main() {
   }
 
   const address = await server.start(port, host);
+  // Once this server is listening: a coordinator it reconnects to may build a
+  // runtime at once, and that runtime's mounts need an address to publish.
+  server.coordinatorLinks.restore();
   const storeDir =
     process.env.HKP_STORE_DIR ?? path.join(os.homedir(), ".hkp", "node", "store");
   console.log(

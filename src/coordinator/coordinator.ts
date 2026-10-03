@@ -3,6 +3,8 @@ import { BoardSession } from "./session";
 import { BoardStore, createMemoryBoardStore } from "./boardStore";
 import { LogStore } from "./logStore";
 import { LogEntry, LogLevel } from "../types";
+import { ParticipantRegistry } from "./participants";
+import { isRemoteRuntime } from "./types";
 
 export class BoardCoordinator {
   // userId → boardName → BoardSession
@@ -13,11 +15,38 @@ export class BoardCoordinator {
 
   /** Where the boards themselves are kept; see BoardStore. In memory unless a
    *  caller supplies somewhere that outlives the process. */
+  /**
+   * The tickets this coordinator has issued and the runtime servers connected
+   * with them. Everything a board's remote runtimes do reaches it through
+   * here: the coordinator accepts connections and makes none.
+   */
+  readonly participants: ParticipantRegistry;
+
   constructor(
     private readonly store: BoardStore = createMemoryBoardStore(),
     /** Where boards' log entries are kept; absent means none are collected. */
     private readonly logStore?: LogStore,
-  ) {}
+    participants?: ParticipantRegistry,
+    /**
+     * What this coordinator's operator allows. `maxFrameBytes` bounds a single
+     * value passed between runtimes; unset means no limit.
+     */
+    private readonly limits: { maxFrameBytes?: number } = {},
+  ) {
+    this.participants =
+      participants ??
+      new ParticipantRegistry({
+        maxFrameBytes: limits.maxFrameBytes,
+        // A board that exists has to remember the ticket that now counts, or
+        // a restart would bring back the one it replaced.
+        onTicketsChanged: (userId, boardName) => {
+          const session = this.getBoard(userId, boardName);
+          if (session) {
+            void this.persist(session);
+          }
+        },
+      });
+  }
 
   /** Entries this board has recorded; see LogStore.read. */
   readLog(
@@ -29,28 +58,136 @@ export class BoardCoordinator {
   }
 
   /**
-   * Takes back the boards the store holds, as boards that are not running.
+   * Takes back the boards the store holds.
    *
    * Await this before serving: until it finishes the coordinator will report
    * that the user has no boards, and a browser told that would be told wrongly.
    * A board already registered in this process wins — it is the live one, and
    * what the store holds is an older copy of the same document.
+   *
+   * A board that was running is run again. Nothing is connected yet, so it
+   * comes back in `error`, naming every runtime it is waiting for, and builds
+   * each one as its runtime server reconnects with the ticket it kept — with
+   * nobody present, which is the point of a ticket. A board that was stopped
+   * stays stopped.
    */
   async restore(): Promise<void> {
     for (const board of await this.store.load()) {
       if (this.getBoard(board.userId, board.boardName)) {
         continue;
       }
+      this.participants.importTickets(
+        board.userId,
+        board.boardName,
+        board.tickets ?? [],
+      );
+      // Written by a coordinator that kept no tickets: there is nothing that
+      // could reconnect, so the board is as stopped as it always came back.
+      const stopped = board.stopped ?? true;
       const session = new BoardSession(
         board.boardName,
         board.userId,
         board.config,
-        undefined,
-        { createdAt: board.createdAt },
+        this.participants.forBoard(board.userId, board.boardName),
+        { createdAt: board.createdAt, stopped },
         this.logStore,
+        this.limits,
       );
       this.userSessions(board.userId).set(board.boardName, session);
+      if (!stopped) {
+        await session.start();
+      }
     }
+  }
+
+  /**
+   * Issues a ticket for each of a board's runtimes named. Asked for before the
+   * board is registered: the person's client hands each ticket to the runtime
+   * server it chose, which connects with it, and only then is the board
+   * registered.
+   *
+   * For a board that is already running the new tickets are pending: its
+   * runtime servers stay its own until the registration that follows, so a
+   * deploy that fails part-way leaves it as it was. See ParticipantRegistry.
+   */
+  async issueTickets(
+    userId: string,
+    boardName: string,
+    runtimeIds: string[],
+  ): Promise<Record<string, string>> {
+    const tickets: Record<string, string> = {};
+    for (const runtimeId of runtimeIds) {
+      tickets[runtimeId] = this.participants.issue({
+        userId,
+        boardName,
+        runtimeId,
+      });
+    }
+    // A board that already exists has to remember a ticket that counts at
+    // once — one for a runtime it had none for.
+    const session = this.getBoard(userId, boardName);
+    if (session) {
+      await this.persist(session);
+    }
+    return tickets;
+  }
+
+  /**
+   * Takes back the tickets of a deploy that did not go through.
+   *
+   * For a board that is running these are its pending ones; its servers and
+   * the tickets they hold are untouched. A board that was never registered
+   * has nothing else, so all of its tickets go, and the servers introduced
+   * for it are let go.
+   */
+  cancelTickets(userId: string, boardName: string): void {
+    if (this.getBoard(userId, boardName)) {
+      this.participants.cancelPending(userId, boardName);
+    } else {
+      this.participants.revokeBoard(userId, boardName);
+    }
+  }
+
+  /** Writes a board down, with its tickets and whether it is stopped. */
+  private async persist(session: BoardSession): Promise<void> {
+    try {
+      await this.store.save({
+        userId: session.userId,
+        boardName: session.boardName,
+        createdAt: session.createdAt,
+        config: session.config,
+        stopped: session.isStopped(),
+        tickets: this.participants.exportTickets(
+          session.userId,
+          session.boardName,
+        ),
+      });
+    } catch (err) {
+      // The board is as it should be in this process; only its survival of a
+      // restart is in doubt. Failing the request over that would be the worse
+      // trade.
+      console.error(
+        `[coordinator] Failed to persist board "${session.boardName}":`,
+        err instanceof Error ? err.message : err,
+      );
+    }
+  }
+
+  /**
+   * Stops a board without giving it up, and remembers that it is stopped — a
+   * restart must not start a board its owner stopped.
+   */
+  async stopBoard(
+    userId: string,
+    boardName: string,
+  ): Promise<BoardSession | null> {
+    const session = this.getBoard(userId, boardName);
+    if (!session) {
+      return null;
+    }
+    await session.stop();
+    await this.persist(session);
+    return session;
   }
 
   /**
@@ -69,13 +206,12 @@ export class BoardCoordinator {
   async registerBoard(
     userId: string,
     config: CloudBoardConfig,
-    userJwt?: string,
   ): Promise<BoardSession> {
     const key = `${userId}\u0000${config.boardName}`;
     const queued = (this.registrations.get(key) ?? Promise.resolve())
       // A failed registration must not stop the next one from being attempted.
       .catch(() => undefined)
-      .then(() => this.replaceSession(userId, config, userJwt));
+      .then(() => this.replaceSession(userId, config));
     this.registrations.set(key, queued);
     try {
       return await queued;
@@ -89,9 +225,6 @@ export class BoardCoordinator {
   private async replaceSession(
     userId: string,
     config: CloudBoardConfig,
-    // The caller's JWT, forwarded so the session can provision runtimes and mint
-    // delegated session tokens on the user's behalf.
-    userJwt?: string,
   ): Promise<BoardSession> {
     const existing = this.sessions.get(userId)?.get(config.boardName);
     // Lift the browser bridges out of the old session before destroying it so
@@ -102,13 +235,28 @@ export class BoardCoordinator {
       await existing.destroy();
     }
 
+    // The deploy went through: a server introduced for it and waiting is the
+    // board's from here. After the old session released its runtimes, which
+    // it did over the connections it had.
+    this.participants.promoteBoard(userId, config.boardName);
+
+    // A ticket for a runtime the board no longer has stops being a way in. The
+    // old session has already released that runtime, over the connection this
+    // closes.
+    this.participants.revokeBoard(
+      userId,
+      config.boardName,
+      config.runtimes.filter(isRemoteRuntime).map((runtime) => runtime.id),
+    );
+
     const session = new BoardSession(
       config.boardName,
       userId,
       config,
-      userJwt,
+      this.participants.forBoard(userId, config.boardName),
       undefined,
       this.logStore,
+      this.limits,
     );
     await session.start();
 
@@ -122,23 +270,8 @@ export class BoardCoordinator {
 
     // Deploying is what makes a board the coordinator's, so it is what the
     // store is told about. Starting a stopped board registers the same config
-    // again and lands here too, which is harmless: it writes what is already
-    // written.
-    try {
-      await this.store.save({
-        userId,
-        boardName: config.boardName,
-        createdAt: session.createdAt,
-        config,
-      });
-    } catch (err) {
-      // The board is provisioned and running; only its survival of a restart is
-      // in doubt. Failing the deploy over that would be the worse trade.
-      console.error(
-        `[coordinator] Failed to persist board "${config.boardName}":`,
-        err instanceof Error ? err.message : err,
-      );
-    }
+    // again and lands here too.
+    await this.persist(session);
     return session;
   }
 
@@ -161,22 +294,7 @@ export class BoardCoordinator {
     }
 
     const unreachable = await session.setLogging(enabled, level);
-
-    try {
-      await this.store.save({
-        userId,
-        boardName,
-        createdAt: session.createdAt,
-        config: session.config,
-      });
-    } catch (err) {
-      // The running board took the change; only its survival of a restart is in
-      // doubt, which is not worth failing the request over.
-      console.error(
-        `[coordinator] Failed to persist the log setting for "${boardName}":`,
-        err instanceof Error ? err.message : err,
-      );
-    }
+    await this.persist(session);
 
     return { unreachable };
   }
@@ -214,8 +332,11 @@ export class BoardCoordinator {
     if (!session) {
       return false;
     }
-    session.destroy();
+    await session.destroy();
     this.sessions.get(userId)?.delete(boardName);
+    // After the runtimes were released over them: the tickets are the board's,
+    // and a deleted board has no participants.
+    this.participants.revokeBoard(userId, boardName);
     // Deleting a board that outlived a restart has to delete it there too, or
     // the next restore brings it back.
     await this.store.remove(userId, boardName);
@@ -225,10 +346,11 @@ export class BoardCoordinator {
   destroyAll(): void {
     for (const userSessions of this.sessions.values()) {
       for (const session of userSessions.values()) {
-        session.destroy();
+        void session.destroy();
       }
     }
     this.sessions.clear();
+    this.participants.closeAll();
   }
 
   private userSessions(userId: string): Map<string, BoardSession> {

@@ -90,6 +90,7 @@ import { InjectorService, injectorDescriptor } from "./services/injector";
 import { RssService, rssDescriptor } from "./services/rss";
 import { AssetService, assetDescriptor } from "./services/asset";
 import {
+  boardSpace,
   contextFromWire,
   HostedRuntime,
   RuntimeApp,
@@ -116,12 +117,20 @@ import {
   RuntimeNotification,
   ServiceConfiguration,
 } from "./types";
-import { readSecretsPayload } from "./secrets";
+import { readSecretsPayload, referencedSecrets } from "./secrets";
 import {
   AssetDescriptor,
   DEFAULT_MAX_INLINE_ASSET_BYTES,
   readAssetsPayload,
 } from "./assets";
+import {
+  CoordinatorLinks,
+  CoordinatorLinksOptions,
+  LinkedRuntime,
+  LinkStore,
+  createFileLinkStore,
+  createMemoryLinkStore,
+} from "./coordinatorLinks";
 
 /**
  * Per-tenant limits. Runtimes, services and timers all consume resources on a
@@ -245,7 +254,18 @@ type CreateRuntimeServerOptions = {
    * `index.ts` persists one so a webhook configured elsewhere keeps working.
    */
   mountSecret?: string;
+  /**
+   * Where the tickets this server connects to coordinators with are kept, or a
+   * store to use as given. Absent or empty means memory: the links work, and
+   * are not re-established after a restart.
+   */
+  coordinatorLinks?: LinkStore | string;
+  /** Timing of those connections; the defaults suit a real deployment. */
+  coordinatorLinkOptions?: CoordinatorLinksOptions;
 };
+
+/** Refused for being over a per-tenant limit; carries what to tell the caller. */
+class QuotaError extends Error {}
 
 /** A coordinator session token, bound to the user it was minted for and the
  *  runtime it grants access to. */
@@ -608,9 +628,12 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
 
   const runtimeApp = new RuntimeApp(
     factories,
-    (owner, runtimeId) => ({
+    (owner, runtimeId, space) => ({
       mount: (serviceUuid, handlers, options) =>
-        mounts.register(owner, runtimeId, serviceUuid, handlers, options),
+        mounts.register(owner, runtimeId, serviceUuid, handlers, {
+          ...options,
+          space,
+        }),
     }),
     // A `file://` asset is a file in one of the tenant's volumes —
     // `file:///<volume>/<path>` — read through the same store and the same
@@ -777,6 +800,20 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
 
   // Tear a runtime down and drop any session tokens it issued, so a dead
   // runtime's tokens can't linger as valid credentials.
+  /** Removes a board's runtime; nothing a client created is touched. */
+  function removeLinkedRuntime(linked: LinkedRuntime): void {
+    const space = boardSpace(linked.owner, linked.boardName);
+    runtimeApp.removeRuntime(space, linked.runtimeId);
+    mounts.releaseRuntime(space, linked.runtimeId);
+  }
+
+  function linkedRuntime(linked: LinkedRuntime): HostedRuntime | undefined {
+    return runtimeApp.getRuntime(
+      boardSpace(linked.owner, linked.boardName),
+      linked.runtimeId,
+    );
+  }
+
   function removeRuntimeAndSessions(owner: string, runtimeId: string): void {
     runtimeApp.removeRuntime(owner, runtimeId);
     mounts.releaseRuntime(owner, runtimeId);
@@ -787,6 +824,255 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
     }
   }
 
+  /**
+   * Builds a runtime for a tenant, replacing anything under that id, and wires
+   * what it says to whoever is listening.
+   *
+   * A runtime a client asked for lives in the tenant's own space and speaks to
+   * the sockets watching it. One built for a coordinator (`linked`) lives in
+   * its board's space and speaks to that coordinator; see `boardSpace`.
+   *
+   * Provisioning creates. Attaching to a runtime that is already running is a
+   * different intent and has its own verb — GET /runtimes/:id, which a client
+   * uses before posting when it means "take back over" rather than "build
+   * this".
+   *
+   * Replacing rather than reusing matters most for the flag the config
+   * carries: reusing would keep the *old* runtime's lifecycle, so a board
+   * deployed to a coordinator could inherit a browser's "clean me up when I
+   * disconnect" and vanish when that browser closed.
+   */
+  function provisionRuntime(
+    owner: string,
+    config: RuntimeConfiguration,
+    linked?: LinkedRuntime,
+  ): HostedRuntime {
+    const space = linked ? boardSpace(linked.owner, linked.boardName) : owner;
+    const replacing = runtimeApp.getRuntime(space, config.id);
+
+    // Quotas apply only to genuinely new runtimes — replacing one that already
+    // exists must never be refused for being over the limit.
+    if (
+      !replacing &&
+      atQuota(runtimeApp.countRuntimes(owner), quotas.maxRuntimesPerUser)
+    ) {
+      throw new QuotaError(
+        `Runtime limit reached (${quotas.maxRuntimesPerUser})`,
+      );
+    }
+    if (exceedsQuota(config.services.length, quotas.maxServicesPerRuntime)) {
+      throw new QuotaError(
+        `Service limit reached (${quotas.maxServicesPerRuntime})`,
+      );
+    }
+
+    const runtime = runtimeApp.createRuntime(owner, config, space);
+    if (linked) {
+      runtime.registerNotificationTarget((notification) => {
+        coordinatorLinks.emit(linked, {
+          type: "notification",
+          serviceUuid: notification.instanceId,
+          payload: notification.payload,
+        });
+      });
+      runtime.registerLogTarget((entry) => {
+        coordinatorLinks.emit(linked, { type: "log", entry });
+      });
+      runtime.registerResultTarget((result) => {
+        coordinatorLinks.emit(linked, { type: "result", data: result });
+      });
+      return runtime;
+    }
+    const socketKey = tenantKey(owner, runtime.id);
+    runtime.registerNotificationTarget((notification) => {
+      sendJsonNotification(socketKey, notification);
+    });
+    runtime.registerLogTarget((entry) => {
+      sendJsonLog(socketKey, entry);
+    });
+    runtime.registerResultTarget((result) => {
+      const sockets = runtimeSockets.get(socketKey);
+      if (!sockets) return;
+      for (const socket of sockets) {
+        sendJsonResult(socket, result);
+      }
+    });
+    return runtime;
+  }
+
+  /**
+   * What a coordinator may do here, over a connection this server opened to
+   * it: the operations on one runtime, as the tenant who introduced the link.
+   * The same things the REST routes below do for a caller holding a token.
+   */
+  const coordinatorLinks = new CoordinatorLinks(
+    {
+      kind: RUNTIME_SERVER_KIND,
+      registry: () => runtimeApp.getRegistry(),
+      runtimeExists: (linked) => !!linkedRuntime(linked),
+      provision: (linked, payload, secrets) => {
+        const config = validateRuntimeConfiguration({
+          id: linked.runtimeId,
+          name: payload.name,
+          boardName: payload.boardName,
+          // The coordinator's until it says otherwise: a deployed board keeps
+          // running with nobody watching.
+          garbageCollected: false,
+          state: payload.state,
+          services: payload.services,
+          assets: payload.assets,
+        });
+        if (!config) {
+          throw new Error("The board's description of this runtime is malformed");
+        }
+        // The values this server was handed for the runtime, by the person's
+        // own client. They do not come from the coordinator and never go to it.
+        config.secrets = secrets;
+        const runtime = provisionRuntime(linked.owner, config, linked);
+        const held = new Set(runtime.secrets().aliases());
+        const missingSecrets = referencedSecrets(
+          config.services.map((service) => service.state),
+        ).filter((alias) => !held.has(alias));
+        return {
+          registry: runtimeApp.getRegistry(),
+          services: runtime.listServices(),
+          missingSecrets,
+        };
+      },
+      describe: (linked) => {
+        const runtime = linkedRuntime(linked);
+        return runtime ? { services: runtime.listServices() } : null;
+      },
+      configureService: async (linked, serviceUuid, config) => {
+        const runtime = linkedRuntime(linked);
+        if (!runtime) {
+          throw new Error("the runtime is not running");
+        }
+        if (!isJsonRecord(config)) {
+          throw new Error("a service is configured with an object");
+        }
+        if (!runtime.configureService(serviceUuid, config)) {
+          throw new Error(`no service "${serviceUuid}"`);
+        }
+        return waitForServiceActivationState(runtime, serviceUuid);
+      },
+      setState: (linked, state) => {
+        const runtime = linkedRuntime(linked);
+        if (!runtime) {
+          throw new Error("the runtime is not running");
+        }
+        return applyRuntimeState(runtime, state);
+      },
+      remove: (linked) => removeLinkedRuntime(linked),
+      process: async (linked, params, context) => {
+        const runtime = linkedRuntime(linked);
+        if (!runtime) {
+          throw new Error("the runtime is not running");
+        }
+        return runtime.process(
+          params,
+          () => {
+            // Notifications are broadcast through runtime notification targets.
+          },
+          // The coordinator names the run its call belongs to, so that a board
+          // spanning several runtimes reads as one trace.
+          contextFromWire(context),
+        );
+      },
+    },
+    typeof options.coordinatorLinks === "string"
+      ? options.coordinatorLinks
+        ? createFileLinkStore(options.coordinatorLinks)
+        : createMemoryLinkStore()
+      : (options.coordinatorLinks ?? createMemoryLinkStore()),
+    options.coordinatorLinkOptions,
+  );
+
+  /** Applies the parts of a runtime's state that can change while it runs. */
+  function applyRuntimeState(runtime: HostedRuntime, state: JsonRecord) {
+    if (typeof state.logging === "boolean") {
+      runtime.setLogging(state.logging);
+    }
+    if (isLogLevel(state.logLevel)) {
+      runtime.setLogLevel(state.logLevel);
+    }
+    if (typeof state.logData === "boolean") {
+      runtime.setLogData(state.logData);
+    }
+    return {
+      logging: runtime.getLogging(),
+      logData: runtime.getLogData(),
+      logLevel: runtime.getLogLevel(),
+    };
+  }
+
+  /**
+   * Introduces this server to a coordinator, for one runtime of one board.
+   *
+   * Called by the person's own client while it deploys a board: it has asked
+   * the coordinator for a ticket and passes it on, over the same session it
+   * creates runtimes here with. This server then connects to the coordinator —
+   * the coordinator connects to nothing — and keeps the ticket to reconnect
+   * with.
+   *
+   * The address dialled is one the caller chose, and the caller is someone this
+   * server already runs services for; nothing here can be made to reach further
+   * than they could with a service of their own.
+   *
+   * `secrets` are the values for the references that runtime's services carry.
+   * They are handed to the runtime when the coordinator builds it, and are not
+   * sent to the coordinator.
+   */
+  expressApp.post("/coordinator-links", async (req, res) => {
+    const body = req.body as Record<string, unknown> | undefined;
+    if (
+      !isJsonRecord(body) ||
+      typeof body.coordinatorUrl !== "string" ||
+      typeof body.ticket !== "string" ||
+      typeof body.boardName !== "string" ||
+      typeof body.runtimeId !== "string" ||
+      !body.coordinatorUrl ||
+      !body.ticket ||
+      !body.boardName ||
+      !body.runtimeId
+    ) {
+      res.sendStatus(400);
+      return;
+    }
+    try {
+      await coordinatorLinks.introduce(
+        {
+          owner: ownerKeyOf(req.authenticatedUser),
+          boardName: body.boardName,
+          runtimeId: body.runtimeId,
+          coordinatorUrl: body.coordinatorUrl,
+          ticket: body.ticket,
+        },
+        readSecretsPayload(body.secrets),
+      );
+      res.status(201).json({ connected: true });
+    } catch (err) {
+      res.status(502).json({
+        error: err instanceof Error ? err.message : "Could not connect",
+      });
+    }
+  });
+
+  /** The caller's links: which runtimes belong to which board, never a ticket. */
+  expressApp.get("/coordinator-links", (req, res) => {
+    res.json({ links: coordinatorLinks.list(ownerKeyOf(req.authenticatedUser)) });
+  });
+
+  /** Leaves a board: drops the link and the runtime it was for. */
+  expressApp.delete("/coordinator-links/:boardName/:runtimeId", (req, res) => {
+    const removed = coordinatorLinks.remove({
+      owner: ownerKeyOf(req.authenticatedUser),
+      boardName: req.params.boardName,
+      runtimeId: req.params.runtimeId,
+    });
+    res.sendStatus(removed ? 200 : 404);
+  });
+
   expressApp.get("/runtimes", (req, res) => {
     res.json({
       runtimes: tenantOf(req)
@@ -795,6 +1081,15 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
       // The service registry is a property of the build, not of a tenant.
       registry: runtimeApp.getRegistry(),
       server: RUNTIME_SERVER_KIND,
+      // This server can connect to a coordinator when introduced to one; see
+      // POST /coordinator-links. Said here so a client can tell before it
+      // deploys a board that needs it.
+      coordinatorLinks: true,
+      // A runtime built for a coordinator is kept apart from the ones a client
+      // creates, so a client deleting its own does not delete a deployed
+      // board's. A client checks for this before it deploys: against a server
+      // that keeps them together, leaving the board it deployed would stop it.
+      boardRuntimes: true,
     });
   });
 
@@ -820,7 +1115,6 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
     }
 
     const owner = ownerKeyOf(req.authenticatedUser);
-    const tenant = tenantOf(req);
     const payloads = Array.isArray(req.body) ? req.body : [req.body];
     const runtimes: ReturnType<typeof serializeRuntime>[] = [];
 
@@ -831,50 +1125,15 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
         return;
       }
 
-      // POST provisions: it creates the runtime, replacing anything under that
-      // id. Attaching to a runtime that is already running is a different
-      // intent and has its own verb — GET /runtimes/:id, which a client uses
-      // before posting when it means "take back over" rather than "build this".
-      //
-      // Replacing rather than reusing matters most for the flag the payload
-      // carries: reusing would keep the *old* runtime's lifecycle, so a board
-      // deployed to a coordinator could inherit a browser's "clean me up when I
-      // disconnect" and vanish when that browser closed.
-      const replacing = tenant.getRuntime(config.id);
-
-      // Quotas apply only to genuinely new runtimes — replacing one that
-      // already exists must never be refused for being over the limit.
-      if (!replacing && atQuota(tenant.getRuntimes().length, quotas.maxRuntimesPerUser)) {
-        res.status(429).json({
-          error: `Runtime limit reached (${quotas.maxRuntimesPerUser})`,
-        });
-        return;
-      }
-      if (
-        exceedsQuota(config.services.length, quotas.maxServicesPerRuntime)
-      ) {
-        res.status(429).json({
-          error: `Service limit reached (${quotas.maxServicesPerRuntime})`,
-        });
-        return;
-      }
-
-      const runtime = tenant.createRuntime(config);
-      const socketKey = tenantKey(owner, runtime.id);
-      runtime.registerNotificationTarget((notification) => {
-        sendJsonNotification(socketKey, notification);
-      });
-      runtime.registerLogTarget((entry) => {
-        sendJsonLog(socketKey, entry);
-      });
-      runtime.registerResultTarget((result) => {
-        const sockets = runtimeSockets.get(socketKey);
-        if (!sockets) return;
-        for (const socket of sockets) {
-          sendJsonResult(socket, result);
+      try {
+        runtimes.push(serializeRuntime(provisionRuntime(owner, config)));
+      } catch (err) {
+        if (err instanceof QuotaError) {
+          res.status(429).json({ error: err.message });
+          return;
         }
-      });
-      runtimes.push(serializeRuntime(runtime));
+        throw err;
+      }
     }
 
     res.json({
@@ -1049,20 +1308,7 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
       res.sendStatus(400);
       return;
     }
-    if (typeof req.body.logging === "boolean") {
-      runtime.setLogging(req.body.logging);
-    }
-    if (isLogLevel(req.body.logLevel)) {
-      runtime.setLogLevel(req.body.logLevel);
-    }
-    if (typeof req.body.logData === "boolean") {
-      runtime.setLogData(req.body.logData);
-    }
-    res.json({
-      logging: runtime.getLogging(),
-      logData: runtime.getLogData(),
-      logLevel: runtime.getLogLevel(),
-    });
+    res.json(applyRuntimeState(runtime, req.body));
   });
 
   expressApp.get("/runtimes/:runtimeId/inputs", (req, res) => {
@@ -1263,7 +1509,8 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
     },
   );
 
-  const bridgeWsServer = new WebSocketServer({ noServer: true });
+  // No ceiling of the library's own; see attachCoordinatorJoin.
+  const bridgeWsServer = new WebSocketServer({ noServer: true, maxPayload: 0 });
   let bridgeUpgradeHandler:
     | ((ws: WebSocket, user: AuthenticatedUser) => void)
     | undefined;
@@ -1277,6 +1524,14 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
     socket.destroy();
   }
 
+  // Upgrade paths that authenticate their own callers, by exact path. A
+  // coordinator's join endpoint is one: what connects there holds a ticket,
+  // not a user's token.
+  const upgradeRoutes = new Map<
+    string,
+    (request: http.IncomingMessage, socket: Duplex, head: Buffer) => void
+  >();
+
   httpServer.on("upgrade", (request, socket, head) => {
     // Mounts are matched first and are not token-authenticated, for the same
     // reason their HTTP requests are not: the callers are outside parties.
@@ -1286,6 +1541,12 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
 
     // Protocol is irrelevant — base is only needed to resolve the relative path.
     const url = new URL(request.url ?? "/", `http://${request.headers.host}`);
+
+    const upgradeRoute = upgradeRoutes.get(url.pathname);
+    if (upgradeRoute) {
+      upgradeRoute(request, socket, head);
+      return;
+    }
 
     // Authenticate every upgrade with the same rules as HTTP routes. Browsers
     // can't set headers on a WS handshake, so the token rides in ?access_token=.
@@ -1415,6 +1676,19 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
     expressApp,
     httpServer,
     runtimeApp,
+    coordinatorLinks,
+    /** Serves WebSocket upgrades on a path with a handler that does its own
+     *  authentication, ahead of the token check every other upgrade gets. */
+    addUpgradeRoute(
+      pathname: string,
+      handler: (
+        request: http.IncomingMessage,
+        socket: Duplex,
+        head: Buffer,
+      ) => void,
+    ) {
+      upgradeRoutes.set(pathname, handler);
+    },
     async start(port = 0, host = options.host ?? "127.0.0.1") {
       await new Promise<void>((resolve, reject) => {
         httpServer.once("error", reject);
@@ -1437,6 +1711,7 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
       bridgeUpgradeHandler = handler;
     },
     async stop() {
+      coordinatorLinks.stop();
       for (const sockets of runtimeSockets.values()) {
         for (const socket of sockets) {
           socket.close();

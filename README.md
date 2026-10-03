@@ -49,8 +49,6 @@ All options are passed as environment variables.
 | `AUTH0_AUDIENCE`             | —           | Accepted `aud` values, comma-separated — the Auth0 client id of each application whose users this runtime serves (the frontend sends its id_token). **Required** to start.               |
 | `ALLOWED_EMAILS`             | —           | Comma-separated email allowlist. When set, only tokens with a **verified** `email` claim on the list are accepted; requires Auth0 config (refuses to start without it).                 |
 | `ALLOW_NO_AUTH`              | —           | Set to `true` to run **without authentication**. Only honoured for a local source checkout; the published npm package ignores it. Local development only.                               |
-| `HKP_RUNTIME_URL_ALLOWLIST`  | —           | Comma-separated `host` or `host:port` list. When set, the coordinator may only dial runtimes whose host is listed (strict allowlist; recommended for shared/exposed coordinators).      |
-| `HKP_ALLOW_PRIVATE_RUNTIMES` | —           | Set to `true` to let the coordinator dial loopback/private (RFC1918/ULA) runtime URLs. Needed for local or self-hosted internal runtimes. Link-local/metadata stays blocked regardless. |
 | `NAME`                       | `hkp-node`  | Server name reported to clients                                                                                                                                                         |
 | `HKP_MAX_RUNTIMES_PER_USER`  | —           | Maximum runtimes one tenant may hold. Unset or `0` means unlimited. Reconnecting to a runtime that already exists is never refused.                                                      |
 | `HKP_MAX_SERVICES_PER_RUNTIME` | —         | Maximum services per runtime. Unset or `0` means unlimited.                                                                                                                             |
@@ -58,6 +56,8 @@ All options are passed as environment variables.
 | `HKP_MAX_INLINE_ASSET_BYTES` | `8388608`   | Largest content one asset may carry inline as `text` or `base64` (8 MB); larger content is named by URL.                                                                                 |
 | `HKP_MAX_ASSET_REQUEST_BODY_BYTES` | `33554432` | Largest body of a request that carries asset descriptors — creating a runtime, pushing assets, deploying a board (32 MB) — accepted only from an authenticated caller. It bounds how much inline content one runtime, or one deployed board, may be handed at once, counted as it travels (base64, JSON-escaped). Left unset it is never less than one asset at the inline limit needs. |
 | `HKP_MAX_REQUEST_BODY_BYTES` | `26214400`  | Largest request body accepted on a service endpoint (25 MB). Oversized requests get `413`. Set `0` to disable — unwise, since these endpoints take no token.                             |
+| `HKP_COORDINATOR_LINKS_FILE` | `~/.hkp/node/coordinator-links.json` | Where this server keeps the tickets it connects to coordinators with, so a deployed board's runtimes are re-established after a restart. Set to the empty string to keep them in memory only. Written `0600`: a ticket is a bearer credential for one runtime of one board. |
+| `HKP_COORDINATOR_MAX_FRAME_BYTES` | —      | Coordinator only. The largest single frame a runtime server or an attached browser may send that is passed on — in practice, the largest value one runtime may hand the next. Unset means no limit. A larger frame is dropped and recorded in the board's log as `frame-dropped`; the connection stays up. |
 | `HKP_COORDINATOR_DATA_DIR`   | `~/.hkp/coordinator/boards` | Where the coordinator keeps the boards it has been given, one JSON file each, so they survive a restart. Set to the empty string to keep them in memory only. Files hold the board's config — which can carry service credentials — and are written `0600` under `0700` directories. One directory belongs to one coordinator: two processes sharing it will both restore every board and fight over the same runtimes. |
 
 ### Authentication
@@ -175,69 +175,29 @@ hkp-node, so nothing in-tree broke, but your own boards may need the same edit.
 Note hkp-rt's `http-server-subservices` still emits the flat shape — the two runtimes are
 temporarily out of step until that side is updated.
 
-**Coordinator → runtime (delegated session tokens).** The coordinator reaches runtimes as a
-machine client over long-lived connections, so it can't use a user JWT (those expire and the
-user may be offline). Instead, while the user is creating/modifying a board the coordinator
-provisions runtimes **with the user's JWT**, then exchanges it via `POST
-/runtimes/:id/session-token` for an opaque, per-runtime **session token** that resolves back to
-that user. The coordinator presents this token (in the `Authorization` header) on its result
-WebSocket and teardown calls. Tokens are in-memory only and bound to the runtime's lifetime: if a
-runtime restarts, the coordinator must re-provision, which needs a live user JWT — so boards
-don't self-heal across a runtime restart while the user is offline (persisting these bindings is
-future work). There is no shared static service secret.
+**Runtime server → coordinator (tickets).** A coordinator never dials a runtime server. When a
+board is deployed, the person's client asks the coordinator for a **ticket** per remote runtime
+(`POST /coordinator/users/:sub/boards/:board/tickets`) and tells each runtime server to connect
+with it (`POST /coordinator-links`, over the same session it creates runtimes with). The runtime
+server then opens a WebSocket to the coordinator's `/coordinator/join`, presenting the ticket as
+a bearer token, and the coordinator builds, configures and drives that runtime over the
+connection that came in.
 
-**SSRF guard.** A board config is untrusted input (boards can be shared/imported), and it tells
-the coordinator which `runtime.url` to dial from inside its network. The coordinator validates
-every such URL (resolving the host and checking all addresses): link-local / cloud-metadata
-(`169.254.169.254`) and the unspecified address are always blocked, and loopback/private ranges
-are blocked unless allowed via `HKP_ALLOW_PRIVATE_RUNTIMES` or `HKP_RUNTIME_URL_ALLOWLIST`. For
-local/self-hosted runtimes (including the single-box setup), set `HKP_ALLOW_PRIVATE_RUNTIMES=true`.
+- A ticket speaks for **one runtime of one board of one person**. The connection can do nothing
+  else, and acts on the runtime server as the user who introduced it.
+- The coordinator keeps only a hash; the runtime server keeps the ticket
+  (`HKP_COORDINATOR_LINKS_FILE`) and reconnects with it after a restart or a dropped connection,
+  with nobody present. The coordinator then rebuilds the runtime from the board's config.
+- Deploying again replaces a runtime's ticket; deleting the board, or deploying it without that
+  runtime, revokes it. A runtime server whose ticket is no longer held drops the link and the
+  runtime it was for.
+- Because nothing is dialled on a board's say-so, there is no address allowlist to maintain and no
+  SSRF surface on this path: `HKP_RUNTIME_URL_ALLOWLIST` and `HKP_ALLOW_PRIVATE_RUNTIMES` no longer
+  exist. A runtime server on a laptop behind NAT, or on loopback, joins like any other — the only
+  thing that has to be reachable is the coordinator.
 
-#### `HKP_RUNTIME_URL_ALLOWLIST` in detail
-
-**What it guards.** This variable constrains a single, specific outbound path: the URLs the
-**coordinator dials when it provisions runtimes**. Those URLs come from the `runtime.url` fields
-of a board config, which is untrusted (boards are shared and imported). It has nothing to do with
-the clients that _connect to_ the coordinator — browsers and the Readymade app register **inbound**
-over a WebSocket bridge, so they are never dialed and never need an allowlist entry. In other
-words, the entries you list are the **runtime backend hosts the coordinator is permitted to reach**,
-resolved from the coordinator's own network vantage point (a `runtime.url` of `127.0.0.1` means the
-_coordinator's_ loopback, not a client's machine).
-
-**Default (variable unset).** The coordinator may dial any **public** host. Link-local and
-cloud-metadata addresses (`169.254.169.254`, `::`, etc.) are **always blocked**. Loopback and
-private ranges (RFC1918 / IPv6 ULA) are blocked unless you also set `HKP_ALLOW_PRIVATE_RUNTIMES=true`.
-
-**When set.** It becomes a **strict allowlist**: the coordinator may dial _only_ the listed hosts —
-even otherwise-public hosts that are not listed are rejected. A listed host is also allowed to
-resolve to a loopback/private address (you, the operator, vouched for it), so listing a host
-implicitly permits it regardless of `HKP_ALLOW_PRIVATE_RUNTIMES`. Link-local/metadata stays blocked
-no matter what.
-
-**Matching rules.**
-
-- Comma-separated; entries are trimmed and compared **case-insensitively**.
-- Each entry is either a bare `host` or a `host:port`.
-- A bare `host` entry matches that host on **any** port.
-- A `host:port` entry matches **only** when the URL carries that **explicit** port. Note that a URL
-  using a scheme default (e.g. `https://node.example.com` with no `:443`) has _no_ explicit port, so
-  a `node.example.com:443` entry would **not** match it — list the bare host in that case.
-- Matching is on the host/port only; scheme and path are not considered (beyond the scheme having to
-  be `http`/`https`/`ws`/`wss`).
-
-**Examples.**
-
-```sh
-# Cloud coordinator: only ever dial our two known runtime backends (any port).
-HKP_RUNTIME_URL_ALLOWLIST=node.example.com,python.example.com
-
-# Permit one specific private runtime by host:port, without opening all of RFC1918.
-# (Listing it also waives the private-range block for that host — no HKP_ALLOW_PRIVATE_RUNTIMES needed.)
-HKP_RUNTIME_URL_ALLOWLIST=10.0.5.12:8080
-
-# Pin a backend to a single non-default port only.
-HKP_RUNTIME_URL_ALLOWLIST=runtime.internal:9443
-```
+`POST /runtimes/:id/session-token` still exists on the runtime server but the coordinator no
+longer uses it.
 
 **Loopback bind = no auth required.** When `HOST` is a loopback address (`127.0.0.1`, `::1`,
 `localhost`), the server is reachable only from the local machine, so the loopback bind is

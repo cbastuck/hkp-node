@@ -23,7 +23,7 @@ import { createFileDatabaseStore } from "../src/services/database";
 
 const run = promisify(execFile);
 const WORKER = path.join(__dirname, "database-processes.ts");
-const TSX = path.join(__dirname, "..", "node_modules", ".bin", "tsx");
+const TSX = path.join(__dirname, "..", "node_modules", "tsx", "dist", "cli.mjs");
 
 let root = "";
 
@@ -36,7 +36,18 @@ afterEach(() => {
 });
 
 function writer(tag: string, writes: number) {
-  return run(TSX, [WORKER, root, "tester", "shared-by-two", tag, String(writes)]);
+  // Use the exact Node running Vitest. The `.bin/tsx` shim resolves `node`
+  // through PATH instead, which can silently launch an older system Node that
+  // does not provide node:sqlite even though the suite itself runs on Node 22.
+  return run(process.execPath, [
+    TSX,
+    WORKER,
+    root,
+    "tester",
+    "shared-by-two",
+    tag,
+    String(writes),
+  ]);
 }
 
 describe("two processes over one named database", () => {

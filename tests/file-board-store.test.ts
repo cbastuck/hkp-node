@@ -67,6 +67,34 @@ describe("keeping a board", () => {
     expect(await store.load()).toEqual([board("doorbell")]);
   });
 
+  it("keeps whether a board was stopped and what recognises its tickets", async () => {
+    // What lets a board run again after a restart with nobody present.
+    const store = createFileBoardStore(await freshRoot());
+    const tickets = [
+      { runtimeId: "node", hash: "ab".repeat(32), issuedAt: "2026-01-02T00:00:00.000Z" },
+    ];
+    await store.save(board("doorbell", { stopped: true, tickets }));
+
+    const [held] = await store.load();
+
+    expect(held.stopped).toBe(true);
+    expect(held.tickets).toEqual(tickets);
+  });
+
+  it("drops a ticket entry that is not one, rather than the board", async () => {
+    const store = createFileBoardStore(await freshRoot());
+    await store.save(
+      board("doorbell", {
+        tickets: [{ runtimeId: "node" } as never, "junk" as never],
+      }),
+    );
+
+    const [held] = await store.load();
+
+    expect(held.boardName).toBe("doorbell");
+    expect(held.tickets).toEqual([]);
+  });
+
   it("replaces the board of the same name rather than adding another", async () => {
     const root = await freshRoot();
     const store = createFileBoardStore(root);

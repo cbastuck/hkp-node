@@ -1,13 +1,14 @@
-import request from "supertest";
 import { afterEach, describe, expect, it } from "vitest";
 
-// The runtimes in these tests are on loopback, which the SSRF guard blocks by
-// default. Set before anything reads the policy (it is cached on first read).
-process.env.HKP_ALLOW_PRIVATE_RUNTIMES = "true";
-
-import { createRuntimeServer } from "../src/server";
-import { BoardCoordinator } from "../src/coordinator/coordinator";
 import { assetDescriptor } from "../src/services/asset";
+import {
+  CoordinatorHost,
+  RuntimeServer,
+  boardRuntime,
+  deploy as deployBoard,
+  startCoordinator,
+  startRuntimeServer,
+} from "./cloud";
 
 /**
  * A deployed board's assets reach the runtimes a coordinator provisions.
@@ -18,12 +19,12 @@ import { assetDescriptor } from "../src/services/asset";
  * because which asset a service uses can be decided while the board runs.
  */
 
-const servers: Array<ReturnType<typeof createRuntimeServer>> = [];
-const coordinators: BoardCoordinator[] = [];
+const servers: RuntimeServer[] = [];
+const hosts: CoordinatorHost[] = [];
 
 afterEach(async () => {
-  while (coordinators.length) {
-    coordinators.pop()?.destroyAll();
+  while (hosts.length) {
+    await hosts.pop()?.stop();
   }
   while (servers.length) {
     await servers.pop()?.stop();
@@ -36,38 +37,38 @@ describe("a deployed board's assets", () => {
     services?: Record<string, unknown[]>;
     assets: Array<Record<string, unknown>>;
   }) {
-    const server = createRuntimeServer({ externalHost: "127.0.0.1", auth: { mode: "none" } });
+    const { server } = await startRuntimeServer();
     servers.push(server);
-    const { baseUrl } = await server.start();
-    const coordinator = new BoardCoordinator();
-    coordinators.push(coordinator);
+    const host = await startCoordinator();
+    hosts.push(host);
 
     const runtimes = config.runtimes ?? [{ id: "rt-1", name: "Node" }];
-    const session = await coordinator.registerBoard("user-1", {
-      boardName: "board-1",
-      runtimes: runtimes.map((runtime) => ({ type: "rest", url: baseUrl, ...runtime })),
-      services:
-        config.services ??
-        Object.fromEntries(runtimes.map((runtime) => [runtime.id, []])),
-      assets: config.assets,
-    } as never);
+    const session = await deployBoard(
+      host,
+      "user-1",
+      {
+        boardName: "board-1",
+        runtimes: runtimes.map((runtime) => ({ type: "rest", ...runtime })),
+        services:
+          config.services ??
+          Object.fromEntries(runtimes.map((runtime) => [runtime.id, []])),
+        assets: config.assets,
+      } as never,
+      Object.fromEntries(runtimes.map((runtime) => [runtime.id, server])),
+    );
     expect(session.getErrors()).toEqual([]);
 
-    /** The ids a runtime holds: what a push answers with, here a push of nothing. */
-    const held = async (runtimeId: string): Promise<string[]> => {
-      const { body } = await request(server.httpServer)
-        .post(`/runtimes/${runtimeId}/assets`)
-        .send({})
-        .expect(200);
-      return [...body.ids].sort();
-    };
-    return { server, held };
+    const runtimeOf = (runtimeId: string) => boardRuntime(server, runtimeId)!;
+    /** The ids a runtime holds. */
+    const held = (runtimeId: string): string[] =>
+      [...runtimeOf(runtimeId).assets().ids()].sort();
+    return { runtimeOf, held };
   }
 
   it("are all given to a runtime, named by one of its services or not", async () => {
     // Nothing on the runtime names `night`: which asset the service emits is
     // decided by what reaches it while the board runs.
-    const { server, held } = await deploy({
+    const { runtimeOf, held } = await deploy({
       services: {
         "rt-1": [
           {
@@ -83,9 +84,10 @@ describe("a deployed board's assets", () => {
       ],
     });
 
-    expect(await held("rt-1")).toEqual(["day", "night"]);
-    const night = await request(server.httpServer).get("/runtimes/rt-1/assets/night").expect(200);
-    expect(night.body).toEqual({ ok: true, mediaType: "text/plain", size: 4 });
+    expect(held("rt-1")).toEqual(["day", "night"]);
+    const { asset } = await runtimeOf("rt-1").assets().resolve("hkp-asset://night");
+    expect(asset?.mediaType).toBe("text/plain");
+    expect(asset?.bytes.length).toBe(4);
   });
 
   it("are kept from a runtime they do not name", async () => {
@@ -101,8 +103,8 @@ describe("a deployed board's assets", () => {
       ],
     });
 
-    expect(await held("front")).toEqual(["page"]);
-    expect(await held("back")).toEqual(["ledger", "page"]);
+    expect(held("front")).toEqual(["page"]);
+    expect(held("back")).toEqual(["ledger", "page"]);
   });
 
   it("are not given to a runtime a unit contributed, which has that unit's", async () => {
@@ -114,7 +116,7 @@ describe("a deployed board's assets", () => {
       assets: [{ id: "page", mediaType: "text/plain", text: "the board's" }],
     });
 
-    expect(await held("rt-1")).toEqual(["page"]);
-    expect(await held("shop.rt")).toEqual([]);
+    expect(held("rt-1")).toEqual(["page"]);
+    expect(held("shop.rt")).toEqual([]);
   });
 });

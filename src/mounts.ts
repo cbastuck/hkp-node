@@ -45,6 +45,8 @@ export type MountHandle = {
 
 type MountRecord = {
   owner: string;
+  /** The space the runtime lives in; see `boardSpace`. */
+  space: string;
   runtimeId: string;
   serviceUuid: string;
   handlers: MountHandlers;
@@ -86,7 +88,16 @@ export const MOUNT_PREFIX = "/hosted";
  * endpoint, and renaming one mount rotates only that one.
  */
 export class MountRegistry {
-  private readonly mounts = new Map<string, MountRecord>();
+  /**
+   * Every claim to an address, oldest first. An address is derived from what
+   * the mount is called, so more than one runtime may claim the same one: a
+   * runtime rebuilt under its id claims it before the one it replaces lets
+   * go, and a board open in a client and also deployed holds two copies of
+   * each of its mounts. One claim answers — see `answering` — and the others
+   * are kept, so that releasing one leaves the address with whoever still
+   * claims it.
+   */
+  private readonly mounts = new Map<string, MountRecord[]>();
   private readonly secret: string;
 
   /**
@@ -132,7 +143,7 @@ export class MountRegistry {
     // What the mount is called, and the board's, so the address survives a
     // reload. A service that names nothing is identified by its own uuid, which
     // is stable in a board file too.
-    options: { boardName?: string; mountName?: string } = {},
+    options: { boardName?: string; mountName?: string; space?: string } = {},
   ): MountHandle | null {
     const mountId = this.deriveId(
       owner,
@@ -146,14 +157,45 @@ export class MountRegistry {
       return null;
     }
 
-    this.mounts.set(mountId, { owner, runtimeId, serviceUuid, handlers });
+    const record: MountRecord = {
+      owner,
+      space: options.space ?? owner,
+      runtimeId,
+      serviceUuid,
+      handlers,
+    };
+    this.mounts.set(mountId, [...(this.mounts.get(mountId) ?? []), record]);
     return {
       url,
       path: mountPath,
-      release: () => {
-        this.mounts.delete(mountId);
-      },
+      // This claim and no other.
+      release: () => this.drop(mountId, (claim) => claim === record),
     };
+  }
+
+  /**
+   * The claim that answers at an address: a deployed board's before a
+   * client's, and the newest of its kind. A board somebody deployed is meant
+   * to be reachable whoever else has it open, so opening it in a client
+   * neither takes its address nor, on leaving, takes the address away.
+   */
+  private answering(mountId: string): MountRecord | undefined {
+    const claims = this.mounts.get(mountId) ?? [];
+    const deployed = claims.filter((claim) => claim.space !== claim.owner);
+    return deployed.at(-1) ?? claims.at(-1);
+  }
+
+  private drop(mountId: string, gone: (claim: MountRecord) => boolean): void {
+    const claims = this.mounts.get(mountId);
+    if (!claims) {
+      return;
+    }
+    const kept = claims.filter((claim) => !gone(claim));
+    if (kept.length === 0) {
+      this.mounts.delete(mountId);
+    } else if (kept.length !== claims.length) {
+      this.mounts.set(mountId, kept);
+    }
   }
 
   /**
@@ -161,19 +203,20 @@ export class MountRegistry {
    * on destroy; this is the backstop so a torn-down runtime can never leave a
    * publicly reachable endpoint behind.
    */
-  releaseRuntime(owner: string, runtimeId: string): void {
-    for (const [mountId, record] of this.mounts) {
-      if (record.owner === owner && record.runtimeId === runtimeId) {
-        this.mounts.delete(mountId);
-      }
+  releaseRuntime(space: string, runtimeId: string): void {
+    for (const mountId of [...this.mounts.keys()]) {
+      this.drop(
+        mountId,
+        (claim) => claim.space === space && claim.runtimeId === runtimeId,
+      );
     }
   }
 
+  /** Drops the mounts of what a tenant's clients created; a deployed board's
+   *  go with its runtimes. */
   releaseOwner(owner: string): void {
-    for (const [mountId, record] of this.mounts) {
-      if (record.owner === owner) {
-        this.mounts.delete(mountId);
-      }
+    for (const mountId of [...this.mounts.keys()]) {
+      this.drop(mountId, (claim) => claim.space === owner);
     }
   }
 
@@ -184,10 +227,8 @@ export class MountRegistry {
   /** Number of live mounts for a tenant, for quota checks. */
   countForOwner(owner: string): number {
     let count = 0;
-    for (const record of this.mounts.values()) {
-      if (record.owner === owner) {
-        count += 1;
-      }
+    for (const claims of this.mounts.values()) {
+      count += claims.filter((claim) => claim.owner === owner).length;
     }
     return count;
   }
@@ -241,7 +282,7 @@ export class MountRegistry {
     const remainder = pathname.slice(MOUNT_PREFIX.length + 1);
     const slash = remainder.indexOf("/");
     const mountId = slash === -1 ? remainder : remainder.slice(0, slash);
-    const record = this.mounts.get(mountId);
+    const record = this.answering(mountId);
     if (!record) {
       return null;
     }

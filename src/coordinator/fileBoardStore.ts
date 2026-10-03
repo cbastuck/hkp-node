@@ -74,12 +74,22 @@ export function createFileBoardStore(root: string): BoardStore {
       );
       return null;
     }
-    const { userId, boardName, createdAt, config } = parsed;
+    const { userId, boardName, createdAt, config, stopped, tickets } = parsed;
     return {
       userId,
       boardName,
       createdAt,
       config: config as CloudBoardConfig,
+      stopped: typeof stopped === "boolean" ? stopped : undefined,
+      tickets: Array.isArray(tickets)
+        ? tickets.filter(
+            (ticket) =>
+              !!ticket &&
+              typeof ticket.runtimeId === "string" &&
+              typeof ticket.hash === "string" &&
+              typeof ticket.issuedAt === "string",
+          )
+        : undefined,
     };
   }
 

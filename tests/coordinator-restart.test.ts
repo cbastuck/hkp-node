@@ -5,36 +5,42 @@ import path from "node:path";
 import request from "supertest";
 import { afterEach, describe, expect, it } from "vitest";
 
-process.env.HKP_ALLOW_PRIVATE_RUNTIMES = "true";
-
-import { createRuntimeServer } from "../src/server";
 import { BoardCoordinator } from "../src/coordinator/coordinator";
 import { createFileBoardStore } from "../src/coordinator/fileBoardStore";
 import { CloudBoardConfig } from "../src/coordinator/types";
+import { createMemoryLinkStore } from "../src/coordinatorLinks";
 import { httpServerSubservicesDescriptor } from "../src/services/http-server";
+import {
+  CoordinatorHost,
+  boardRuntime,
+  OWNER,
+  RuntimeServer,
+  deploy,
+  eventually,
+  startCoordinator,
+  startRuntimeServer,
+} from "./cloud";
 
 /**
- * Restarting a coordinator.
+ * Restarting a coordinator, and restarting a runtime server.
  *
- * The boards come back; the runs do not. A restored board is a config that is
- * not running, because starting one needs the user's JWT and at boot there is
- * nobody. Its runtimes, meanwhile, are still going: the coordinator provisioned
- * them to persist, so they outlive it and nothing is left tracking them. That
- * is the state Start has to be able to walk into.
+ * Both sides keep exactly one thing about a deployed board's connection: the
+ * ticket. The runtime server keeps it to present again; the coordinator keeps
+ * what recognises it. So after either restarts, the runtime server reconnects
+ * on its own and the coordinator builds the runtime from the board's config —
+ * with nobody present, and with no user token anywhere.
+ *
+ * What does not come back is the run: a rebuilt runtime starts from the
+ * board's config, not from where the old one had got to.
  */
 
-type Server = ReturnType<typeof createRuntimeServer>;
-
-const servers: Server[] = [];
+const servers: RuntimeServer[] = [];
 const roots: string[] = [];
-const coordinators: BoardCoordinator[] = [];
+const hosts: CoordinatorHost[] = [];
 
 afterEach(async () => {
-  while (coordinators.length) {
-    const coordinator = coordinators.pop()!;
-    for (const board of coordinator.getBoards("user-1")) {
-      await coordinator.removeBoard("user-1", board.boardName);
-    }
+  while (hosts.length) {
+    await hosts.pop()?.stop();
   }
   while (servers.length) {
     await servers.pop()?.stop();
@@ -44,14 +50,12 @@ afterEach(async () => {
   }
 });
 
-async function startRuntimeServer() {
-  const server = createRuntimeServer({
-    externalHost: "127.0.0.1",
-    auth: { mode: "none" },
-  });
-  servers.push(server);
-  const { baseUrl } = await server.start();
-  return { server, baseUrl };
+async function runtimeServer(
+  options: Parameters<typeof startRuntimeServer>[0] = {},
+) {
+  const started = await startRuntimeServer(options);
+  servers.push(started.server);
+  return started;
 }
 
 async function freshRoot() {
@@ -61,17 +65,24 @@ async function freshRoot() {
 }
 
 /** A coordinator reading and writing the given directory, as a restart does. */
-async function coordinatorOn(root: string) {
+async function coordinatorOn(root: string, port?: number) {
   const coordinator = new BoardCoordinator(createFileBoardStore(root));
   await coordinator.restore();
-  coordinators.push(coordinator);
-  return coordinator;
+  const host = await startCoordinator(coordinator, port);
+  hosts.push(host);
+  return host;
 }
 
-function boardConfig(url: string): CloudBoardConfig {
+/** Stops a coordinator the way a restart does: it keeps what is on disk. */
+async function shutDown(host: CoordinatorHost) {
+  hosts.splice(hosts.indexOf(host), 1);
+  await host.stop();
+}
+
+function boardConfig(): CloudBoardConfig {
   return {
     boardName: "doorbell",
-    runtimes: [{ id: "node", name: "Node", type: "rest", url }],
+    runtimes: [{ id: "node", name: "Node", type: "rest" }],
     services: {
       node: [
         {
@@ -95,87 +106,190 @@ function boardConfig(url: string): CloudBoardConfig {
   };
 }
 
-async function publishedMount(server: Server): Promise<string> {
-  const { body } = await request(server.httpServer)
-    .get("/runtimes/node/services/http-1")
-    .expect(200);
-  return String(body.__hkpMount);
+async function publishedMount(server: RuntimeServer): Promise<string> {
+  return String(
+    boardRuntime(server, "node")?.getService("http-1")?.getState().__hkpMount,
+  );
 }
 
 describe("a coordinator that has been restarted", () => {
   it("has the board it was given, with the config it was deployed with", async () => {
     const root = await freshRoot();
-    const { baseUrl } = await startRuntimeServer();
+    const { server } = await runtimeServer();
     const first = await coordinatorOn(root);
-    await first.registerBoard("user-1", boardConfig(baseUrl));
+    await deploy(first, "user-1", boardConfig(), { node: server });
+    await shutDown(first);
 
     const second = await coordinatorOn(root);
 
-    const boards = second.getBoards("user-1");
+    const boards = second.coordinator.getBoards("user-1");
     expect(boards.map((b) => b.boardName)).toEqual(["doorbell"]);
-    expect(boards[0].config).toEqual(boardConfig(baseUrl));
+    expect(boards[0].config).toEqual(boardConfig());
   });
 
-  it("has it stopped, whatever it was doing before", async () => {
+  it("runs the board again once its runtime server reconnects, with nobody present", async () => {
     const root = await freshRoot();
-    const { baseUrl } = await startRuntimeServer();
+    const { server } = await runtimeServer();
     const first = await coordinatorOn(root);
-    await first.registerBoard("user-1", boardConfig(baseUrl));
-    expect(first.getBoards("user-1")[0].status).toBe("running");
+    await deploy(first, "user-1", boardConfig(), { node: server });
+    const address = await publishedMount(server);
+    await shutDown(first);
+
+    // Back where it was, which is what a restart is to whoever kept its address.
+    const second = await coordinatorOn(root, first.port);
+
+    await eventually(
+      () => second.coordinator.getBoards("user-1")[0].status === "running",
+      "the board to run again",
+    );
+    // Rebuilt from the board's config, under the same id — one runtime, not two
+    // — and at the address it had, so what was configured against it elsewhere
+    // still reaches it.
+    expect(
+      server.runtimeApp.getBoardRuntimes(OWNER).map((runtime) => runtime.id),
+    ).toEqual(["node"]);
+    expect(await publishedMount(server)).toBe(address);
+    expect((await fetch(address)).status).toBe(200);
+  });
+
+  it("says which runtime it is waiting for until then", async () => {
+    const root = await freshRoot();
+    const { server } = await runtimeServer();
+    const first = await coordinatorOn(root);
+    await deploy(first, "user-1", boardConfig(), { node: server });
+    await shutDown(first);
+    // The runtime server is gone too: nothing will reconnect.
+    servers.splice(servers.indexOf(server), 1);
+    await server.stop();
 
     const second = await coordinatorOn(root);
 
-    expect(second.getBoards("user-1")[0].status).toBe("stopped");
+    const [board] = second.coordinator.getBoards("user-1");
+    expect(board.status).toBe("error");
+    expect(board.errors[0]).toMatch(/Runtime "node" is not connected/);
   });
 
-  it("has not touched the runtimes, which are still running without it", async () => {
-    // Provisioned to persist, so they survive — and nothing is tracking them.
-    // The orphan is real; the point is that starting the board reclaims it.
+  it("leaves the runtimes running while it is away", async () => {
+    // Built to persist, so they outlive the coordinator. A webhook arriving in
+    // the meantime is still answered.
     const root = await freshRoot();
-    const { server, baseUrl } = await startRuntimeServer();
+    const { server } = await runtimeServer();
     const first = await coordinatorOn(root);
-    await first.registerBoard("user-1", boardConfig(baseUrl));
-    const before = await publishedMount(server);
+    await deploy(first, "user-1", boardConfig(), { node: server });
+    const address = await publishedMount(server);
 
-    await coordinatorOn(root);
+    await shutDown(first);
 
-    await request(server.httpServer).get("/runtimes/node").expect(200);
-    expect((await fetch(before)).status).toBe(200);
+    expect(boardRuntime(server, "node")).toBeTruthy();
+    expect((await fetch(address)).status).toBe(200);
   });
 
-  it("rebuilds them when the board is started, leaving no second copy", async () => {
-    // Start registers the same config, and posting a runtime id replaces what
-    // is under it — so the orphan is destroyed rather than duplicated.
+  it("keeps a stopped board stopped, and leaves its runtime server alone", async () => {
     const root = await freshRoot();
-    const { server, baseUrl } = await startRuntimeServer();
+    const { server } = await runtimeServer();
     const first = await coordinatorOn(root);
-    await first.registerBoard("user-1", boardConfig(baseUrl));
-    const orphaned = await publishedMount(server);
+    await deploy(first, "user-1", boardConfig(), { node: server });
+    await first.coordinator.stopBoard("user-1", "doorbell");
+    await shutDown(first);
 
-    const second = await coordinatorOn(root);
-    const restored = second.getBoards("user-1")[0];
-    await second.registerBoard("user-1", restored.config!);
+    const second = await coordinatorOn(root, first.port);
+    await eventually(
+      () =>
+        second.coordinator.participants.describe("user-1", "doorbell")[0]
+          ?.connected === true,
+      "the runtime server to reconnect",
+    );
 
-    const { body } = await request(server.httpServer)
-      .get("/runtimes")
-      .expect(200);
-    expect(body.runtimes.map((rt: { id: string }) => rt.id)).toEqual(["node"]);
-    expect(second.getBoards("user-1")[0].status).toBe("running");
-    // The rebuilt runtime derives the same address, so what was configured
-    // against the orphan still reaches the board that replaced it.
-    expect(await publishedMount(server)).toBe(orphaned);
-    expect((await fetch(orphaned)).status).toBe(200);
+    expect(second.coordinator.getBoards("user-1")[0].status).toBe("stopped");
+    expect(boardRuntime(server, "node")).toBeUndefined();
   });
 
   it("does not bring back a board that was deleted", async () => {
     const root = await freshRoot();
-    const { baseUrl } = await startRuntimeServer();
+    const { server } = await runtimeServer();
     const first = await coordinatorOn(root);
-    await first.registerBoard("user-1", boardConfig(baseUrl));
-    await first.removeBoard("user-1", "doorbell");
+    await deploy(first, "user-1", boardConfig(), { node: server });
+    await first.coordinator.removeBoard("user-1", "doorbell");
+    await shutDown(first);
 
     const second = await coordinatorOn(root);
 
-    expect(second.getBoards("user-1")).toEqual([]);
+    expect(second.coordinator.getBoards("user-1")).toEqual([]);
+  });
+});
+
+describe("a deployed board somebody opens", () => {
+  it("goes on answering at its address while it is open elsewhere, and after", async () => {
+    // What the playground does with a board: it builds the same runtimes
+    // under the same ids on the same server, and removes them on leaving.
+    // Their endpoints derive the address the deployed board's have.
+    const root = await freshRoot();
+    const { server } = await runtimeServer();
+    const host = await coordinatorOn(root);
+    await deploy(host, "user-1", boardConfig(), { node: server });
+    const address = await publishedMount(server);
+    const config = boardConfig();
+    const copy = {
+      ...config.runtimes[0],
+      boardName: config.boardName,
+      services: config.services.node,
+    };
+
+    const opened = await request(server.httpServer)
+      .post("/runtimes")
+      .send(copy)
+      .expect(200);
+    const state = await request(server.httpServer)
+      .get("/runtimes/node/services/http-1")
+      .expect(200);
+    expect(opened.body.runtimes).toHaveLength(1);
+    expect(state.body.__hkpMount).toBe(address);
+    expect((await fetch(address)).status).toBe(200);
+
+    await request(server.httpServer).delete("/runtimes/node").expect(200);
+
+    expect((await fetch(address)).status).toBe(200);
+  });
+});
+
+describe("a runtime server that has been restarted", () => {
+  it("reconnects with the ticket it kept and is given its runtime again", async () => {
+    const root = await freshRoot();
+    const kept = createMemoryLinkStore();
+    const before = await runtimeServer({ coordinatorLinks: kept });
+    const host = await coordinatorOn(root);
+    await deploy(host, "user-1", boardConfig(), { node: before.server });
+    const session = host.coordinator.getBoard("user-1", "doorbell")!;
+
+    servers.splice(servers.indexOf(before.server), 1);
+    await before.server.stop();
+    await eventually(() => session.getStatus() === "error", "the stop to show");
+
+    const after = await runtimeServer({ coordinatorLinks: kept });
+    after.server.coordinatorLinks.restore();
+
+    await eventually(() => session.getStatus() === "running", "the rebuild");
+    expect(boardRuntime(after.server, "node")).toBeTruthy();
+    expect((await fetch(await publishedMount(after.server))).status).toBe(200);
+  });
+
+  it("forgets a ticket the coordinator no longer holds, and the runtime with it", async () => {
+    // The board was deleted while this server was away. What it kept is a
+    // ticket for nothing, and it must not go on presenting it.
+    const root = await freshRoot();
+    const kept = createMemoryLinkStore();
+    const before = await runtimeServer({ coordinatorLinks: kept });
+    const host = await coordinatorOn(root);
+    await deploy(host, "user-1", boardConfig(), { node: before.server });
+    servers.splice(servers.indexOf(before.server), 1);
+    await before.server.stop();
+    await host.coordinator.removeBoard("user-1", "doorbell");
+    expect(kept.load()).toHaveLength(1);
+
+    const after = await runtimeServer({ coordinatorLinks: kept });
+    after.server.coordinatorLinks.restore();
+
+    await eventually(() => kept.load().length === 0, "the ticket to be dropped");
+    expect(after.server.coordinatorLinks.list(OWNER)).toEqual([]);
   });
 });

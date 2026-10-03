@@ -1,25 +1,26 @@
 import http from "node:http";
 import { AddressInfo } from "node:net";
 
-import request from "supertest";
 import { WebSocket, WebSocketServer } from "ws";
 import { afterEach, describe, expect, it } from "vitest";
-
-// The runtimes in these tests are on loopback, which the SSRF guard blocks by
-// default. Set before anything reads the policy (it is cached on first read).
-process.env.HKP_ALLOW_PRIVATE_RUNTIMES = "true";
 
 import { createRuntimeServer } from "../src/server";
 import { BoardSession } from "../src/coordinator/session";
 import { BridgeMessage } from "../src/coordinator/bridgeProtocol";
 import { httpServerSubservicesDescriptor } from "../src/services/http-server";
 import { monitorDescriptor } from "../src/services/monitor";
+import {
+  boardRuntime,
+  FAST_LINKS,
+  startCoordinator,
+  startSession,
+} from "./cloud";
 
 /**
  * What a browser attaching to a cloud board is told, and what it may ask for.
  *
- * The coordinator owns the board: it provisions the remote runtimes and holds
- * their state. A browser renders from what it is sent and asks the coordinator
+ * The coordinator owns the board: it builds the remote runtimes, over the
+ * connections their runtime servers opened to it, and holds their state. A browser renders from what it is sent and asks the coordinator
  * to act on remote services, rather than dialling those runtimes itself — so a
  * board's runtimes may live somewhere the browser cannot reach. See
  * plans/TODO-CLOUD-COORDINATOR.md.
@@ -43,10 +44,31 @@ async function startRuntimeServer() {
   const server = createRuntimeServer({
     externalHost: "127.0.0.1",
     auth: { mode: "none" },
+    coordinatorLinkOptions: FAST_LINKS,
   });
   servers.push(server);
   const { baseUrl } = await server.start();
   return { server, baseUrl };
+}
+
+/** A session whose one runtime is run by `server`, connected with a ticket. */
+async function sessionOn(
+  server: Server,
+  services: Array<Record<string, unknown>>,
+) {
+  const host = await startCoordinator();
+  cleanups.push(host.stop);
+  const session = await startSession(
+    host,
+    {
+      boardName: "board-1",
+      runtimes: [{ id: "rt-1", name: "Node", type: "rest" }],
+      services: { "rt-1": services as never },
+    },
+    { "rt-1": server },
+  );
+  cleanups.push(() => session.destroy());
+  return session;
 }
 
 /**
@@ -113,26 +135,17 @@ const endpointService = {
   state: { bypass: false, mode: "process_on_session", pipeline: [] },
 };
 
-async function startBoard(baseUrl: string) {
-  const session = new BoardSession("board-1", "user-1", {
-    boardName: "board-1",
-    runtimes: [{ id: "rt-1", name: "Node", type: "rest", url: baseUrl }],
-    services: {
-      "rt-1": [
-        endpointService,
-        { uuid: "mon-1", serviceId: monitorDescriptor.serviceId },
-      ],
-    },
-  });
-  cleanups.push(() => session.destroy());
-  await session.start();
-  return session;
+async function startBoard(server: Server) {
+  return sessionOn(server, [
+    endpointService,
+    { uuid: "mon-1", serviceId: monitorDescriptor.serviceId },
+  ]);
 }
 
 describe("attaching to a cloud board", () => {
   it("is told the board without asking", async () => {
-    const { baseUrl } = await startRuntimeServer();
-    const session = await startBoard(baseUrl);
+    const { server } = await startRuntimeServer();
+    const session = await startBoard(server);
 
     const bridge = await browserBridge(session, ["ui"]);
     const snapshot = await bridge.next("snapshot");
@@ -146,28 +159,19 @@ describe("attaching to a cloud board", () => {
     // Monitor's message appears in no getState — so the browser only ever sees
     // them here. A payload is whatever the service passed on, so a plain string
     // has to travel as readily as an object.
-    const { server, baseUrl } = await startRuntimeServer();
+    const { server } = await startRuntimeServer();
     // Only the monitor: the endpoint service the other boards start with stops
     // propagation, so nothing downstream of it would see this input.
-    const session = new BoardSession("board-1", "user-1", {
-      boardName: "board-1",
-      runtimes: [{ id: "rt-1", name: "Node", type: "rest", url: baseUrl }],
-      services: {
-        "rt-1": [{ uuid: "mon-1", serviceId: monitorDescriptor.serviceId }],
-      },
-    });
-    cleanups.push(() => session.destroy());
-    await session.start();
+    const session = await sessionOn(server, [
+      { uuid: "mon-1", serviceId: monitorDescriptor.serviceId },
+    ]);
 
     const bridge = await browserBridge(session, []);
     await bridge.next("snapshot");
 
     // Run the pipeline in place: the HTTP entry point parses JSON strictly, so
     // a bare string cannot be posted through it.
-    server.runtimeApp
-      .forOwner("anonymous")
-      .getRuntime("rt-1")
-      ?.process("a plain string", () => {});
+    boardRuntime(server, "rt-1")?.process("a plain string", () => {});
 
     // The runtime also reports where a value is in the pipeline; what the
     // monitor itself said is the one carrying the value.
@@ -184,8 +188,8 @@ describe("attaching to a cloud board", () => {
   it("is told what each runtime can run", async () => {
     // Panel selection resolves by serviceId *and* version, so a browser without
     // the registry renders the wrong UI for a versioned service.
-    const { baseUrl } = await startRuntimeServer();
-    const session = await startBoard(baseUrl);
+    const { server } = await startRuntimeServer();
+    const session = await startBoard(server);
 
     const bridge = await browserBridge(session, []);
     const snapshot = await bridge.next("snapshot");
@@ -199,8 +203,8 @@ describe("attaching to a cloud board", () => {
   it("is told addresses that exist in no saved board", async () => {
     // A mount's address is assigned when the runtime is provisioned. It is the
     // reason the snapshot carries live state rather than the board's own.
-    const { baseUrl } = await startRuntimeServer();
-    const session = await startBoard(baseUrl);
+    const { server, baseUrl } = await startRuntimeServer();
+    const session = await startBoard(server);
 
     const bridge = await browserBridge(session, []);
     const snapshot = await bridge.next("snapshot");
@@ -216,8 +220,8 @@ describe("attaching to a cloud board", () => {
     // state it renders into it cannot disagree. The same config is fetchable
     // over REST, which is where the board list reads it for boards nobody has
     // attached to.
-    const { baseUrl } = await startRuntimeServer();
-    const session = await startBoard(baseUrl);
+    const { server } = await startRuntimeServer();
+    const session = await startBoard(server);
 
     const bridge = await browserBridge(session, []);
     const snapshot = await bridge.next("snapshot");
@@ -238,8 +242,8 @@ describe("attaching to a cloud board", () => {
     // What a browser does after a reconnect, or on noticing a gap in the
     // sequence: start from the board as it is rather than carry on from a stale
     // view.
-    const { baseUrl } = await startRuntimeServer();
-    const session = await startBoard(baseUrl);
+    const { server } = await startRuntimeServer();
+    const session = await startBoard(server);
 
     const bridge = await browserBridge(session, []);
     const first = await bridge.next("snapshot");
@@ -254,8 +258,8 @@ describe("stopping a board so it can be edited", () => {
   it("hands its runtimes back but keeps the board", async () => {
     // Editing takes the runtimes over, so the coordinator must let go of them —
     // without losing the board, which is only in its memory.
-    const { server, baseUrl } = await startRuntimeServer();
-    const session = await startBoard(baseUrl);
+    const { server } = await startRuntimeServer();
+    const session = await startBoard(server);
     const bridge = await browserBridge(session, []);
     const before = await bridge.next("snapshot");
     expect(before.runtimes).toHaveLength(1);
@@ -266,14 +270,13 @@ describe("stopping a board so it can be edited", () => {
     // The board is still the coordinator's, with the config it was given.
     expect((session.config.services["rt-1"] ?? []).length).toBe(2);
     // ...and its runtimes are gone from the runtime server.
-    const res = await request(server.httpServer).get("/runtimes/rt-1");
-    expect(res.status).toBe(404);
+    expect(boardRuntime(server, "rt-1")).toBeUndefined();
   });
 
   it("tells attached browsers that it stopped", async () => {
     // A viewer must not keep rendering services that are no longer running.
-    const { baseUrl } = await startRuntimeServer();
-    const session = await startBoard(baseUrl);
+    const { server } = await startRuntimeServer();
+    const session = await startBoard(server);
     const bridge = await browserBridge(session, []);
     const first = await bridge.next("snapshot");
     const seenSoFar = bridge.received.length;
@@ -289,8 +292,8 @@ describe("stopping a board so it can be edited", () => {
 
 describe("acting on a remote service", () => {
   it("configures it for the browser and answers with the result", async () => {
-    const { baseUrl } = await startRuntimeServer();
-    const session = await startBoard(baseUrl);
+    const { server } = await startRuntimeServer();
+    const session = await startBoard(server);
     const bridge = await browserBridge(session, []);
     await bridge.next("snapshot");
 
@@ -310,8 +313,8 @@ describe("acting on a remote service", () => {
   it("tells every attached browser what the new state is", async () => {
     // The one that asked already knows; a second viewer would otherwise render
     // state that is no longer true.
-    const { baseUrl } = await startRuntimeServer();
-    const session = await startBoard(baseUrl);
+    const { server } = await startRuntimeServer();
+    const session = await startBoard(server);
     const asking = await browserBridge(session, []);
     const watching = await browserBridge(session, []);
     await watching.next("snapshot");
@@ -330,8 +333,8 @@ describe("acting on a remote service", () => {
   });
 
   it("says so when the runtime is not part of this board", async () => {
-    const { baseUrl } = await startRuntimeServer();
-    const session = await startBoard(baseUrl);
+    const { server } = await startRuntimeServer();
+    const session = await startBoard(server);
     const bridge = await browserBridge(session, []);
     await bridge.next("snapshot");
 

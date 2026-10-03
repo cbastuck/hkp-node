@@ -10,6 +10,9 @@ export type CoordinatorRouterOptions = {
   auth?: AuthConfig;
 };
 
+/** A board has a handful of runtimes; this only bounds a malformed request. */
+const MAX_TICKETS_PER_REQUEST = 64;
+
 export function createCoordinatorRouter(
   options: CoordinatorRouterOptions = {},
 ): { router: Router; coordinator: BoardCoordinator } {
@@ -27,6 +30,67 @@ export function createCoordinatorRouter(
     res.json({ boards });
   });
 
+  /**
+   * Tickets for a board's runtimes: one per runtime named, each replacing the
+   * one before it.
+   *
+   * Asked for by the person's own client, which hands each ticket to the
+   * runtime server it chose for that runtime. This is the whole of how a
+   * runtime server comes to belong to a board: the coordinator is told no
+   * address and looks none up.
+   */
+  router.post(
+    "/users/:username/boards/:boardName/tickets",
+    async (req: Request, res: Response) => {
+      const { username, boardName } = req.params as Record<string, string>;
+      const runtimeIds = (req.body as { runtimeIds?: unknown } | undefined)
+        ?.runtimeIds;
+      if (
+        !Array.isArray(runtimeIds) ||
+        runtimeIds.length > MAX_TICKETS_PER_REQUEST ||
+        !runtimeIds.every((id) => typeof id === "string" && !!id)
+      ) {
+        res.sendStatus(400);
+        return;
+      }
+      const tickets = await coordinator.issueTickets(
+        username,
+        boardName,
+        runtimeIds as string[],
+      );
+      res.status(201).json({ tickets });
+    },
+  );
+
+  /**
+   * Takes back the tickets of a deploy that did not go through: the client
+   * asked for them, could not introduce every runtime server, and will not
+   * register the board. See BoardCoordinator.cancelTickets.
+   */
+  router.delete(
+    "/users/:username/boards/:boardName/tickets",
+    (req: Request, res: Response) => {
+      const { username, boardName } = req.params as Record<string, string>;
+      coordinator.cancelTickets(username, boardName);
+      res.sendStatus(204);
+    },
+  );
+
+  /**
+   * Which of a board's runtimes hold a ticket, and whether the runtime server
+   * holding it is connected. Never the tickets themselves — a coordinator
+   * keeps only what recognises one.
+   */
+  router.get(
+    "/users/:username/boards/:boardName/participants",
+    (req: Request, res: Response) => {
+      const { username, boardName } = req.params as Record<string, string>;
+      res.json({
+        participants: coordinator.participants.describe(username, boardName),
+      });
+    },
+  );
+
   router.post(
     "/users/:username/boards",
     async (req: Request, res: Response) => {
@@ -38,17 +102,7 @@ export function createCoordinatorRouter(
       }
 
       try {
-        // Forward the caller's JWT so the session can provision runtimes and
-        // mint delegated session tokens on their behalf.
-        const authHeader = req.headers.authorization;
-        const userJwt = authHeader?.startsWith("Bearer ")
-          ? authHeader.slice(7)
-          : undefined;
-        const session = await coordinator.registerBoard(
-          username,
-          config,
-          userJwt,
-        );
+        const session = await coordinator.registerBoard(username, config);
         res.status(201).json({
           boardName: session.boardName,
           status: session.getStatus(),
@@ -174,12 +228,11 @@ export function createCoordinatorRouter(
       // its place and its config, so registering that config again starts it
       // back up.
       const { username, boardName } = req.params as Record<string, string>;
-      const session = coordinator.getBoard(username, boardName);
+      const session = await coordinator.stopBoard(username, boardName);
       if (!session) {
         res.sendStatus(404);
         return;
       }
-      await session.stop();
       res.json({
         boardName: session.boardName,
         status: session.getStatus(),
