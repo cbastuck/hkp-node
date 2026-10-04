@@ -76,7 +76,7 @@ type SqlMode = "query" | "run" | "exec" | "databases" | "export" | "import";
 const MODES: SqlMode[] = ["query", "run", "exec", "databases", "export", "import"];
 
 /** The modes that run the configured statement, and need one. */
-const STATEMENT_MODES: SqlMode[] = ["query", "run"];
+const STATEMENT_MODES: SqlMode[] = ["query", "run", "exec"];
 
 /** Whether the statement's result travels onward, or the input it ran on. */
 type SqlEmit = "result" | "input";
@@ -308,7 +308,7 @@ export class SqlService implements HostedService {
 
   private execute(db: Database, input: unknown): JsonRecord {
     if (this.mode === "exec") {
-      db.exec(this.statement || this.schema);
+      db.exec(this.statement);
       this.lastCount = 0;
       return { executed: true };
     }
