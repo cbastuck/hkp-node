@@ -239,6 +239,14 @@ describe("failure", () => {
     expect(t.service.process({}, t.notify)).toBeNull();
     expect(t.service.getState().error).toContain("no statement");
   });
+
+  it("does not run the schema in place of a missing exec statement", () => {
+    // Standing in for the statement, the schema would run a second time on
+    // the first pass and again on every one after.
+    const t = serviceWith({ mode: "exec", schema: SCHEMA });
+    expect(t.service.process({}, t.notify)).toBeNull();
+    expect(t.service.getState().error).toContain("no statement");
+  });
 });
 
 describe("what counts as a parameter", () => {
