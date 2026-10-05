@@ -11,7 +11,21 @@ declare global {
   }
 }
 
+/**
+ * Who a verified token speaks for.
+ *
+ * `email` is present only when the token carries one **and** says it is
+ * verified, and is normalised the way the lists it is compared with are. An
+ * address somebody merely typed while signing up is dropped rather than
+ * carried: everything that reads it — the server's allowlist, a board's member
+ * list, a run's caller — treats it as proof of who is asking.
+ */
 export type AuthenticatedUser = { sub: string; email?: string };
+
+/** An email as the lists it is compared with keep it. */
+export function normalizeEmail(email: string): string {
+  return email.trim().toLowerCase();
+}
 
 /**
  * Owner key used when authentication is disabled. Every request collapses into
@@ -37,9 +51,10 @@ export type AuthMiddleware = (
  * How requests are authenticated.
  *
  * - `jwt`  — verify an Auth0 bearer token against the JWKS for `domain`/`audience`.
- *   When `allowedEmails` is set, the token must additionally carry a **verified**
- *   `email` claim that is on the list; any other authenticated user of the
- *   tenant is rejected.
+ *   When `allowedEmails` is set, owning anything here — a runtime, a board —
+ *   additionally takes a **verified** `email` claim that is on the list. It
+ *   gates who may own, not who may be identified: a deployed board's member
+ *   list admits people the allowlist does not name, to that board only.
  *
  *   `audience` may list several accepted values. The frontend sends its id_token,
  *   whose `aud` is the Auth0 *client id* of whichever application signed the user
@@ -80,13 +95,29 @@ export type AuthenticatorOptions = {
  * the exact same checks.
  */
 export type Authenticator = {
-  /** Express middleware for HTTP routes. Sets req.authenticatedUser on success. */
+  /**
+   * Express middleware for HTTP routes: `authorizeOwner` on the bearer token.
+   * Sets req.authenticatedUser on success.
+   */
   middleware: AuthMiddleware;
   /**
-   * Verify a raw token string (from a WebSocket `?access_token=` query param or
-   * an Authorization bearer value). Resolves to the principal or null.
+   * Who a raw token speaks for, and nothing about what they may do: signature,
+   * issuer, audience and `sub`, with the email only when it is verified. For
+   * the paths that decide access by something narrower than the server's
+   * allowlist — a deployed board's member list.
    */
-  verifyToken(token: string | undefined | null): Promise<AuthenticatedUser | null>;
+  identifyToken(
+    token: string | undefined | null,
+  ): Promise<AuthenticatedUser | null>;
+  /**
+   * `identifyToken`, then the server's allowlist: whether this person may own
+   * things here — runtimes, boards. What every route uses unless it says
+   * otherwise. The token is a raw string, from a WebSocket `?access_token=`
+   * query param or an Authorization bearer value.
+   */
+  authorizeOwner(
+    token: string | undefined | null,
+  ): Promise<AuthenticatedUser | null>;
 };
 
 /**
@@ -105,13 +136,44 @@ export function isEmailAllowed(
   if (typeof claims.email !== "string" || claims.email_verified !== true) {
     return false;
   }
-  return allowedEmails.includes(claims.email.trim().toLowerCase());
+  return allowedEmails.includes(normalizeEmail(claims.email));
+}
+
+/**
+ * The allowlist asked of somebody already identified. An identity carries an
+ * email only when it was verified, so this is `isEmailAllowed` without the
+ * claims.
+ */
+export function mayOwn(
+  user: AuthenticatedUser,
+  allowedEmails: string[] | undefined,
+): boolean {
+  if (!allowedEmails) {
+    return true;
+  }
+  return !!user.email && allowedEmails.includes(user.email);
+}
+
+/** What a token's claims say about who it speaks for, or null without a `sub`. */
+export function identityFromClaims(claims: {
+  [claim: string]: unknown;
+}): AuthenticatedUser | null {
+  const sub = typeof claims.sub === "string" ? claims.sub : null;
+  if (!sub) {
+    return null;
+  }
+  // Dropped, not refused: a person whose address is unverified can still sign
+  // in wherever no list is asked, and is simply nobody's listed member.
+  const email =
+    typeof claims.email === "string" && claims.email_verified === true
+      ? normalizeEmail(claims.email)
+      : "";
+  return { sub, ...(email ? { email } : {}) };
 }
 
 function createJwtVerifier(
   domain: string,
   audience: string | string[],
-  allowedEmails?: string[],
 ): (token: string) => Promise<AuthenticatedUser | null> {
   // An empty `audience` makes jwt.verify skip the check altogether, which would
   // accept a token minted for any application in the tenant. Refusing to build a
@@ -153,14 +215,7 @@ function createJwtVerifier(
           resolve(null);
           return;
         }
-        const sub = typeof decoded.sub === "string" ? decoded.sub : null;
-        if (!sub || !isEmailAllowed(decoded, allowedEmails)) {
-          resolve(null);
-          return;
-        }
-        const email =
-          typeof decoded.email === "string" ? decoded.email : undefined;
-        resolve({ sub, ...(email ? { email } : {}) });
+        resolve(identityFromClaims(decoded));
       });
     });
 }
@@ -178,17 +233,14 @@ export function createAuthenticator(
         req.authenticatedUser = { sub: ANONYMOUS_SUB };
         next();
       },
-      verifyToken: async () => ({ sub: ANONYMOUS_SUB }),
+      identifyToken: async () => ({ sub: ANONYMOUS_SUB }),
+      authorizeOwner: async () => ({ sub: ANONYMOUS_SUB }),
     };
   }
 
-  const verify = createJwtVerifier(
-    config.domain,
-    config.audience,
-    config.allowedEmails,
-  );
+  const verify = createJwtVerifier(config.domain, config.audience);
 
-  const verifyToken = async (
+  const identifyToken = async (
     token: string | undefined | null,
   ): Promise<AuthenticatedUser | null> => {
     if (!token) {
@@ -203,6 +255,22 @@ export function createAuthenticator(
     return verify(token);
   };
 
+  const authorizeOwner = async (
+    token: string | undefined | null,
+  ): Promise<AuthenticatedUser | null> => {
+    if (!token) {
+      return null;
+    }
+    // A session token was minted for somebody who had passed the allowlist,
+    // and carries no email to ask it of again.
+    const opaque = options.resolveOpaqueToken?.(token);
+    if (opaque) {
+      return opaque;
+    }
+    const user = await verify(token);
+    return user && mayOwn(user, config.allowedEmails) ? user : null;
+  };
+
   return {
     middleware: (req, res, next) => {
       const header = req.headers.authorization;
@@ -210,7 +278,7 @@ export function createAuthenticator(
         res.sendStatus(401);
         return;
       }
-      void verifyToken(header.slice(7)).then((user) => {
+      void authorizeOwner(header.slice(7)).then((user) => {
         if (!user) {
           res.sendStatus(401);
           return;
@@ -219,7 +287,8 @@ export function createAuthenticator(
         next();
       });
     },
-    verifyToken,
+    identifyToken,
+    authorizeOwner,
   };
 }
 

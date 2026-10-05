@@ -9,7 +9,9 @@ import { config as loadEnv } from "dotenv";
 import { createRuntimeServer } from "./server";
 import {
   BoardCoordinator,
+  SHARED_BOARDS_PATH,
   attachCoordinatorJoin,
+  createBridgeHandler,
   createCoordinatorRouter,
 } from "./coordinator";
 import { createFileBoardStore } from "./coordinator/fileBoardStore";
@@ -136,6 +138,8 @@ async function main() {
       (dataDir ? path.join(path.dirname(dataDir), "logs") : "");
     const { router: coordinatorRouter, coordinator } = createCoordinatorRouter({
       auth: authConfig,
+      // One verifier for the server and what is mounted on it.
+      authenticator: server.authenticator,
       coordinator: dataDir
         ? new BoardCoordinator(
             createFileBoardStore(dataDir),
@@ -145,6 +149,19 @@ async function main() {
               maxFrameBytes:
                 readInteger(process.env.HKP_COORDINATOR_MAX_FRAME_BYTES, 0) ||
                 undefined,
+              // What sharing a board may cost this coordinator. Unset keeps
+              // the defaults in coordinator/members.ts.
+              maxMembersPerBoard:
+                readInteger(process.env.HKP_COORDINATOR_MAX_MEMBERS, 0) ||
+                undefined,
+              maxBridgesPerMember:
+                readInteger(process.env.HKP_COORDINATOR_MAX_MEMBER_BRIDGES, 0) ||
+                undefined,
+              maxMemberProcessPerMinute:
+                readInteger(
+                  process.env.HKP_COORDINATOR_MAX_MEMBER_PROCESS_PER_MINUTE,
+                  0,
+                ) || undefined,
             },
           )
         : undefined,
@@ -164,76 +181,16 @@ async function main() {
     // Where runtime servers connect in with their tickets. The coordinator
     // reaches a board's runtimes over those connections and no other way.
     attachCoordinatorJoin(server, coordinator);
-    server.setBridgeUpgradeHandler((ws, user) => {
-      ws.once("message", (raw) => {
-        const text = raw.toString();
-        let msg: {
-          type?: string;
-          userId?: string;
-          boardName?: string;
-          runtimeIds?: string[];
-        };
-        try {
-          msg = JSON.parse(text);
-        } catch {
-          console.warn("[bridge] Failed to parse connect message — closing");
-          console.log(
-            "[bridge-close] Server initiating close: invalid JSON in initial connect message",
-          );
-          ws.close();
-          return;
-        }
-        if (msg.type !== "connect" || !msg.userId || !msg.boardName) {
-          console.warn(
-            `[bridge] Invalid connect message (type=${msg.type}, userId=${msg.userId}, boardName=${msg.boardName}) — closing`,
-          );
-          console.log(
-            `[bridge-close] Server initiating close: invalid connect payload (type=${msg.type}, userId=${msg.userId}, boardName=${msg.boardName})`,
-          );
-          ws.close();
-          return;
-        }
-        const { userId, boardName, runtimeIds = [] } = msg;
-
-        // A browser may only bridge its own board. In no-auth dev mode there is
-        // no real identity, so this is only enforced under JWT auth.
-        if (authConfig.mode === "jwt" && user.sub !== userId) {
-          console.warn(
-            `[bridge] Authenticated user "${user.sub}" may not bridge board for userId="${userId}" — closing`,
-          );
-          ws.close();
-          return;
-        }
-        // The session may not exist yet if the bridge connects before
-        // onBoardInfrastructureChange has registered the board (500 ms debounce).
-        // Poll for up to 3 s before giving up.
-        const pollForSession = (attemptsLeft: number) => {
-          if (ws.readyState !== 1 /* OPEN */) {
-            return;
-          }
-          const session = coordinator.getBoard(userId, boardName);
-          if (session) {
-            session.registerBrowserSocket(ws, runtimeIds);
-            return;
-          }
-          if (attemptsLeft <= 0) {
-            const knownBoards = coordinator
-              .getBoards(userId)
-              .map((b) => b.boardName);
-            console.warn(
-              `[bridge] No session found for userId="${userId}" boardName="${boardName}" after retries. Known: [${knownBoards.join(", ")}]`,
-            );
-            console.log(
-              `[bridge-close] Server initiating close: no session found after retries for userId="${userId}" boardName="${boardName}"`,
-            );
-            ws.close();
-            return;
-          }
-          setTimeout(() => pollForSession(attemptsLeft - 1), 100);
-        };
-        pollForSession(30);
-      });
-    });
+    // The one route of a coordinator open to somebody the server's allowlist
+    // does not name: a member asking which boards are shared with them.
+    server.addSelfAuthenticatedRoute(
+      "GET",
+      `/coordinator${SHARED_BOARDS_PATH}`,
+    );
+    // A browser attaching to a board: its owner, or somebody on its list.
+    server.setBridgeUpgradeHandler(
+      createBridgeHandler(coordinator, { authMode: authConfig.mode }),
+    );
     console.log("hkp-node coordinator enabled at /coordinator");
   }
 

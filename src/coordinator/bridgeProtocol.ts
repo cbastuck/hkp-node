@@ -13,7 +13,7 @@
  * about remote runtimes is cache — see plans/TODO-CLOUD-COORDINATOR.md.
  */
 
-import { LogEntry } from "../types";
+import { LogEntry, ProcessContext } from "../types";
 
 /** State a service last reported, keyed by service uuid. */
 export type ServiceStates = Record<string, unknown>;
@@ -49,6 +49,19 @@ export type BridgeMessage =
        * a participant dropping is something an attached browser is told.
        */
       errors: string[];
+      /**
+       * What the browser is to this board: its owner, who is sent the board
+       * whole, or a member, who is sent the facade and what the facade reads —
+       * `config` and `runtimes` are then a projection, with no board
+       * underneath to show.
+       */
+      role?: "owner" | "member";
+      /**
+       * Who the browser is to this board, as the coordinator established it:
+       * the verified address, and what the board's member list calls it. For
+       * showing somebody who they are acting as; nothing acts on it.
+       */
+      you?: { email?: string; name?: string };
       /**
        * The board as authored. Also fetchable over REST — the board list reads
        * it there for boards nobody has attached to — but sent here so that an
@@ -90,7 +103,14 @@ export type BridgeMessage =
       state: unknown;
     }
   /** Run a browser runtime's pipeline; the browser answers `result`. */
-  | { type: "processRuntime"; runtimeId?: string; params: unknown; requestId?: string }
+  | {
+      type: "processRuntime";
+      runtimeId?: string;
+      params: unknown;
+      requestId?: string;
+      /** The run this continues, for what the browser records about it. */
+      context?: ProcessContext;
+    }
   /** The answer to a `configureService` / `processService` request. */
   | { type: "response"; requestId: string; data?: unknown; error?: string }
 
@@ -103,13 +123,12 @@ export type BridgeMessage =
   /**
    * Act on a remote service on the browser's behalf.
    *
-   * Configuring is the only thing a browser asks for so far. Running a runtime
-   * is browser-initiated too — the ▶ control, a board's play action, a browser
-   * service calling another runtime by name — but whether that should proxy a
-   * runtime call or be a board-level action the coordinator owns is undecided,
-   * so it is not in the protocol until something calls it. Driving the chain
-   * from one runtime to the next is never it: that is the coordinator's own
-   * job (see routeResult).
+   * Running a whole runtime is browser-initiated too — the ▶ control, a
+   * board's play action, a browser service calling another runtime by name —
+   * but whether that should proxy a runtime call or be a board-level action
+   * the coordinator owns is undecided, so it is not in the protocol until
+   * something calls it. Driving the chain from one runtime to the next is
+   * never it: that is the coordinator's own job (see routeResult).
    */
   | {
       type: "configureService";
@@ -117,6 +136,22 @@ export type BridgeMessage =
       runtimeId: string;
       serviceUuid: string;
       config: unknown;
+    }
+  /**
+   * Ask a service on a remote runtime to do its job with a payload, running
+   * the pipeline from that service onward — what a facade's `process` action
+   * means on a deployed board. Answered with `response`: accepted, or why not.
+   * What the pipeline produces arrives as notifications, as always.
+   *
+   * The run it begins is the browser's own: its caller is whoever attached
+   * with this bridge, whatever the payload says.
+   */
+  | {
+      type: "processService";
+      requestId: string;
+      runtimeId: string;
+      serviceUuid: string;
+      payload?: unknown;
     }
   /** A result the browser produced for a `processRuntime` it was asked to run. */
   | { type: "result"; requestId: string; data?: unknown }

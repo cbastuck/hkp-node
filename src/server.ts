@@ -91,8 +91,11 @@ import { RssService, rssDescriptor } from "./services/rss";
 import { AssetService, assetDescriptor } from "./services/asset";
 import {
   boardSpace,
-  contextFromWire,
+  contextForClient,
+  contextFromLink,
+  contextToWire,
   HostedRuntime,
+  newRun,
   RuntimeApp,
   TenantRuntimes,
 } from "./runtime";
@@ -684,7 +687,17 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
   expressApp.use((req, res, next) =>
     carriesAssets(req) ? next() : controlBody(req, res, next),
   );
-  expressApp.use(authenticator.middleware);
+  // Routes that authenticate their own callers, as "METHOD /path". Every
+  // other request passes the check below, which asks the server's allowlist —
+  // and that is who may *own* things here. A route listed says who may call it
+  // by something narrower, and is named explicitly, the way `upgradeRoutes`
+  // names the join endpoint: nothing gets past this check by its shape.
+  const selfAuthenticatedRoutes = new Set<string>();
+  expressApp.use((req, res, next) =>
+    selfAuthenticatedRoutes.has(`${req.method} ${req.path}`)
+      ? next()
+      : authenticator.middleware(req, res, next),
+  );
   expressApp.use((req, res, next) =>
     carriesAssets(req) ? assetBody(req, res, next) : next(),
   );
@@ -869,17 +882,28 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
     const runtime = runtimeApp.createRuntime(owner, config, space);
     if (linked) {
       runtime.registerNotificationTarget((notification) => {
+        // Named with whoever began the run it was raised in, which is how the
+        // coordinator knows whose it is to hear. Raised outside a run — a
+        // timer, a callback — it names nobody.
+        const caller = runtime.currentContext()?.caller;
         coordinatorLinks.emit(linked, {
           type: "notification",
           serviceUuid: notification.instanceId,
           payload: notification.payload,
+          ...(caller ? { caller } : {}),
         });
       });
       runtime.registerLogTarget((entry) => {
         coordinatorLinks.emit(linked, { type: "log", entry });
       });
-      runtime.registerResultTarget((result) => {
-        coordinatorLinks.emit(linked, { type: "result", data: result });
+      runtime.registerResultTarget((result, context) => {
+        // With the run it was emitted in, so the coordinator can tell the
+        // next runtime which run this continues and who began it.
+        coordinatorLinks.emit(linked, {
+          type: "result",
+          data: result,
+          context: contextToWire(context),
+        });
       });
       return runtime;
     }
@@ -956,6 +980,36 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
         }
         return waitForServiceActivationState(runtime, serviceUuid);
       },
+      processService: (linked, serviceUuid, params, context, done) => {
+        const runtime = linkedRuntime(linked);
+        if (!runtime) {
+          throw new Error("the runtime is not running");
+        }
+        if (typeof serviceUuid !== "string" || !runtime.getService(serviceUuid)) {
+          throw new Error(`no service "${serviceUuid}"`);
+        }
+        // As on `process` below: the run and its caller are the coordinator's
+        // to state, over this link and nowhere else.
+        const run = contextFromLink(context) ?? newRun();
+        void runtime
+          .processAt(
+            serviceUuid,
+            params,
+            () => {
+              // Notifications are broadcast through runtime notification targets.
+            },
+            run,
+          )
+          .then(
+            (data) => done({ data, context: contextToWire(run) }),
+            (err) => {
+              console.error(
+                `[coordinator-link] Runtime "${linked.runtimeId}" failed to process at "${serviceUuid}":`,
+                err instanceof Error ? err.message : err,
+              );
+            },
+          );
+      },
       setState: (linked, state) => {
         const runtime = linkedRuntime(linked);
         if (!runtime) {
@@ -969,15 +1023,18 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
         if (!runtime) {
           throw new Error("the runtime is not running");
         }
-        return runtime.process(
+        // The coordinator names the run its call belongs to, so that a board
+        // spanning several runtimes reads as one trace — and who began it,
+        // which is taken as stated on this path and on no other.
+        const run = contextFromLink(context) ?? newRun();
+        const data = await runtime.process(
           params,
           () => {
             // Notifications are broadcast through runtime notification targets.
           },
-          // The coordinator names the run its call belongs to, so that a board
-          // spanning several runtimes reads as one trace.
-          contextFromWire(context),
+          run,
         );
+        return { data, context: contextToWire(run) };
       },
     },
     typeof options.coordinatorLinks === "string"
@@ -1283,11 +1340,15 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
       return;
     }
 
-    // No context: an external HTTP caller is not continuing a run, it is
-    // starting one.
-    const result = await runtime.process(req.body, () => {
-      // Notifications are broadcast through runtime notification targets.
-    });
+    // An external HTTP caller is not continuing a run, it is starting one —
+    // as whoever its token says it is.
+    const result = await runtime.process(
+      req.body,
+      () => {
+        // Notifications are broadcast through runtime notification targets.
+      },
+      contextForClient(undefined, req.authenticatedUser),
+    );
     res.json(result);
   });
 
@@ -1436,15 +1497,18 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
         return;
       }
 
-      // No context: an external caller is not continuing a run, it is starting
-      // one — the same reasoning as POST /runtimes/:runtimeId.
+      // The run is the one the body names, or a new one. The caller is never
+      // the body's to name: it is whoever the token was verified as.
       const result = await runtime.processAt(
         req.params.instanceId,
         req.body,
         () => {
           // Notifications are broadcast through runtime notification targets.
         },
-        contextFromWire((req.body as JsonRecord | undefined)?.__context),
+        contextForClient(
+          (req.body as JsonRecord | undefined)?.__context,
+          req.authenticatedUser,
+        ),
       );
       res.json(result ?? null);
     },
@@ -1512,7 +1576,7 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
   // No ceiling of the library's own; see attachCoordinatorJoin.
   const bridgeWsServer = new WebSocketServer({ noServer: true, maxPayload: 0 });
   let bridgeUpgradeHandler:
-    | ((ws: WebSocket, user: AuthenticatedUser) => void)
+    | ((ws: WebSocket, user: AuthenticatedUser, mayOwn: boolean) => void)
     | undefined;
 
   function rejectUpgrade(
@@ -1566,22 +1630,40 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
       : undefined;
     const token = bearer ?? url.searchParams.get("access_token");
 
+    // A coordinator's bridge authenticates its own callers, like the join
+    // endpoint above: a deployed board is attached to by its owner and by the
+    // people it is shared with, and the second are not on this server's
+    // allowlist. So the upgrade establishes who is asking and whether they may
+    // own; which board they may attach to, and as what, is the handler's.
+    if (url.pathname === "/coordinator/bridge") {
+      void Promise.all([
+        authenticator.identifyToken(token),
+        authenticator.authorizeOwner(token),
+      ])
+        .then(([identity, owner]) => {
+          if (!identity) {
+            rejectUpgrade(socket, 401, "Unauthorized");
+            return;
+          }
+          if (!bridgeUpgradeHandler) {
+            rejectUpgrade(socket, 503, "Service Unavailable");
+            return;
+          }
+          bridgeWsServer.handleUpgrade(request, socket, head, (ws) => {
+            bridgeUpgradeHandler!(ws, identity, !!owner);
+          });
+        })
+        .catch(() => {
+          rejectUpgrade(socket, 401, "Unauthorized");
+        });
+      return;
+    }
+
     void authenticator
-      .verifyToken(token)
+      .authorizeOwner(token)
       .then((user) => {
         if (!user) {
           rejectUpgrade(socket, 401, "Unauthorized");
-          return;
-        }
-
-        if (url.pathname === "/coordinator/bridge") {
-          if (bridgeUpgradeHandler) {
-            bridgeWsServer.handleUpgrade(request, socket, head, (ws) => {
-              bridgeUpgradeHandler!(ws, user);
-            });
-          } else {
-            rejectUpgrade(socket, 503, "Service Unavailable");
-          }
           return;
         }
 
@@ -1599,6 +1681,7 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
           webSocketServer.emit("connection", websocket, request, {
             owner,
             runtimeId,
+            user,
           });
         });
       })
@@ -1612,7 +1695,11 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
     (
       socket: WebSocket,
       _request: http.IncomingMessage,
-      { owner, runtimeId }: { owner: string; runtimeId: string },
+      {
+        owner,
+        runtimeId,
+        user,
+      }: { owner: string; runtimeId: string; user: AuthenticatedUser },
     ) => {
       const socketKey = tenantKey(owner, runtimeId);
       const sockets = runtimeSockets.get(socketKey) ?? new Set<WebSocket>();
@@ -1663,8 +1750,9 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
             },
             // A peer driving this runtime names the run its call belongs to, so
             // that a board spanning several runtimes reads as one trace rather
-            // than one per runtime.
-            contextFromWire(message.context),
+            // than one per runtime. Who is calling is not the frame's to say:
+            // it is whoever opened this socket.
+            contextForClient(message.context, user),
           );
           sendJsonResult(socket, result);
         }
@@ -1677,6 +1765,15 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
     httpServer,
     runtimeApp,
     coordinatorLinks,
+    /** How this server verifies a token, for whatever is mounted on it. */
+    authenticator,
+    /**
+     * Lets one HTTP route past the owner check every request otherwise gets,
+     * because it authenticates its own callers. Exact method and path.
+     */
+    addSelfAuthenticatedRoute(method: string, pathname: string) {
+      selfAuthenticatedRoutes.add(`${method.toUpperCase()} ${pathname}`);
+    },
     /** Serves WebSocket upgrades on a path with a handler that does its own
      *  authentication, ahead of the token check every other upgrade gets. */
     addUpgradeRoute(
@@ -1705,8 +1802,12 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
         baseUrl: `http://${host}:${address.port}`,
       };
     },
+    /**
+     * Who handles a browser attaching to a board. It is told who is asking and
+     * whether the server's allowlist lets them own; it decides the rest.
+     */
     setBridgeUpgradeHandler(
-      handler: (ws: WebSocket, user: AuthenticatedUser) => void,
+      handler: (ws: WebSocket, user: AuthenticatedUser, mayOwn: boolean) => void,
     ) {
       bridgeUpgradeHandler = handler;
     },

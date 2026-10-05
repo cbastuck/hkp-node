@@ -14,7 +14,7 @@
  */
 
 import { AssetDescriptor } from "../assets";
-import { LogEntry } from "../types";
+import { Caller, LogEntry, ProcessContext } from "../types";
 
 /** Where a runtime server connects in; relative to the coordinator's base. */
 export const JOIN_PATH = "/join";
@@ -77,6 +77,17 @@ export type ParticipantRequest =
   /** Report the runtime's services and their state. */
   | { op: "describe" }
   | { op: "configureService"; serviceUuid: string; config: unknown }
+  /**
+   * Begin at one service: run the pipeline from it onward with `params`, as
+   * the run `context` names. Answered once the work is taken; what it
+   * produces follows as a `result`, carrying the same context.
+   */
+  | {
+      op: "processService";
+      serviceUuid: string;
+      params: unknown;
+      context?: ProcessContext;
+    }
   /** Change what the running runtime records; see PATCH /runtimes/:id/state. */
   | { op: "setState"; state: Record<string, unknown> }
   /** Tear the runtime down. Removing one that is not there is a success. */
@@ -89,7 +100,7 @@ export type CoordinatorToParticipant =
   | { type: "welcome"; boardName: string; runtimeId: string }
   | ({ type: "request"; requestId: string } & ParticipantRequest)
   /** Run the runtime's pipeline; it answers with a `result`. */
-  | { type: "processRuntime"; params: unknown; context?: unknown };
+  | { type: "processRuntime"; params: unknown; context?: ProcessContext };
 
 /**
  * `result.data` and `processRuntime.params` are JSON when the message is a
@@ -100,8 +111,22 @@ export type ParticipantToCoordinator =
   | ParticipantHello
   | { type: "response"; requestId: string; ok: true; data?: unknown }
   | { type: "response"; requestId: string; ok: false; error: string }
-  | { type: "result"; data: unknown }
-  | { type: "notification"; serviceUuid: string; payload: unknown }
+  /**
+   * What the runtime's pipeline produced, with the run it was produced in.
+   * The coordinator hands that context to the next runtime, which is what
+   * carries a run — and who began it — across a board's runtimes.
+   */
+  | { type: "result"; data: unknown; context?: ProcessContext }
+  /**
+   * `caller` is whoever began the run the notification was raised in, absent
+   * when it was raised outside one. It decides who is told.
+   */
+  | {
+      type: "notification";
+      serviceUuid: string;
+      payload: unknown;
+      caller?: Caller;
+    }
   | { type: "log"; entry: LogEntry };
 
 /** What a participant says unprompted: its runtime's output. */
@@ -120,7 +145,8 @@ export interface Participant {
   readonly runtimeId: string;
   readonly hello: ParticipantHello;
   request<T = unknown>(request: ParticipantRequest): Promise<T>;
-  process(params: unknown, context?: unknown): void;
+  /** Runs the runtime's pipeline, as the run `context` names when given. */
+  process(params: unknown, context?: ProcessContext): void;
   /** Where the runtime's output goes; one listener, replaced by the next. */
   listen(listener: ((event: ParticipantEvent) => void) | null): void;
 }

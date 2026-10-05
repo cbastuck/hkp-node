@@ -19,6 +19,8 @@ import {
   encodeBinaryFrame,
   frameBytes,
 } from "./binaryFrame";
+import { callerFromWire, contextFromLink } from "../runtime";
+import { ProcessContext } from "../types";
 
 /**
  * Tickets, and the runtime servers that connected with one.
@@ -141,7 +143,7 @@ class SocketParticipant implements Participant {
     });
   }
 
-  process(params: unknown, context?: unknown): void {
+  process(params: unknown, context?: ProcessContext): void {
     if (params instanceof BinaryPayload) {
       this.sendRaw(
         encodeBinaryFrame({ type: "processRuntime", context }, params),
@@ -179,11 +181,27 @@ class SocketParticipant implements Participant {
       }
       return;
     }
-    if (
-      message.type === "result" ||
-      message.type === "notification" ||
-      message.type === "log"
-    ) {
+    // What a participant says about a run is read into the shape the rest of
+    // the coordinator relies on, rather than passed on as it arrived.
+    if (message.type === "result") {
+      this.listener?.({
+        type: "result",
+        data: message.data,
+        context: contextFromLink(message.context),
+      });
+      return;
+    }
+    if (message.type === "notification") {
+      const caller = callerFromWire(message.caller);
+      this.listener?.({
+        type: "notification",
+        serviceUuid: message.serviceUuid,
+        payload: message.payload,
+        ...(caller ? { caller } : {}),
+      });
+      return;
+    }
+    if (message.type === "log") {
       this.listener?.(message);
     }
   }
@@ -489,7 +507,11 @@ export class ParticipantRegistry {
         if (!frame || frame.header.type !== "result") {
           return;
         }
-        message = { type: "result", data: frame.payload };
+        message = {
+          type: "result",
+          data: frame.payload,
+          context: contextFromLink(frame.header.context),
+        };
       } else {
         try {
           message = JSON.parse(bytes.toString("utf8"));

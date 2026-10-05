@@ -14,7 +14,7 @@ import {
   encodeBinaryFrame,
   frameBytes,
 } from "./binaryFrame";
-import { LogEntry, LogLevel } from "../types";
+import { Caller, LogEntry, LogLevel, ProcessContext } from "../types";
 import { MOUNT_FIELD, collectMountRefs, formatMountRef } from "./mount";
 import {
   BridgeMessage,
@@ -31,11 +31,54 @@ import {
   ReportedService,
 } from "./participantProtocol";
 import { AssetDescriptor } from "../assets";
+import {
+  FacadeAccess,
+  projectConfig,
+  projectState,
+  readFacadeAccess,
+  runtimeHolding,
+} from "./facadeAccess";
+import { DEFAULT_MEMBER_LIMITS, MemberLimits } from "./members";
 
-type BrowserBridge = {
+/**
+ * What a browser attached to a board is to it.
+ *
+ * The **owner** deployed the board: their bridge is sent the board whole, may
+ * configure its services, and hosts its browser runtimes. A **member** is
+ * somebody the board is shared with: their bridge is sent the facade and what
+ * the facade reads, and may ask for exactly what the facade asks for.
+ */
+export type BridgeRole = "owner" | "member";
+
+/** Who attached, as whoever admitted them established it. */
+export type BridgeAttach = {
+  role: BridgeRole;
+  /** Absent where there is no identity to state — a coordinator without auth. */
+  caller?: Caller;
+};
+
+type BrowserBridge = BridgeAttach & {
   ws: WebSocket;
   runtimeIds: Set<string>;
+  // Each browser is told the board in its own sequence: what a member is sent
+  // is a subset of what the owner is, and a shared count would read to them as
+  // increments going missing.
+  seq: number;
 };
+
+/** Closing a member's bridge because the board is no longer shared with them.
+ *  Final: a client that reconnected would only be refused. */
+export const CLOSE_NOT_A_MEMBER = 4403;
+
+/** Machinery a runtime reports about its own flow, carrying the data passing
+ *  through. A facade ignores it, so a member is not sent it. */
+function isFlowNotification(payload: unknown): boolean {
+  return (
+    !!payload &&
+    typeof payload === "object" &&
+    "__internal" in (payload as Record<string, unknown>)
+  );
+}
 
 /**
  * One board, owned by this coordinator.
@@ -100,9 +143,13 @@ export class BoardSession {
   // attached browser renders from — it owns none of it itself.
   private readonly serviceStates = new Map<string, ServiceStates>();
   private readonly registries = new Map<string, unknown[]>();
-  // Ordering for snapshots and the increments that follow, so a browser can
-  // tell it missed one and ask for a fresh snapshot rather than drift.
-  private seq = 0;
+  // What the board's facade lets a member do and see. The config is fixed for
+  // the life of a session — deploying again makes a new one — so it is read
+  // once.
+  private readonly access: FacadeAccess;
+  // When each member last asked for something to be processed, by email, for
+  // the rate that bounds them.
+  private readonly memberProcessTimes = new Map<string, number[]>();
   // Building, releasing and picking up runtimes happen one at a time: a
   // participant arriving while the board is starting must not be built twice.
   private queue: Promise<unknown> = Promise.resolve();
@@ -126,10 +173,11 @@ export class BoardSession {
     // The largest frame a browser may send that is passed on; unset means no
     // limit. The same setting bounds what a runtime server sends, where the
     // participants are accepted.
-    private readonly limits: { maxFrameBytes?: number } = {},
+    private readonly limits: { maxFrameBytes?: number } & MemberLimits = {},
   ) {
     this.createdAt = restored?.createdAt ?? new Date().toISOString();
     this.stopped = restored?.stopped ?? false;
+    this.access = readFacadeAccess(config.facade);
   }
 
   /** The runtimes this board cannot run without, in chain order. */
@@ -172,7 +220,7 @@ export class BoardSession {
       // out the addresses once the whole board exists.
       await this.publishMountAddresses();
     });
-    this.broadcast(this.snapshot());
+    this.broadcastSnapshot();
   }
 
   /** Whether the board was left stopped, for a store to remember. */
@@ -342,7 +390,7 @@ export class BoardSession {
           err instanceof Error ? err.message : err,
         );
       })
-      .finally(() => this.broadcast(this.snapshot()));
+      .finally(() => this.broadcastSnapshot());
   }
 
   /** A required participant's connection went away. */
@@ -353,7 +401,7 @@ export class BoardSession {
     console.log(
       `[coordinator] Runtime "${runtimeId}" of board "${this.boardName}" disconnected`,
     );
-    this.broadcast(this.snapshot());
+    this.broadcastSnapshot();
   }
 
   private onParticipantEvent(runtimeId: string, event: ParticipantEvent): void {
@@ -363,7 +411,9 @@ export class BoardSession {
     if (event.type === "log") {
       if (event.entry) {
         this.logStore?.append(this.userId, this.boardName, event.entry);
-        this.broadcast({ type: "log", entry: event.entry });
+        // The board's log is its owner's: an entry names services, runs and
+        // callers a member has no business seeing.
+        this.toOwners({ type: "log", entry: event.entry });
       }
       return;
     }
@@ -373,7 +423,12 @@ export class BoardSession {
     // board loaded. Whoever is waiting on that address learns of it here.
     if (event.type === "notification") {
       if (event.serviceUuid) {
-        this.onRuntimeNotification(runtimeId, event.serviceUuid, event.payload);
+        this.onRuntimeNotification(
+          runtimeId,
+          event.serviceUuid,
+          event.payload,
+          event.caller,
+        );
       }
       return;
     }
@@ -381,7 +436,7 @@ export class BoardSession {
     if (event.data === null || event.data === undefined) {
       return;
     }
-    this.routeResult(runtimeId, event.data).catch((err) => {
+    this.routeResult(runtimeId, event.data, event.context).catch((err) => {
       console.error(
         `[coordinator] Failed to route result from runtime "${runtimeId}":`,
         err instanceof Error ? err.message : err,
@@ -429,7 +484,7 @@ export class BoardSession {
       this.residue = unreleased;
       this.stopped = true;
     });
-    this.broadcast(this.snapshot());
+    this.broadcastSnapshot();
   }
 
   /**
@@ -554,31 +609,96 @@ export class BoardSession {
   /**
    * Detach all browser bridges from this session and return them so the caller
    * can hand them to the replacement session without the browsers seeing a
-   * disconnect.
+   * disconnect. Each comes with who it is, which the replacement checks again.
    */
-  takeBridges(): { ws: WebSocket; runtimeIds: string[] }[] {
+  takeBridges(): Array<{ ws: WebSocket; runtimeIds: string[] } & BridgeAttach> {
     const taken = [...this.bridges].map((bridge) => {
       // Detach handlers so the old session no longer processes bridge messages.
       bridge.ws.removeAllListeners("message");
       bridge.ws.removeAllListeners("close");
-      return { ws: bridge.ws, runtimeIds: [...bridge.runtimeIds] };
+      return {
+        ws: bridge.ws,
+        runtimeIds: [...bridge.runtimeIds],
+        role: bridge.role,
+        ...(bridge.caller ? { caller: bridge.caller } : {}),
+      };
     });
     this.bridges.clear();
     return taken;
   }
 
-  registerBrowserSocket(ws: WebSocket, runtimeIds: string[]): void {
+  /** How many bridges somebody holds on this board, by the email they attached as. */
+  countMemberBridges(email: string): number {
+    let count = 0;
+    for (const bridge of this.bridges) {
+      if (bridge.role === "member" && bridge.caller?.email === email) {
+        count += 1;
+      }
+    }
+    return count;
+  }
+
+  /**
+   * Closes the bridges of somebody the board is no longer shared with. At
+   * once: being taken off the list is not something that waits for a
+   * reconnect.
+   */
+  evictMember(email: string): void {
+    for (const bridge of [...this.bridges]) {
+      if (bridge.role === "member" && bridge.caller?.email === email) {
+        bridge.ws.close(CLOSE_NOT_A_MEMBER, "no longer shared");
+      }
+    }
+    this.memberProcessTimes.delete(email);
+  }
+
+  /**
+   * What the board's list now calls an email, for the bridges attached as it.
+   * The name rides with every run they begin, so a rename has to reach
+   * somebody who is already attached.
+   */
+  renameMember(email: string, name: string | undefined): void {
+    for (const bridge of this.bridges) {
+      if (bridge.caller?.email !== email) {
+        continue;
+      }
+      const { name: _previous, ...rest } = bridge.caller;
+      bridge.caller = name ? { ...rest, name } : rest;
+      this.send(bridge.ws, this.snapshotFor(bridge));
+    }
+  }
+
+  /**
+   * Takes a browser that whoever is calling has already admitted, as what it
+   * was admitted as. Deciding that is not this session's job: it holds no
+   * list, and is told.
+   */
+  registerBrowserSocket(
+    ws: WebSocket,
+    runtimeIds: string[],
+    attach: BridgeAttach = { role: "owner" },
+  ): void {
+    // A member's bridge never hosts a runtime, whatever it says it has: the
+    // chain would wait on an answer that is not theirs to give.
+    const hosted = attach.role === "owner" ? runtimeIds : [];
+
     // The same socket re-registering (e.g. its browser runtimes changed) — just
     // refresh its runtimeIds rather than adding a duplicate or re-attaching
     // listeners.
     for (const existing of this.bridges) {
       if (existing.ws === ws) {
-        existing.runtimeIds = new Set(runtimeIds);
+        existing.runtimeIds = new Set(hosted);
         return;
       }
     }
 
-    const bridge: BrowserBridge = { ws, runtimeIds: new Set(runtimeIds) };
+    const bridge: BrowserBridge = {
+      ws,
+      runtimeIds: new Set(hosted),
+      role: attach.role,
+      ...(attach.caller ? { caller: attach.caller } : {}),
+      seq: 0,
+    };
     this.bridges.add(bridge);
 
     ws.on("message", (raw, isBinary) => {
@@ -623,7 +743,27 @@ export class BoardSession {
       // A browser that reconnected, or noticed a gap in the sequence, asking to
       // be told the board again rather than carrying on from a stale view.
       if (message.type === "resync") {
-        this.send(ws, this.snapshot());
+        this.send(ws, this.snapshotFor(bridge));
+        return;
+      }
+
+      if (message.type === "processService") {
+        void this.serveProcessRequest(bridge, message);
+        return;
+      }
+
+      // Everything below is the owner's. A member's bridge may ask to be told
+      // the board again and ask the facade's services to do their job, and
+      // that is the whole of what it may send: it configures nothing, records
+      // nothing, and answers for no runtime.
+      if (bridge.role !== "owner") {
+        if (message.type === "configureService") {
+          this.send(ws, {
+            type: "response",
+            requestId: message.requestId,
+            error: "Only the board's owner may configure it",
+          });
+        }
         return;
       }
 
@@ -659,7 +799,12 @@ export class BoardSession {
       }
 
       if (message.type === "result-from-browser" && message.runtimeId) {
-        this.routeResult(message.runtimeId, message.data).catch((err) => {
+        // A run begun in this browser, by whoever attached with it.
+        this.routeResult(
+          message.runtimeId,
+          message.data,
+          this.beginRun(bridge),
+        ).catch((err) => {
           console.error(
             `[coordinator] Failed to route result from browser runtime "${message.runtimeId}":`,
             err instanceof Error ? err.message : err,
@@ -670,9 +815,9 @@ export class BoardSession {
 
     ws.on("close", () => {
       this.bridges.delete(bridge);
-      // Only abandon in-flight browser results once no client remains to answer
-      // them; another connected bridge may still reply.
-      if (this.bridges.size === 0) {
+      // Only abandon in-flight browser results once nobody remains who could
+      // answer them; another of the owner's bridges may still reply.
+      if (this.hostingBridges().length === 0) {
         for (const [requestId, resolve] of this.pendingBrowserResults) {
           this.pendingBrowserResults.delete(requestId);
           resolve(null);
@@ -682,10 +827,10 @@ export class BoardSession {
 
     // Attaching is a read: the browser renders what the board currently is,
     // rather than provisioning anything itself.
-    this.send(ws, this.snapshot());
+    this.send(ws, this.snapshotFor(bridge));
 
     console.log(
-      `[coordinator] Browser bridge registered for board "${this.boardName}" (runtimeIds: ${runtimeIds.join(", ")}, bridges: ${this.bridges.size})`,
+      `[coordinator] Browser bridge registered for board "${this.boardName}" (${bridge.role}, runtimeIds: ${hosted.join(", ")}, bridges: ${this.bridges.size})`,
     );
   }
 
@@ -717,6 +862,7 @@ export class BoardSession {
     runtimeId: string,
     serviceUuid: string,
     payload: unknown,
+    caller?: Caller,
   ): void {
     // Pass it on as what it is. A service's notifications are its output, not
     // its state — a Monitor's message never appears in its getState — so a
@@ -724,12 +870,7 @@ export class BoardSession {
     // notifications it would have received from the runtime directly. A payload
     // is whatever the service said, string and number included; only the mount
     // address below is looked for, and only an object can carry one.
-    this.broadcast({
-      type: "notification",
-      runtimeId,
-      serviceUuid,
-      payload,
-    });
+    this.deliverNotification(runtimeId, serviceUuid, payload, caller);
 
     if (!payload || typeof payload !== "object") {
       return;
@@ -749,13 +890,7 @@ export class BoardSession {
         ? { ...(previous as Record<string, unknown>), [MOUNT_FIELD]: published }
         : { [MOUNT_FIELD]: published };
     this.serviceStates.set(runtimeId, states);
-    this.broadcast({
-      type: "serviceState",
-      seq: ++this.seq,
-      runtimeId,
-      serviceUuid,
-      state: states[serviceUuid],
-    });
+    this.broadcastServiceState(runtimeId, serviceUuid, states[serviceUuid]);
 
     if (this.recordMountAddress(runtimeId, serviceUuid, published)) {
       void this.publishMountAddresses().catch((err) => {
@@ -767,13 +902,104 @@ export class BoardSession {
     }
   }
 
-  /** Sends a message to every browser watching this board. */
-  private broadcast(message: BridgeMessage): void {
+  /**
+   * Tells the browsers that are to hear it what a service said.
+   *
+   * A notification raised inside a run somebody began is theirs: it goes to
+   * the bridges they attached with, and to nobody else — what one member's
+   * action produced is not another member's to read, and not the owner's to
+   * watch. One raised in a run nobody began — a timer, a request at a mount —
+   * is the board's own news and goes to everyone.
+   *
+   * A member is sent it only from a service the facade reads, and never the
+   * runtime's own account of its flow, which carries the data passing through
+   * every service.
+   */
+  private deliverNotification(
+    runtimeId: string,
+    serviceUuid: string,
+    payload: unknown,
+    caller?: Caller,
+  ): void {
+    let frame: string | null = null;
+    for (const bridge of this.bridges) {
+      if (caller && bridge.caller?.sub !== caller.sub) {
+        continue;
+      }
+      if (
+        bridge.role === "member" &&
+        (!this.access.sources.has(serviceUuid) || isFlowNotification(payload))
+      ) {
+        continue;
+      }
+      if (bridge.ws.readyState !== WebSocket.OPEN) {
+        continue;
+      }
+      frame ??= JSON.stringify({
+        type: "notification",
+        runtimeId,
+        serviceUuid,
+        payload,
+      });
+      bridge.ws.send(frame);
+    }
+  }
+
+  /** Sends a message to every browser the board's owner has attached. */
+  private toOwners(message: BridgeMessage): void {
     const payload = JSON.stringify(message);
     for (const bridge of this.bridges) {
-      if (bridge.ws.readyState === WebSocket.OPEN) {
+      if (bridge.role === "owner" && bridge.ws.readyState === WebSocket.OPEN) {
         bridge.ws.send(payload);
       }
+    }
+  }
+
+  /** The owner's open bridges: the only ones a browser runtime can be on. */
+  private hostingBridges(): BrowserBridge[] {
+    return [...this.bridges].filter(
+      (bridge) =>
+        bridge.role === "owner" && bridge.ws.readyState === WebSocket.OPEN,
+    );
+  }
+
+  /** Tells every browser the board again, each as it is entitled to see it. */
+  private broadcastSnapshot(): void {
+    for (const bridge of this.bridges) {
+      this.send(bridge.ws, this.snapshotFor(bridge));
+    }
+  }
+
+  /**
+   * Tells every browser one service's new state. A member is told only of a
+   * service the facade names, and only what the facade reads of it.
+   */
+  private broadcastServiceState(
+    runtimeId: string,
+    serviceUuid: string,
+    state: unknown,
+  ): void {
+    for (const bridge of this.bridges) {
+      if (bridge.role === "member") {
+        if (!this.access.named.has(serviceUuid)) {
+          continue;
+        }
+        this.send(bridge.ws, {
+          type: "serviceState",
+          seq: ++bridge.seq,
+          runtimeId,
+          serviceUuid,
+          state: projectState(this.access, serviceUuid, state),
+        });
+        continue;
+      }
+      this.send(bridge.ws, {
+        type: "serviceState",
+        seq: ++bridge.seq,
+        runtimeId,
+        serviceUuid,
+        state,
+      });
     }
   }
 
@@ -783,16 +1009,64 @@ export class BoardSession {
     }
   }
 
+  /** A run a browser begins, as whoever attached with it. */
+  private beginRun(bridge: BrowserBridge): ProcessContext {
+    return {
+      runId: randomUUID(),
+      ...(bridge.caller ? { caller: bridge.caller } : {}),
+    };
+  }
+
   /**
-   * The board as this coordinator knows it: every remote runtime's registry and
-   * the state its services last reported.
+   * The board as this coordinator knows it, for one browser.
    *
-   * Sent when a browser attaches, and again on request. It carries the live
-   * state rather than the saved board because that is the part a browser cannot
-   * work out for itself — a mount's address is assigned when the runtime is
-   * provisioned and appears in no saved board.
+   * Sent when a browser attaches, and again on request. For the owner it is
+   * every remote runtime's registry and the state its services last reported:
+   * the live state rather than the saved board, because that is the part a
+   * browser cannot work out for itself — a mount's address is assigned when
+   * the runtime is provisioned and appears in no saved board.
+   *
+   * For a member it is a projection: the facade, and of the board only the
+   * services the facade names with what it reads of each. A board's config
+   * carries service state, and state can carry credentials, so not showing a
+   * member the board would mean little if this sent it to them.
    */
-  private snapshot(): BridgeMessage {
+  private snapshotFor(bridge: BrowserBridge): BridgeMessage {
+    const you = bridge.caller
+      ? {
+          ...(bridge.caller.email ? { email: bridge.caller.email } : {}),
+          ...(bridge.caller.name ? { name: bridge.caller.name } : {}),
+        }
+      : undefined;
+    const common = {
+      type: "snapshot" as const,
+      seq: ++bridge.seq,
+      boardName: this.boardName,
+      status: this.getStatus(),
+      role: bridge.role,
+      ...(you ? { you } : {}),
+    };
+
+    if (bridge.role === "member") {
+      const config = projectConfig(this.config, this.access, (runtimeId, uuid) =>
+        this.liveState(runtimeId, uuid),
+      );
+      return {
+        ...common,
+        // Whether the board is running is a member's to know; which runtime
+        // server is away, and why, is its owner's.
+        errors: [],
+        config,
+        runtimes: config.runtimes.map(({ id }) => ({
+          runtimeId: id,
+          registry: [],
+          services: Object.fromEntries(
+            (config.services[id] ?? []).map((svc) => [svc.uuid, svc.state ?? {}]),
+          ),
+        })),
+      };
+    }
+
     // In the board's own order, and including a runtime whose participant has
     // dropped: what it last reported is still the best account of it there is,
     // and the status beside it says that it is away.
@@ -804,14 +1078,129 @@ export class BoardSession {
         services: this.serviceStates.get(id) ?? {},
       }));
     return {
-      type: "snapshot",
-      seq: ++this.seq,
-      boardName: this.boardName,
-      status: this.getStatus(),
+      ...common,
       errors: this.getErrors(),
       config: this.config,
       runtimes,
     };
+  }
+
+  /** What a service last reported, or what the board configured it with. */
+  private liveState(runtimeId: string, serviceUuid: string): unknown {
+    const reported = this.serviceStates.get(runtimeId)?.[serviceUuid];
+    if (reported !== undefined) {
+      return reported;
+    }
+    return (this.config.services[runtimeId] ?? []).find(
+      (svc) => svc.uuid === serviceUuid,
+    )?.state;
+  }
+
+  /**
+   * Whether a member has asked for more than they are allowed in the last
+   * minute. Counted per person rather than per bridge, so opening another tab
+   * is not a way round it.
+   */
+  private overMemberRate(email: string): boolean {
+    const limit =
+      this.limits.maxMemberProcessPerMinute ??
+      DEFAULT_MEMBER_LIMITS.maxMemberProcessPerMinute;
+    const now = Date.now();
+    const recent = (this.memberProcessTimes.get(email) ?? []).filter(
+      (at) => now - at < 60_000,
+    );
+    if (recent.length >= limit) {
+      this.memberProcessTimes.set(email, recent);
+      return true;
+    }
+    recent.push(now);
+    this.memberProcessTimes.set(email, recent);
+    return false;
+  }
+
+  /**
+   * Asks a service on a remote runtime to do its job, for a browser.
+   *
+   * The run begins here, as whoever attached with the bridge — which is what
+   * makes the caller something the runtime can rely on: it was established
+   * when the bridge was admitted, and nothing in the message can change it.
+   *
+   * The answer says only whether the work was taken. What it produces arrives
+   * the way a pipeline's output always does — as notifications, and as a
+   * result this session carries to the board's next runtime.
+   */
+  private async serveProcessRequest(
+    bridge: BrowserBridge,
+    message: Extract<BridgeMessage, { type: "processService" }>,
+  ): Promise<void> {
+    const refuse = (error: string) =>
+      this.send(bridge.ws, {
+        type: "response",
+        requestId: message.requestId,
+        error,
+      });
+    if (
+      typeof message.requestId !== "string" ||
+      typeof message.serviceUuid !== "string"
+    ) {
+      return;
+    }
+
+    let runtimeId = message.runtimeId;
+    if (bridge.role === "member") {
+      // The entry point is the capability: a member may begin at a service
+      // the facade asks to process, and at no other.
+      if (!this.access.processTargets.has(message.serviceUuid)) {
+        refuse("This board does not offer that");
+        return;
+      }
+      // Where that service is, is the board's to say and not the message's.
+      runtimeId = runtimeHolding(this.config, message.serviceUuid) ?? "";
+      const email = bridge.caller?.email ?? "";
+      if (this.overMemberRate(email)) {
+        refuse("Too many requests — try again in a moment");
+        return;
+      }
+    }
+
+    if (this.stopped) {
+      refuse("This board is stopped");
+      return;
+    }
+    const participant = this.live.has(runtimeId)
+      ? this.participants.get(runtimeId)
+      : undefined;
+    if (!participant) {
+      refuse(
+        bridge.role === "member"
+          ? "This board is not running right now"
+          : this.required().some((rt) => rt.id === runtimeId)
+            ? `Runtime "${runtimeId}" is not connected`
+            : `Unknown runtime "${runtimeId}"`,
+      );
+      return;
+    }
+
+    try {
+      await participant.request({
+        op: "processService",
+        serviceUuid: message.serviceUuid,
+        params: message.payload ?? null,
+        context: this.beginRun(bridge),
+      });
+      this.send(bridge.ws, {
+        type: "response",
+        requestId: message.requestId,
+        data: { accepted: true },
+      });
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      refuse(
+        bridge.role === "member"
+          ? "This board could not take that right now"
+          : `Runtime "${runtimeId}": ${reason}`,
+      );
+    }
   }
 
   /**
@@ -851,13 +1240,7 @@ export class BoardSession {
       const states = this.serviceStates.get(message.runtimeId) ?? {};
       states[message.serviceUuid] = data;
       this.serviceStates.set(message.runtimeId, states);
-      this.broadcast({
-        type: "serviceState",
-        seq: ++this.seq,
-        runtimeId: message.runtimeId,
-        serviceUuid: message.serviceUuid,
-        state: data,
-      });
+      this.broadcastServiceState(message.runtimeId, message.serviceUuid, data);
       this.send(ws, { type: "response", requestId: message.requestId, data });
     } catch (err) {
       this.send(ws, {
@@ -966,9 +1349,17 @@ export class BoardSession {
     }
   }
 
+  /**
+   * Hands what one runtime produced to the next one in the board.
+   *
+   * `context` is the run it was produced in. It goes on with the data, which
+   * is what makes a board's runtimes one run rather than one each — and what
+   * lets the second runtime know who began it.
+   */
   private async routeResult(
     fromRuntimeId: string,
     data: unknown,
+    context?: ProcessContext,
   ): Promise<void> {
     const next = this.nextRuntime(fromRuntimeId, this.config.runtimes);
     if (!next) {
@@ -986,14 +1377,15 @@ export class BoardSession {
         );
         return;
       }
-      participant.process(data);
+      participant.process(data, context);
       return;
     }
 
     if (isBrowserRuntime(next)) {
-      const targets = [...this.bridges].filter(
-        (b) => b.ws.readyState === WebSocket.OPEN,
-      );
+      // The owner's browsers, and only those: a browser runtime is theirs to
+      // run, and a member's bridge asked would leave the chain waiting on an
+      // answer that is dropped when it comes.
+      const targets = this.hostingBridges();
       if (targets.length === 0) {
         // A transient participant that is away. Nothing is wrong: the data
         // stops here, as it would at a service that returned null, and the
@@ -1002,12 +1394,20 @@ export class BoardSession {
       }
 
       const requestId = randomUUID();
-      // Fan the work out to every connected viewer so each client's UI (e.g. a
+      // Fan the work out to each of them so each client's UI (e.g. a
       // Monitor) updates. The first reply resolves the chain; later replies for
       // the same requestId are no-ops since its pending entry is already gone.
       const result = await new Promise<unknown>((resolve) => {
         this.pendingBrowserResults.set(requestId, resolve);
-        const header = { type: "processRuntime", runtimeId: next.id, requestId };
+        // The browser is told the run so that what it records belongs to it.
+        // What continues the chain below is the context held here, not
+        // whatever comes back.
+        const header = {
+          type: "processRuntime",
+          runtimeId: next.id,
+          requestId,
+          ...(context ? { context } : {}),
+        };
         const payload =
           data instanceof BinaryPayload
             ? encodeBinaryFrame(header, data)
@@ -1018,7 +1418,7 @@ export class BoardSession {
       });
 
       if (result !== null) {
-        await this.routeResult(next.id, result);
+        await this.routeResult(next.id, result, context);
       }
     }
   }

@@ -2,6 +2,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 
 import {
+  Caller,
   HostedService,
   HostedServiceFactory,
   JsonRecord,
@@ -21,7 +22,7 @@ import {
 import { ADDRESS_SEPARATOR, descend, splitAddress } from "./address";
 import { SecretVault } from "./secrets";
 import { AssetDescriptor, AssetStore, AssetStoreOptions } from "./assets";
-import { ANONYMOUS_SUB } from "./auth";
+import { ANONYMOUS_SUB, AuthenticatedUser } from "./auth";
 import { MountHandle, MountHandlers } from "./mounts";
 
 /** Severity order, so a runtime can drop anything below what it records. */
@@ -61,16 +62,111 @@ export function contextFromWire(value: unknown): ProcessContext | undefined {
 }
 
 /**
+ * Who a signed-in user is to a run they begin, or nothing where there is no
+ * identity to state.
+ *
+ * A server running without authentication resolves everybody to the one
+ * anonymous tenant. That is *no caller*, not a caller called anonymous —
+ * otherwise everybody on a development machine would be the same person.
+ */
+export function callerOf(user: AuthenticatedUser | undefined): Caller | undefined {
+  if (!user || user.sub === ANONYMOUS_SUB) {
+    return undefined;
+  }
+  return { sub: user.sub, ...(user.email ? { email: user.email } : {}) };
+}
+
+/**
+ * The context of a run a client holding a token begins: a REST process call,
+ * or a `processRuntime` on a runtime's socket.
+ *
+ * The run metadata the client sent is kept, as `contextFromWire` reads it.
+ * Whatever it said about a caller is not read at all: who is calling is what
+ * the server verified, so a client cannot act in another person's name by
+ * saying so.
+ */
+export function contextForClient(
+  wire: unknown,
+  user: AuthenticatedUser | undefined,
+): ProcessContext {
+  const context = contextFromWire(wire) ?? newRun();
+  const caller = callerOf(user);
+  return caller ? { ...context, caller } : context;
+}
+
+/** A caller as a participant link states one, or nothing when the shape is off. */
+export function callerFromWire(value: unknown): Caller | undefined {
+  if (typeof value !== "object" || value === null) {
+    return undefined;
+  }
+  const wire = value as Record<string, unknown>;
+  if (typeof wire.sub !== "string" || !wire.sub) {
+    return undefined;
+  }
+  return {
+    sub: wire.sub,
+    ...(typeof wire.email === "string" && wire.email
+      ? { email: wire.email }
+      : {}),
+    ...(typeof wire.name === "string" && wire.name ? { name: wire.name } : {}),
+  };
+}
+
+/**
+ * The context of a run as it is said over a participant link, by either end:
+ * a coordinator continuing a run on a runtime, or a runtime handing back what
+ * it produced.
+ *
+ * The one path on which a caller is taken as stated. The link is the board's
+ * own — opened by a runtime server with the board's ticket — and the
+ * coordinator on it is what verified the person. Kept apart from
+ * `contextFromWire` so that no other entry point can come to trust a caller by
+ * sharing a parser.
+ */
+export function contextFromLink(value: unknown): ProcessContext | undefined {
+  const context = contextFromWire(value);
+  if (!context) {
+    return undefined;
+  }
+  const caller = callerFromWire((value as Record<string, unknown>).caller);
+  // The reply address belongs to whoever was waiting at the other end.
+  const { requestId: _requestId, ...run } = context;
+  return caller ? { ...run, caller } : run;
+}
+
+/**
+ * A run as it is said to another runtime: which run, and who began it. The
+ * reply address is left out — it means something only to whoever is waiting.
+ */
+export function contextToWire(
+  context: ProcessContext | null | undefined,
+): ProcessContext | undefined {
+  if (!context) {
+    return undefined;
+  }
+  return {
+    runId: context.runId,
+    ...(context.parentRunId ? { parentRunId: context.parentRunId } : {}),
+    ...(context.caller ? { caller: context.caller } : {}),
+  };
+}
+
+/**
  * A run invoked from inside another one, as a nested pipeline is.
  *
  * The child gets an identity of its own rather than borrowing its parent's, so
  * that work done inside a sub-pipeline stays distinguishable from work done
  * around it — which is the whole difference between a trace that shows nesting
- * and one that shows a flat list in timestamp order.
+ * and one that shows a flat list in timestamp order. Who began the work is the
+ * same person however deep it goes, so the caller is inherited.
  */
 export function childRun(parent: ProcessContext | null): ProcessContext {
   return parent
-    ? { runId: randomUUID(), parentRunId: parent.runId }
+    ? {
+        runId: randomUUID(),
+        parentRunId: parent.runId,
+        ...(parent.caller ? { caller: parent.caller } : {}),
+      }
     : newRun();
 }
 
@@ -112,7 +208,9 @@ export class HostedRuntime implements RuntimeHost {
   private readonly notificationTargets = new Set<
     (notification: RuntimeNotification) => void
   >();
-  private readonly resultTargets = new Set<(result: unknown) => void>();
+  private readonly resultTargets = new Set<
+    (result: unknown, context: ProcessContext | null) => void
+  >();
   private readonly createService: ServiceCreator;
   private readonly mounts?: RuntimeMounts;
   /**
@@ -336,7 +434,14 @@ export class HostedRuntime implements RuntimeHost {
     };
   }
 
-  registerResultTarget(target: (result: unknown) => void): () => void {
+  /**
+   * Where what this runtime emits goes. A target is told the run the value was
+   * emitted in, or null when it was emitted outside one, so that whoever
+   * carries it on can say which run it continues.
+   */
+  registerResultTarget(
+    target: (result: unknown, context: ProcessContext | null) => void,
+  ): () => void {
     this.resultTargets.add(target);
     return () => {
       this.resultTargets.delete(target);
@@ -344,8 +449,9 @@ export class HostedRuntime implements RuntimeHost {
   }
 
   emitResult(output: unknown): void {
+    const context = this.currentContext();
     for (const target of this.resultTargets) {
-      target(output);
+      target(output, context);
     }
   }
 
@@ -511,6 +617,9 @@ export class HostedRuntime implements RuntimeHost {
     if (run.parentRunId) {
       entry.parentRunId = run.parentRunId;
     }
+    if (run.caller) {
+      entry.caller = run.caller.sub;
+    }
     if (this.logData && data !== undefined) {
       entry.data = data;
     }
@@ -534,6 +643,7 @@ export class HostedRuntime implements RuntimeHost {
       target({
         runId: run.runId,
         ...(run.parentRunId ? { parentRunId: run.parentRunId } : {}),
+        ...(run.caller ? { caller: run.caller.sub } : {}),
         ts: new Date().toISOString(),
         runtimeId: this.id,
         serviceUuid: this.currentService ?? "",

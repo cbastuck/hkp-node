@@ -223,6 +223,28 @@ export type RuntimeScope = {
  * A run outlives any number of those, so the two are not interchangeable — see
  * plans/TODO-CONSOLIDATION.md section 4.
  */
+/**
+ * Who took the action a run began with.
+ *
+ * Stated by the server that verified their token, never read from what they
+ * sent: a payload saying who its sender is proves nothing about them. A run
+ * nobody began — a timer tick, a request arriving at a mount — has none, and
+ * neither does anything on a server running without authentication, where
+ * there is nobody to tell apart.
+ */
+export type Caller = {
+  /** The token's `sub`. */
+  sub: string;
+  /** Present only when the token carried a verified one; normalised. */
+  email?: string;
+  /**
+   * What the board's member list calls that email. Set by a coordinator that
+   * keeps such a list, and absent everywhere else — a name from the token
+   * would be the person's own choice.
+   */
+  name?: string;
+};
+
 export type ProcessContext = {
   /**
    * Identifies one invocation of a board — one webhook, one timer tick, one
@@ -241,6 +263,12 @@ export type ProcessContext = {
    * here so the shape matches the runtimes that do carry one.
    */
   requestId?: string;
+  /**
+   * Who began this run, when somebody did. It travels with the run — into a
+   * nested pipeline, and across the runtimes of a deployed board — so a
+   * service asks here rather than trusting a field of its input.
+   */
+  caller?: Caller;
 };
 
 export type LogLevel = "debug" | "info" | "warn" | "error";
@@ -270,6 +298,11 @@ export type LogEntry = {
   event: string;
   data?: unknown;
   durationMs?: number;
+  /**
+   * The `sub` of whoever began the run, when somebody did. Enough to answer
+   * "who did this" from a board's log without the log collecting addresses.
+   */
+  caller?: string;
 };
 
 /**
@@ -304,6 +337,11 @@ export interface RuntimeHost {
     context?: ProcessContext,
   ): Promise<unknown>;
   notify(payload: unknown, instanceId: string): void;
+  /**
+   * Hands a value to whatever follows this runtime. Called from inside a run,
+   * the value goes on as part of it — the next runtime of a deployed board is
+   * told the same run and the same caller.
+   */
   emitResult(output: unknown): void;
   /**
    * The context of the call currently being processed, or null outside one.

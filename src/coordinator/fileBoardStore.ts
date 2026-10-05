@@ -5,6 +5,7 @@ import path from "node:path";
 
 import { BoardStore, PersistedBoard } from "./boardStore";
 import { CloudBoardConfig } from "./types";
+import { readMembers } from "./members";
 
 /**
  * Boards kept as one JSON file each, under a directory this coordinator owns.
@@ -74,7 +75,8 @@ export function createFileBoardStore(root: string): BoardStore {
       );
       return null;
     }
-    const { userId, boardName, createdAt, config, stopped, tickets } = parsed;
+    const { userId, boardName, createdAt, config, stopped, tickets, members } =
+      parsed;
     return {
       userId,
       boardName,
@@ -90,6 +92,8 @@ export function createFileBoardStore(root: string): BoardStore {
               typeof ticket.issuedAt === "string",
           )
         : undefined,
+      // Absent in a file written before boards could be shared.
+      members: Array.isArray(members) ? readMembers(members) : undefined,
     };
   }
 
