@@ -2,10 +2,18 @@ import request from "supertest";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { AuthenticatedUser } from "../src/auth";
-import { createMemoryBoardStore } from "../src/coordinator/boardStore";
+import {
+  BoardStore,
+  createMemoryBoardStore,
+} from "../src/coordinator/boardStore";
+import {
+  CLOSE_NO_SUCH_BOARD,
+  CLOSE_TOO_MANY_BRIDGES,
+} from "../src/coordinator/bridge";
 import { BoardCoordinator } from "../src/coordinator/coordinator";
 import {
   projectConfig,
+  projectNotification,
   projectState,
   readFacadeAccess,
 } from "../src/coordinator/facadeAccess";
@@ -251,6 +259,116 @@ describe("a board's member list", () => {
     ]);
   });
 
+  /**
+   * A store that finishes what it is asked when it is told to, in whatever
+   * order: a file system gives no better promise about two writes begun
+   * together.
+   */
+  function slowStore() {
+    const kept = createMemoryBoardStore();
+    const waiting: Array<() => void> = [];
+    let hold = false;
+    const held = <T,>(work: () => Promise<T>) =>
+      hold
+        ? new Promise<T>((resolve, reject) =>
+            waiting.push(() => work().then(resolve, reject)),
+          )
+        : work();
+    const store: BoardStore = {
+      load: () => kept.load(),
+      save: (board) => {
+        // What is written is what was handed over, however long it then takes.
+        const copy = structuredClone(board);
+        return held(() => kept.save(copy));
+      },
+      remove: (userId, boardName) => held(() => kept.remove(userId, boardName)),
+    };
+    return {
+      store,
+      kept,
+      holdWrites: () => {
+        hold = true;
+      },
+      /** Lets what is waiting finish, last asked first. */
+      async finishBackwards() {
+        hold = false;
+        while (waiting.length) {
+          waiting.pop()!();
+          await settle();
+        }
+      },
+      waiting: () => waiting.length,
+    };
+  }
+
+  const keptMembers = async (kept: BoardStore) =>
+    (await kept.load()).find((b) => b.boardName === BOARD.boardName)?.members;
+
+  it("keeps the list as it last was, whichever write the store finishes last", async () => {
+    const slow = slowStore();
+    const coordinator = new BoardCoordinator(slow.store);
+    await hostWith({ coordinator });
+    await coordinator.setMember(OWNER.sub, BOARD.boardName, {
+      email: ANNA.email!,
+      name: "Anna",
+    });
+
+    slow.holdWrites();
+    // Two changes at once, as two requests arriving together are.
+    const adding = coordinator.setMember(OWNER.sub, BOARD.boardName, {
+      email: BEN.email!,
+      name: "Ben",
+    });
+    const removing = coordinator.removeMember(OWNER.sub, BOARD.boardName, ANNA.email!);
+    await settle();
+    await slow.finishBackwards();
+    await Promise.all([adding, removing]);
+
+    // Somebody taken off the list is not back on it after a restart.
+    expect(await keptMembers(slow.kept)).toEqual([{ email: BEN.email, name: "Ben" }]);
+  });
+
+  it("writes the board that is deployed, not one a slower request was holding", async () => {
+    const slow = slowStore();
+    const coordinator = new BoardCoordinator(slow.store);
+    const { host, runtime } = await hostWith({ coordinator });
+    const old = coordinator.getBoard(OWNER.sub, BOARD.boardName)!;
+    // Stopping takes a while, and the board is deployed again meanwhile.
+    const stop = old.stop.bind(old);
+    let stopped!: () => void;
+    old.stop = async () => {
+      await new Promise<void>((resolve) => (stopped = resolve));
+      await stop();
+    };
+    const stopping = coordinator.stopBoard(OWNER.sub, BOARD.boardName);
+    const renamed = { ...BOARD, facade: { layout: "single", panels: [] } };
+    await deploy(host, OWNER.sub, renamed, { node: runtime.server });
+    stopped();
+    await stopping;
+
+    const kept = (await slow.kept.load()).find((b) => b.boardName === BOARD.boardName)!;
+    expect(kept.config.facade).toEqual(renamed.facade);
+    expect(kept.stopped).toBe(false);
+  });
+
+  it("is not brought back by a write still on its way when the board is deleted", async () => {
+    const slow = slowStore();
+    const coordinator = new BoardCoordinator(slow.store);
+    await hostWith({ coordinator });
+
+    slow.holdWrites();
+    const adding = coordinator.setMember(OWNER.sub, BOARD.boardName, {
+      email: ANNA.email!,
+      name: "Anna",
+    });
+    const removing = coordinator.removeBoard(OWNER.sub, BOARD.boardName);
+    await settle();
+    await slow.finishBackwards();
+    await Promise.all([adding, removing]);
+
+    expect(await slow.kept.load()).toEqual([]);
+  });
+
   it("goes with the board", async () => {
     const { host } = await hostWith();
     await host.coordinator.setMember(OWNER.sub, BOARD.boardName, {
@@ -358,8 +476,14 @@ describe("attaching to a board", () => {
       nowhere.closed,
       unverified.closed,
     ]);
-    // The same answer three times, and nothing sent before it.
-    expect(new Set(codes).size).toBe(1);
+    // The same answer three times, and nothing sent before it. An answer,
+    // not a connection going away: whoever asked is to stop asking, which a
+    // close without a code would not tell them apart from a restart.
+    expect(codes).toEqual([
+      CLOSE_NO_SUCH_BOARD,
+      CLOSE_NO_SUCH_BOARD,
+      CLOSE_NO_SUCH_BOARD,
+    ]);
     expect(stranger.received).toEqual([]);
     expect(unverified.received).toEqual([]);
   });
@@ -372,7 +496,7 @@ describe("attaching to a board", () => {
     const own = await openBridge(host, MALLORY.sub, MALLORY.sub, BOARD.boardName);
     cleanups.push(async () => own.socket.terminate());
 
-    await own.closed;
+    expect(await own.closed).toBe(CLOSE_NO_SUCH_BOARD);
     expect(own.received).toEqual([]);
   });
 
@@ -397,7 +521,8 @@ describe("attaching to a board", () => {
     const first = await attached(host, ANNA);
     const second = await attachAs(host, ANNA);
 
-    await second.closed;
+    // Told why, and not as a board that is not there: it is shared with her.
+    expect(await second.closed).toBe(CLOSE_TOO_MANY_BRIDGES);
     expect(second.received).toEqual([]);
     expect(first.socket.readyState).toBe(first.socket.OPEN);
   });
@@ -703,6 +828,56 @@ describe("a member's bridge and the board's runtimes", () => {
     expect(anna.all("notification").map((n) => n.payload)).toEqual([{ at: 1 }]);
   });
 
+  it("hears of what a service says only what the facade reads of it", async () => {
+    const fakes = fakeParticipants();
+    const a = fakes.join("a");
+    const reading = (source: object): CloudBoardConfig => ({
+      ...CHAIN,
+      facade: {
+        layout: "single",
+        panels: [
+          {
+            id: "main",
+            layout: {
+              direction: "column",
+              items: [
+                { type: "data-table", source },
+                { type: "text", source: { serviceUuid: "tick", path: "error" } },
+              ],
+            },
+          },
+        ],
+      },
+    });
+    const session = new BoardSession(
+      "chain",
+      OWNER.sub,
+      reading({ serviceUuid: "tick", path: "rows" }),
+      fakes.participants,
+    );
+    cleanups.push(() => session.destroy());
+    await session.start();
+    const owner = await attachBrowser(session, [], { role: "owner" });
+    const anna = await attachBrowser(session, [], member(ANNA, "Anna"));
+    cleanups.push(owner.stop, anna.stop);
+
+    const said = { rows: [{ court: 1 }], secret: "hunter2", count: 1 };
+    a.emit({ type: "notification", serviceUuid: "tick", payload: said });
+    // Nothing the facade reads is in this one, and it is still news: what was
+    // shown before is no longer what the service says.
+    a.emit({ type: "notification", serviceUuid: "tick", payload: { secret: "hunter2" } });
+    a.emit({ type: "notification", serviceUuid: "tick", payload: "hunter2" });
+    await eventually(() => owner.all("notification").length === 3, "the owner to hear all of it");
+    await eventually(() => anna.all("notification").length === 3, "the member to hear of all of it");
+
+    expect(owner.all("notification")[0].payload).toEqual(said);
+    expect(anna.all("notification").map((n) => n.payload)).toEqual([
+      { rows: [{ court: 1 }] },
+      {},
+      {},
+    ]);
+  });
+
   it("is told a service's state only where the facade names it, in its own sequence", async () => {
     const { a, attach } = await chain();
     const owner = await attach([], { role: "owner" });
@@ -885,6 +1060,25 @@ describe("reading a facade for what it grants", () => {
     // Read whole as a notification, which is not its state.
     expect(projectState(access, "status", { secret: 1 })).toEqual({});
     expect(projectState(access, "upload", { secret: 1 })).toEqual({});
+  });
+
+  it("gives of a notification only the paths read, and all of it to a source reading it whole", () => {
+    const said = {
+      rows: [1, 2],
+      meta: { total: 2, cursor: "c" },
+      statement: "SELECT",
+    };
+    const given = projectNotification(access, "list", said);
+    expect(given).toEqual({ rows: [1, 2], meta: { total: 2 } });
+    // What was said is not what is cut down.
+    expect(said.meta).toEqual({ total: 2, cursor: "c" });
+
+    expect(projectNotification(access, "status", { secret: 1 })).toEqual({ secret: 1 });
+    expect(projectNotification(access, "status", "text")).toBe("text");
+    // Named by the facade, read by none of its sources.
+    expect(projectNotification(access, "upload", { secret: 1 })).toEqual({});
+    expect(projectNotification(access, "list", "text")).toEqual({});
+    expect(projectNotification(access, "list", null)).toEqual({});
   });
 
   it("leaves a browser runtime's services with the owner", () => {

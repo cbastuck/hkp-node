@@ -18,9 +18,21 @@ import { BridgeAttach } from "./session";
  *   that board, and it admits people the server's operator never heard of.
  *
  * Anybody else is closed on the way an unknown board is — after the same
- * wait, saying the same nothing — so that asking is not a way to learn which
+ * wait, with the same code — so that asking is not a way to learn which
  * boards exist or who they are shared with.
  */
+
+/**
+ * Closing a bridge because there is no such board for whoever asked: it does
+ * not exist, or it is not theirs and not shared with them. One code for both.
+ * Said as a code so that a client can tell an answer from a connection that
+ * merely dropped, which says nothing about the board.
+ */
+export const CLOSE_NO_SUCH_BOARD = 4404;
+
+/** Closing a member's bridge because they already hold as many as one member
+ *  may. Only ever said to somebody the board is shared with. */
+export const CLOSE_TOO_MANY_BRIDGES = 4429;
 
 export type BridgeAdmissionOptions = {
   /**
@@ -116,7 +128,7 @@ export function createBridgeHandler(
             console.warn(
               `[bridge] Too many bridges for one member of "${boardName}" — closing`,
             );
-            ws.close();
+            ws.close(CLOSE_TOO_MANY_BRIDGES, "open in too many places");
             return;
           }
           session.registerBrowserSocket(ws, runtimeIds, attach);
@@ -126,7 +138,7 @@ export function createBridgeHandler(
           console.warn(
             `[bridge] No board "${boardName}" to attach "${user.sub}" to — closing`,
           );
-          ws.close();
+          ws.close(CLOSE_NO_SUCH_BOARD, "no such board");
           return;
         }
         setTimeout(() => look(attemptsLeft - 1), attemptDelayMs);

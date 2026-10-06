@@ -31,6 +31,9 @@ export class BoardCoordinator {
   // on a session: a session is one run of a board and is replaced on every
   // deploy, while the list is the board's and outlives all of them.
   private readonly members = new Map<string, BoardMember[]>();
+  // What is being asked of the store, by owner and board: the end of the line
+  // each board's writes and its removal wait in. See inStoreOrder.
+  private readonly storeWork = new Map<string, Promise<void>>();
 
   /** Where the boards themselves are kept; see BoardStore. In memory unless a
    *  caller supplies somewhere that outlives the process. */
@@ -61,7 +64,7 @@ export class BoardCoordinator {
         onTicketsChanged: (userId, boardName) => {
           const session = this.getBoard(userId, boardName);
           if (session) {
-            void this.persist(session);
+            void this.persist(userId, boardName);
           }
         },
       });
@@ -150,7 +153,7 @@ export class BoardCoordinator {
     // once — one for a runtime it had none for.
     const session = this.getBoard(userId, boardName);
     if (session) {
-      await this.persist(session);
+      await this.persist(userId, boardName);
     }
     return tickets;
   }
@@ -171,9 +174,47 @@ export class BoardCoordinator {
     }
   }
 
-  /** Writes a board down, with its tickets, its members and whether it is
-   *  stopped. */
-  private async persist(session: BoardSession): Promise<void> {
+  /**
+   * Runs something against the store for a board after whatever was asked of
+   * the store for that board before it.
+   *
+   * A store finishes what it is asked in no particular order — a write that
+   * began first can land last — so two things asked at once would leave
+   * whichever happened to finish later, and a removal could be undone by a
+   * write that was already on its way.
+   */
+  private inStoreOrder(key: string, task: () => Promise<void>): Promise<void> {
+    const queued = (this.storeWork.get(key) ?? Promise.resolve()).then(task);
+    // Kept as something that cannot reject: what follows it runs either way.
+    const settled = queued.catch(() => undefined);
+    this.storeWork.set(key, settled);
+    void settled.then(() => {
+      if (this.storeWork.get(key) === settled) {
+        this.storeWork.delete(key);
+      }
+    });
+    return queued;
+  }
+
+  /**
+   * Writes a board down, with its tickets, its members and whether it is
+   * stopped — as it is when the write begins, not as it was when it was asked
+   * for. Whatever asked may have waited behind another write, or may have
+   * been holding a session that a deploy has replaced since; the board
+   * registered under the name by then is the one that is true.
+   */
+  private persist(userId: string, boardName: string): Promise<void> {
+    return this.inStoreOrder(boardKey(userId, boardName), () =>
+      this.write(userId, boardName),
+    );
+  }
+
+  private async write(userId: string, boardName: string): Promise<void> {
+    const session = this.getBoard(userId, boardName);
+    if (!session) {
+      // Removed since: writing it would bring it back.
+      return;
+    }
     try {
       await this.store.save({
         userId: session.userId,
@@ -211,7 +252,7 @@ export class BoardCoordinator {
       return null;
     }
     await session.stop();
-    await this.persist(session);
+    await this.persist(userId, boardName);
     return session;
   }
 
@@ -309,7 +350,7 @@ export class BoardCoordinator {
     // Deploying is what makes a board the coordinator's, so it is what the
     // store is told about. Starting a stopped board registers the same config
     // again and lands here too.
-    await this.persist(session);
+    await this.persist(userId, config.boardName);
     return session;
   }
 
@@ -332,7 +373,7 @@ export class BoardCoordinator {
     }
 
     const unreachable = await session.setLogging(enabled, level);
-    await this.persist(session);
+    await this.persist(userId, boardName);
 
     return { unreachable };
   }
@@ -378,8 +419,11 @@ export class BoardCoordinator {
     // The list goes with the board: sharing is of a board that exists.
     this.members.delete(boardKey(userId, boardName));
     // Deleting a board that outlived a restart has to delete it there too, or
-    // the next restore brings it back.
-    await this.store.remove(userId, boardName);
+    // the next restore brings it back. Behind any write of it still on its
+    // way, which would otherwise land afterwards and do the same.
+    await this.inStoreOrder(boardKey(userId, boardName), () =>
+      this.store.remove(userId, boardName),
+    );
     return true;
   }
 
@@ -422,7 +466,7 @@ export class BoardCoordinator {
     // Somebody already attached as this address is called the new name from
     // their next action on.
     session.renameMember(member.email, member.name);
-    await this.persist(session);
+    await this.persist(userId, boardName);
     return [...next];
   }
 
@@ -450,7 +494,7 @@ export class BoardCoordinator {
     // The owner keeps their own bridge, and only loses the name the list
     // gave them.
     session.renameMember(address, undefined);
-    await this.persist(session);
+    await this.persist(userId, boardName);
     return [...next];
   }
 

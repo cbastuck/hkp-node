@@ -34,6 +34,7 @@ import { AssetDescriptor } from "../assets";
 import {
   FacadeAccess,
   projectConfig,
+  projectNotification,
   projectState,
   readFacadeAccess,
   runtimeHolding,
@@ -911,9 +912,10 @@ export class BoardSession {
    * watch. One raised in a run nobody began — a timer, a request at a mount —
    * is the board's own news and goes to everyone.
    *
-   * A member is sent it only from a service the facade reads, and never the
-   * runtime's own account of its flow, which carries the data passing through
-   * every service.
+   * A member is sent it only from a service the facade reads, cut down to
+   * what the facade reads of it, and never the runtime's own account of its
+   * flow, which carries the data passing through every service. The owner is
+   * sent what was said.
    */
   private deliverNotification(
     runtimeId: string,
@@ -921,7 +923,10 @@ export class BoardSession {
     payload: unknown,
     caller?: Caller,
   ): void {
-    let frame: string | null = null;
+    const frameOf = (said: unknown) =>
+      JSON.stringify({ type: "notification", runtimeId, serviceUuid, payload: said });
+    let whole: string | null = null;
+    let projected: string | null = null;
     for (const bridge of this.bridges) {
       if (caller && bridge.caller?.sub !== caller.sub) {
         continue;
@@ -935,13 +940,15 @@ export class BoardSession {
       if (bridge.ws.readyState !== WebSocket.OPEN) {
         continue;
       }
-      frame ??= JSON.stringify({
-        type: "notification",
-        runtimeId,
-        serviceUuid,
-        payload,
-      });
-      bridge.ws.send(frame);
+      if (bridge.role === "member") {
+        projected ??= frameOf(
+          projectNotification(this.access, serviceUuid, payload),
+        );
+        bridge.ws.send(projected);
+      } else {
+        whole ??= frameOf(payload);
+        bridge.ws.send(whole);
+      }
     }
   }
 

@@ -152,17 +152,45 @@ export function projectState(
   serviceUuid: string,
   state: unknown,
 ): Record<string, unknown> {
-  const projected: Record<string, unknown> = {};
-  for (const path of access.sources.get(serviceUuid) ?? []) {
+  return pick(state, access.sources.get(serviceUuid) ?? []);
+}
+
+/**
+ * Of what a service said, only what the facade's sources read from it.
+ *
+ * A source without a path reads the notification whole, so the whole of it is
+ * given. Otherwise it is cut down to the paths read: each of them resolves in
+ * what is returned to exactly what it resolved to in what was said, and
+ * nothing beside them is there. A notification holding none of them comes out
+ * empty rather than not at all — that a service spoke, and no longer says what
+ * it said before, is itself read.
+ */
+export function projectNotification(
+  access: FacadeAccess,
+  serviceUuid: string,
+  payload: unknown,
+): unknown {
+  const paths = access.sources.get(serviceUuid) ?? new Set<string>();
+  if (paths.has("")) {
+    return payload;
+  }
+  return pick(payload, paths);
+}
+
+/** The values at `paths` in `value`, at the same paths in an object of their
+ *  own. A pathless entry names no part of it and picks nothing. */
+function pick(value: unknown, paths: Iterable<string>): Record<string, unknown> {
+  const picked: Record<string, unknown> = {};
+  for (const path of paths) {
     if (!path) {
       continue;
     }
-    const value = readPath(state, path);
-    if (value !== undefined) {
-      writePath(projected, path, value);
+    const found = readPath(value, path);
+    if (found !== undefined) {
+      writePath(picked, path, found);
     }
   }
-  return projected;
+  return picked;
 }
 
 /**
