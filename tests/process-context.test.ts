@@ -24,6 +24,7 @@ class ContextSpy implements HostedService {
   readonly serviceName = "ContextSpy";
   readonly uuid: string;
   readonly seen: Array<ProcessContext | null> = [];
+  readonly configured: Array<ProcessContext | null> = [];
 
   private host: RuntimeHost | null = null;
 
@@ -36,6 +37,7 @@ class ContextSpy implements HostedService {
   }
 
   configure(): JsonRecord {
+    this.configured.push(this.host?.currentContext() ?? null);
     return {};
   }
 
@@ -161,7 +163,10 @@ describe("process context", () => {
       { uuid: "after" },
     ]);
 
-    runtime.process({}, () => {}, { runId: "outer" });
+    runtime.process({}, () => {}, {
+      runId: "outer",
+      actor: { kind: "board" },
+    });
 
     expect(spies.get("before")!.seen[0]?.runId).toBe("outer");
     expect(spies.get("after")!.seen[0]?.runId).toBe("outer");
@@ -185,7 +190,7 @@ describe("process context", () => {
     // What a service captured before leaving its call and handed back on
     // returning — an HTTP response, a delayed emit.
     const { runtime, spies } = runtimeOf([{ uuid: "a" }, { uuid: "b" }]);
-    const captured = { runId: "captured" };
+    const captured = { runId: "captured", actor: { kind: "board" } as const };
 
     runtime.processFrom("a", {}, () => {}, captured);
 
@@ -200,6 +205,24 @@ describe("process context", () => {
     runtime.process({}, () => {});
 
     // The pass has returned; nothing is running.
+    expect(runtime.currentContext()).toBeNull();
+  });
+
+  it("gives configure the context supplied by the framework", () => {
+    const { runtime, spies } = runtimeOf([{ uuid: "a" }]);
+    const run = {
+      runId: "configured-by-member",
+      actor: {
+        kind: "person" as const,
+        sub: "auth0|member",
+        expiresAt: Date.now() + 60_000,
+      },
+    };
+
+    runtime.configureService("a", {}, run);
+    runtime.configureService("a", {});
+
+    expect(spies.get("a")!.configured).toEqual([run, null]);
     expect(runtime.currentContext()).toBeNull();
   });
 });

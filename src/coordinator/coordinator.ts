@@ -118,6 +118,7 @@ export class BoardCoordinator {
         { createdAt: board.createdAt, stopped },
         this.logStore,
         this.limits,
+        (caller) => this.mayActAs(board.userId, board.boardName, caller),
       );
       this.userSessions(board.userId).set(board.boardName, session);
       if (!stopped) {
@@ -323,6 +324,7 @@ export class BoardCoordinator {
       undefined,
       this.logStore,
       this.limits,
+      (caller) => this.mayActAs(userId, config.boardName, caller),
     );
     await session.start();
 
@@ -496,6 +498,19 @@ export class BoardCoordinator {
     session.renameMember(address, undefined);
     await this.persist(userId, boardName);
     return [...next];
+  }
+
+  /** A person actor's authority is live only while they are still the owner
+   * or appear on the board's current member list. */
+  private mayActAs(
+    userId: string,
+    boardName: string,
+    caller: { sub: string; email?: string },
+  ): boolean {
+    return (
+      caller.sub === userId ||
+      !!findMember(this.getMembers(userId, boardName), caller.email)
+    );
   }
 
   /** The boards whose list names an email, across every owner. */

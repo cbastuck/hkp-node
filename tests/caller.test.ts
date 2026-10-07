@@ -107,10 +107,46 @@ async function createRuntimeAs(baseUrl: string, user: AuthenticatedUser | null, 
 
 const FORGED = {
   runId: "run-from-client",
-  caller: { sub: BOB.sub, email: BOB.email, name: "Bob" },
+  actor: {
+    kind: "person" as const,
+    sub: BOB.sub,
+    email: BOB.email,
+    name: "Bob",
+    expiresAt: Date.now() + 60_000,
+  },
 };
 
 describe("a client holding a token", () => {
+  it("is the caller of a service configure call", async () => {
+    const { server, baseUrl } = await serverWith([]);
+    await createRuntimeAs(baseUrl, ALICE, [
+      { serviceId: "monitor", uuid: "monitor" },
+    ]);
+
+    const runtime = server.runtimeApp.getRuntime(ALICE.sub, "rt-1")!;
+    const service = runtime.getService("monitor")!;
+    const configure = service.configure.bind(service);
+    const seen: Array<ProcessContext | null> = [];
+    service.configure = (config) => {
+      seen.push(runtime.currentContext());
+      return configure(config);
+    };
+
+    await request(baseUrl)
+      .post("/runtimes/rt-1/services/monitor")
+      .set("Authorization", `Bearer ${ALICE.sub}`)
+      .send({ __context: FORGED, logToConsole: true })
+      .expect(200);
+
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.runId).not.toBe(FORGED.runId);
+    expect(seen[0]?.actor).toMatchObject({
+      kind: "person",
+      sub: ALICE.sub,
+      email: ALICE.email,
+    });
+  });
+
   it("is the caller of a service process call, whatever the body claims", async () => {
     const { baseUrl } = await serverWith([]);
     await createRuntimeAs(baseUrl, ALICE, [whoami("who")]);
@@ -139,7 +175,7 @@ describe("a client holding a token", () => {
     const { body } = await request(baseUrl)
       .post("/runtimes/rt-1")
       .set("Authorization", `Bearer ${ALICE.sub}`)
-      .send({ __context: FORGED, context: FORGED, caller: FORGED.caller })
+      .send({ __context: FORGED, context: FORGED, actor: FORGED.actor })
       .expect(200);
 
     expect(body.rows).toEqual([
@@ -227,11 +263,16 @@ describe("a server without authentication", () => {
 
 describe("reading a context", () => {
   it("never reads a caller from a client's context", () => {
-    expect(contextFromWire(FORGED)).toEqual({ runId: "run-from-client" });
+    expect(contextFromWire(FORGED)).toEqual({
+      runId: "run-from-client",
+      actor: { kind: "local" },
+    });
     expect(contextForClient(FORGED, undefined)).toEqual({
       runId: "run-from-client",
+      actor: { kind: "local" },
     });
-    expect(contextForClient(FORGED, ALICE).caller).toEqual({
+    expect(contextForClient(FORGED, ALICE).actor).toMatchObject({
+      kind: "person",
       sub: ALICE.sub,
       email: ALICE.email,
     });
@@ -240,18 +281,24 @@ describe("reading a context", () => {
   it("begins a run for a client that named none", () => {
     const context = contextForClient(undefined, ALICE);
     expect(context.runId).toBeTruthy();
-    expect(context.caller?.sub).toBe(ALICE.sub);
+    expect(context.actor).toMatchObject({ kind: "person", sub: ALICE.sub });
   });
 
   it("takes a caller as stated over a participant link", () => {
     expect(contextFromLink(FORGED)).toEqual({
       runId: "run-from-client",
-      caller: { sub: BOB.sub, email: BOB.email, name: "Bob" },
+      actor: FORGED.actor,
     });
-    // A caller without a `sub` is nobody, not somebody with half an identity.
+    // A malformed person is expired, rather than gaining another actor kind.
     expect(
-      contextFromLink({ runId: "r", caller: { email: "x@example.com" } }),
-    ).toEqual({ runId: "r" });
+      contextFromLink({
+        runId: "r",
+        actor: { kind: "person", email: "x@example.com" },
+      }),
+    ).toEqual({
+      runId: "r",
+      actor: { kind: "person", sub: "", expiresAt: 0 },
+    });
     expect(contextFromLink(undefined)).toBeUndefined();
   });
 
@@ -264,12 +311,20 @@ describe("reading a context", () => {
   it("hands the caller down to a child run", () => {
     const parent: ProcessContext = {
       runId: "outer",
-      caller: { sub: ALICE.sub, email: ALICE.email, name: "Alice" },
+      actor: {
+        kind: "person",
+        sub: ALICE.sub,
+        email: ALICE.email,
+        name: "Alice",
+        expiresAt: Date.now() + 60_000,
+      },
     };
     const child = childRun(parent);
     expect(child.parentRunId).toBe("outer");
-    expect(child.caller).toEqual(parent.caller);
-    expect(childRun({ runId: "outer" }).caller).toBeUndefined();
+    expect(child.actor).toEqual(parent.actor);
+    expect(
+      childRun({ runId: "outer", actor: { kind: "board" } }).actor,
+    ).toEqual({ kind: "board" });
   });
 });
 
@@ -307,9 +362,15 @@ describe("identifying a token", () => {
 });
 
 describe("sql's caller parameters", () => {
-  function sqlAs(caller: ProcessContext["caller"], statement: string) {
+  function sqlAs(
+    actor: ProcessContext["actor"],
+    statement: string,
+  ) {
     const host = {
-      currentContext: () => ({ runId: "r", ...(caller ? { caller } : {}) }),
+      currentContext: () => ({
+        runId: "r",
+        actor,
+      }),
       log: () => {},
       scope: () => ({ owner: "tester", boardName: "Board" }),
     } as unknown as RuntimeHost;
@@ -324,7 +385,13 @@ describe("sql's caller parameters", () => {
 
   it("binds them from the run, over an input field of the same name", () => {
     const run = sqlAs(
-      { sub: ALICE.sub, email: ALICE.email, name: "Alice" },
+      {
+        kind: "person",
+        sub: ALICE.sub,
+        email: ALICE.email,
+        name: "Alice",
+        expiresAt: Date.now() + 60_000,
+      },
       "SELECT $caller_email AS email, :caller_name AS name, @caller_sub AS sub, $other AS other",
     );
 
@@ -341,7 +408,10 @@ describe("sql's caller parameters", () => {
   });
 
   it("binds NULL when the run has no caller, whatever the input says", () => {
-    const run = sqlAs(undefined, "SELECT $caller_email AS email, $caller_sub AS sub");
+    const run = sqlAs(
+      { kind: "board" },
+      "SELECT $caller_email AS email, $caller_sub AS sub",
+    );
 
     expect(run({ caller_email: BOB.email, caller_sub: BOB.sub })).toEqual([
       { email: null, sub: null },
@@ -350,12 +420,21 @@ describe("sql's caller parameters", () => {
 
   it("binds NULL for what a caller does not have", () => {
     const run = sqlAs(
-      { sub: CAROL.sub },
+      {
+        kind: "person",
+        sub: CAROL.sub,
+        expiresAt: Date.now() + 60_000,
+      },
       "SELECT $caller_email AS email, $caller_name AS name, $caller_sub AS sub",
     );
 
     expect(run({ caller_email: "carol@claims.example" })).toEqual([
       { email: null, name: null, sub: CAROL.sub },
     ]);
+  });
+
+  it("binds actor kind from context and never from input", () => {
+    const run = sqlAs({ kind: "mount" }, "SELECT $actor_kind AS kind");
+    expect(run({ actor_kind: "person" })).toEqual([{ kind: "mount" }]);
   });
 });

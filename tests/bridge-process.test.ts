@@ -154,8 +154,17 @@ describe("processing at a service over the bridge", () => {
       requestId: "p-1",
       runtimeId: "a",
       serviceUuid: "who-a",
-      // Not somewhere a caller can be claimed from.
-      payload: { caller_sub: "typed", __context: { caller: ALICE } },
+      // Neither the payload nor a forged nested context can state the actor.
+      payload: {
+        caller_sub: "typed",
+        __context: {
+          actor: {
+            kind: "person",
+            ...ALICE,
+            expiresAt: 9_999_999_999_999,
+          },
+        },
+      },
     });
 
     await eventually(
@@ -253,7 +262,7 @@ describe("a run across a board's runtimes", () => {
       op: "processService",
       serviceUuid: "svc",
       params: { n: 1 },
-      context: { caller: ALICE },
+      context: { actor: { kind: "person", ...ALICE } },
     });
     expect(
       (request as { context?: { runId?: string } }).context?.runId,
@@ -263,7 +272,14 @@ describe("a run across a board's runtimes", () => {
   it("keeps its context through a browser runtime, whatever the browser sends back", async () => {
     const { session, a, b } = await chain();
     const owner = await browser(session, { role: "owner", caller: ALICE }, ["ui"]);
-    const run = { runId: "run-1", caller: ALICE };
+    const run = {
+      runId: "run-1",
+      actor: {
+        kind: "person" as const,
+        ...ALICE,
+        expiresAt: Date.now() + 60_000,
+      },
+    };
 
     a.emit({ type: "result", data: { n: 1 }, context: run });
     await eventually(() => !!owner.last("processRuntime"), "the browser to be asked");
@@ -275,7 +291,14 @@ describe("a run across a board's runtimes", () => {
       requestId: asked.requestId!,
       data: { n: 2 },
       // Not the browser's to restate: what continues is what the coordinator held.
-      context: { runId: "forged", caller: { sub: "auth0|mallory" } },
+      context: {
+        runId: "forged",
+        actor: {
+          kind: "person",
+          sub: "auth0|mallory",
+          expiresAt: Date.now() + 60_000,
+        },
+      },
     } as never);
 
     await eventually(() => b.processed.length > 0, "the next runtime to run");
@@ -290,7 +313,23 @@ describe("a run across a board's runtimes", () => {
     owner.send({ type: "result-from-browser", runtimeId: "ui", data: { n: 1 } });
 
     await eventually(() => b.processed.length > 0, "the next runtime to run");
-    expect(b.contexts[0]?.caller).toEqual(ALICE);
+    expect(b.contexts[0]?.actor).toMatchObject({ kind: "person", ...ALICE });
+    expect(b.contexts[0]?.runId).toBeTruthy();
+  });
+
+  it("does not make a callerless browser emission the owner's run", async () => {
+    const { session, b } = await chain();
+    const owner = await browser(session, { role: "owner", caller: ALICE }, ["ui"]);
+
+    owner.send({
+      type: "result-from-browser",
+      runtimeId: "ui",
+      data: { n: 1 },
+      callerless: true,
+    });
+
+    await eventually(() => b.processed.length > 0, "the next runtime to run");
+    expect(b.contexts[0]?.actor).toEqual({ kind: "board" });
     expect(b.contexts[0]?.runId).toBeTruthy();
   });
 
@@ -300,7 +339,11 @@ describe("a run across a board's runtimes", () => {
     // browser runtime it passes through.
     const owner = await browser(session, { role: "owner", caller: ALICE }, ["ui"]);
 
-    a.emit({ type: "result", data: { n: 1 }, context: { runId: "tick" } });
+    a.emit({
+      type: "result",
+      data: { n: 1 },
+      context: { runId: "tick", actor: { kind: "board" } },
+    });
     await eventually(() => !!owner.last("processRuntime"), "the browser to be asked");
     owner.send({
       type: "result",
@@ -309,13 +352,19 @@ describe("a run across a board's runtimes", () => {
     });
 
     await eventually(() => b.processed.length > 0, "the next runtime to run");
-    expect(b.contexts).toEqual([{ runId: "tick" }]);
+    expect(b.contexts).toEqual([
+      { runId: "tick", actor: { kind: "board" } },
+    ]);
   });
 
   it("stops at a browser runtime nobody is hosting", async () => {
     const { a, b } = await chain();
 
-    a.emit({ type: "result", data: { n: 1 }, context: { runId: "tick" } });
+    a.emit({
+      type: "result",
+      data: { n: 1 },
+      context: { runId: "tick", actor: { kind: "board" } },
+    });
     await settle();
 
     expect(b.processed).toEqual([]);

@@ -253,7 +253,7 @@ describe.skipIf(!hasPython)("a board across hkp-node and hkp-python", () => {
     }
     const session = await host.coordinator.registerBoard("user-1", shared);
     expect(session.getErrors()).toEqual([]);
-    const alice = { sub: "auth0|alice", email: "alice@example.com", name: "Alice" };
+    const alice = { sub: "user-1", email: "alice@example.com", name: "Alice" };
     const browser = await attachBrowser(session, [], { role: "owner", caller: alice });
 
     try {

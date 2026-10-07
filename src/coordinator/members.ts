@@ -42,12 +42,15 @@ export type MemberLimits = {
   maxBridgesPerMember?: number;
   /** How many process calls a member may make on one board per minute. */
   maxMemberProcessPerMinute?: number;
+  /** Longest a run may retain a person actor's authority. */
+  maxPersonRunAgeMs?: number;
 };
 
 export const DEFAULT_MEMBER_LIMITS: Required<MemberLimits> = {
   maxMembersPerBoard: 200,
   maxBridgesPerMember: 4,
   maxMemberProcessPerMinute: 120,
+  maxPersonRunAgeMs: 15 * 60 * 1000,
 };
 
 /** Refused for being over a limit; carries what to tell the owner. */

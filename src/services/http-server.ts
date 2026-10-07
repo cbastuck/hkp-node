@@ -1041,7 +1041,7 @@ export class HttpServerSubservicesService implements HostedService {
     // continues it. Minting one here rather than letting each leg mint its own
     // is what keeps a request's trace joined up instead of arriving as two
     // unrelated runs that happen to share a timestamp.
-    const runContext = newRun();
+    const runContext = newRun("mount");
 
     let output: unknown;
     let processInput: unknown;

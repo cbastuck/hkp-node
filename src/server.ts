@@ -882,15 +882,11 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
     const runtime = runtimeApp.createRuntime(owner, config, space);
     if (linked) {
       runtime.registerNotificationTarget((notification) => {
-        // Named with whoever began the run it was raised in, which is how the
-        // coordinator knows whose it is to hear. Raised outside a run — a
-        // timer, a callback — it names nobody.
-        const caller = runtime.currentContext()?.caller;
         coordinatorLinks.emit(linked, {
           type: "notification",
           serviceUuid: notification.instanceId,
           payload: notification.payload,
-          ...(caller ? { caller } : {}),
+          context: contextToWire(notification.context),
         });
       });
       runtime.registerLogTarget((entry) => {
@@ -967,7 +963,7 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
         const runtime = linkedRuntime(linked);
         return runtime ? { services: runtime.listServices() } : null;
       },
-      configureService: async (linked, serviceUuid, config) => {
+      configureService: async (linked, serviceUuid, config, context) => {
         const runtime = linkedRuntime(linked);
         if (!runtime) {
           throw new Error("the runtime is not running");
@@ -975,7 +971,8 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
         if (!isJsonRecord(config)) {
           throw new Error("a service is configured with an object");
         }
-        if (!runtime.configureService(serviceUuid, config)) {
+        const run = contextFromLink(context) ?? newRun();
+        if (!runtime.configureService(serviceUuid, config, run)) {
           throw new Error(`no service "${serviceUuid}"`);
         }
         return waitForServiceActivationState(runtime, serviceUuid);
@@ -1452,7 +1449,11 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
         return;
       }
 
-      let state = runtime.configureService(req.params.instanceId, req.body);
+      let state = runtime.configureService(
+        req.params.instanceId,
+        req.body,
+        contextForClient(undefined, req.authenticatedUser),
+      );
       if (!state) {
         res.sendStatus(404);
         return;

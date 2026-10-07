@@ -137,6 +137,7 @@ export type LinkHost = {
     runtime: LinkedRuntime,
     serviceUuid: string,
     config: unknown,
+    context: unknown,
   ): Promise<unknown>;
   /**
    * Begins the runtime's pipeline at one service, as the run `context` names.
@@ -494,6 +495,7 @@ class Link {
           runtime,
           request.serviceUuid,
           request.config,
+          request.context,
         );
       case "processService":
         this.host.processService(

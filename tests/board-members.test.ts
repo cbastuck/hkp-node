@@ -640,7 +640,14 @@ describe("what a member may send", () => {
       payload: {
         caller_email: BEN.email,
         caller_sub: BEN.sub,
-        __context: { caller: { sub: BEN.sub, email: BEN.email } },
+        __context: {
+          actor: {
+            kind: "person",
+            sub: BEN.sub,
+            email: BEN.email,
+            expiresAt: Date.now() + 60_000,
+          },
+        },
       },
     });
 
@@ -828,6 +835,65 @@ describe("a member's bridge and the board's runtimes", () => {
     expect(anna.all("notification").map((n) => n.payload)).toEqual([{ at: 1 }]);
   });
 
+  it("drops a person's late result after membership is revoked", async () => {
+    const fakes = fakeParticipants();
+    const a = fakes.join("a");
+    const b = fakes.join("b");
+    let allowed = true;
+    const session = new BoardSession(
+      "chain",
+      OWNER.sub,
+      CHAIN,
+      fakes.participants,
+      undefined,
+      undefined,
+      {},
+      () => allowed,
+    );
+    cleanups.push(() => session.destroy());
+    await session.start();
+    allowed = false;
+
+    a.emit({
+      type: "result",
+      data: { private: true },
+      context: {
+        runId: "late",
+        actor: {
+          kind: "person",
+          sub: ANNA.sub,
+          email: ANNA.email,
+          expiresAt: Date.now() + 60_000,
+        },
+      },
+    });
+    await settle();
+
+    expect(b.processed).toEqual([]);
+  });
+
+  it("drops an expired person's notification", async () => {
+    const { a, attach } = await chain();
+    const anna = await attach([], member(ANNA, "Anna"));
+    a.emit({
+      type: "notification",
+      serviceUuid: "tick",
+      payload: { private: true },
+      context: {
+        runId: "expired",
+        actor: {
+          kind: "person",
+          sub: ANNA.sub,
+          email: ANNA.email,
+          name: "Anna",
+          expiresAt: Date.now() - 1,
+        },
+      },
+    });
+    await settle();
+    expect(anna.all("notification")).toEqual([]);
+  });
+
   it("hears of what a service says only what the facade reads of it", async () => {
     const fakes = fakeParticipants();
     const a = fakes.join("a");
@@ -863,18 +929,19 @@ describe("a member's bridge and the board's runtimes", () => {
 
     const said = { rows: [{ court: 1 }], secret: "hunter2", count: 1 };
     a.emit({ type: "notification", serviceUuid: "tick", payload: said });
-    // Nothing the facade reads is in this one, and it is still news: what was
-    // shown before is no longer what the service says.
+    // Nothing the facade reads is in these. They reveal neither their payload
+    // nor that the service spoke, and cannot accidentally look like a clear.
     a.emit({ type: "notification", serviceUuid: "tick", payload: { secret: "hunter2" } });
     a.emit({ type: "notification", serviceUuid: "tick", payload: "hunter2" });
-    await eventually(() => owner.all("notification").length === 3, "the owner to hear all of it");
-    await eventually(() => anna.all("notification").length === 3, "the member to hear of all of it");
+    // A clear is explicit and does pass the projection.
+    a.emit({ type: "notification", serviceUuid: "tick", payload: { rows: [] } });
+    await eventually(() => owner.all("notification").length === 4, "the owner to hear all of it");
+    await eventually(() => anna.all("notification").length === 2, "the member to hear what it reads");
 
     expect(owner.all("notification")[0].payload).toEqual(said);
     expect(anna.all("notification").map((n) => n.payload)).toEqual([
       { rows: [{ court: 1 }] },
-      {},
-      {},
+      { rows: [] },
     ]);
   });
 
@@ -1075,10 +1142,13 @@ describe("reading a facade for what it grants", () => {
 
     expect(projectNotification(access, "status", { secret: 1 })).toEqual({ secret: 1 });
     expect(projectNotification(access, "status", "text")).toBe("text");
-    // Named by the facade, read by none of its sources.
-    expect(projectNotification(access, "upload", { secret: 1 })).toEqual({});
-    expect(projectNotification(access, "list", "text")).toEqual({});
-    expect(projectNotification(access, "list", null)).toEqual({});
+    // Named by the facade, read by none of its sources, or carrying none of
+    // the paths read: no observable notification is produced.
+    expect(projectNotification(access, "upload", { secret: 1 })).toBeUndefined();
+    expect(projectNotification(access, "list", "text")).toBeUndefined();
+    expect(projectNotification(access, "list", null)).toBeUndefined();
+    // Clearing something the facade actually reads remains observable.
+    expect(projectNotification(access, "list", { rows: [] })).toEqual({ rows: [] });
   });
 
   it("leaves a browser runtime's services with the owner", () => {

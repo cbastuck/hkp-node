@@ -14,7 +14,7 @@
  */
 
 import { AssetDescriptor } from "../assets";
-import { Caller, LogEntry, ProcessContext } from "../types";
+import { LogEntry, ProcessContext } from "../types";
 
 /** Where a runtime server connects in; relative to the coordinator's base. */
 export const JOIN_PATH = "/join";
@@ -76,7 +76,12 @@ export type ParticipantRequest =
   | ({ op: "provision" } & ProvisionPayload)
   /** Report the runtime's services and their state. */
   | { op: "describe" }
-  | { op: "configureService"; serviceUuid: string; config: unknown }
+  | {
+      op: "configureService";
+      serviceUuid: string;
+      config: unknown;
+      context?: ProcessContext;
+    }
   /**
    * Begin at one service: run the pipeline from it onward with `params`, as
    * the run `context` names. Answered once the work is taken; what it
@@ -117,15 +122,12 @@ export type ParticipantToCoordinator =
    * carries a run — and who began it — across a board's runtimes.
    */
   | { type: "result"; data: unknown; context?: ProcessContext }
-  /**
-   * `caller` is whoever began the run the notification was raised in, absent
-   * when it was raised outside one. It decides who is told.
-   */
+  /** The run the notification was raised in. It decides who is told. */
   | {
       type: "notification";
       serviceUuid: string;
       payload: unknown;
-      caller?: Caller;
+      context?: ProcessContext;
     }
   | { type: "log"; entry: LogEntry };
 

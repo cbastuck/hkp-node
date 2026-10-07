@@ -128,7 +128,7 @@ export class BoardSession {
   private readonly bridges = new Set<BrowserBridge>();
   private readonly pendingBrowserResults = new Map<
     string,
-    (data: unknown) => void
+    { resolve: (data: unknown) => void; timer: ReturnType<typeof setTimeout> }
   >();
   // Addresses services published for the mounts they own, keyed
   // "runtimeId/serviceUuid". This session coordinates the board, so it is what
@@ -175,6 +175,9 @@ export class BoardSession {
     // limit. The same setting bounds what a runtime server sends, where the
     // participants are accepted.
     private readonly limits: { maxFrameBytes?: number } & MemberLimits = {},
+    // Checked at every coordinator boundary. The coordinator owns membership,
+    // so runtimes cannot decide whether a captured person is still entitled.
+    private readonly mayActAs: (caller: Caller) => boolean = () => true,
   ) {
     this.createdAt = restored?.createdAt ?? new Date().toISOString();
     this.stopped = restored?.stopped ?? false;
@@ -428,7 +431,7 @@ export class BoardSession {
           runtimeId,
           event.serviceUuid,
           event.payload,
-          event.caller,
+          event.context,
         );
       }
       return;
@@ -605,6 +608,11 @@ export class BoardSession {
       bridge.ws.close();
     }
     this.bridges.clear();
+    for (const [requestId, pending] of this.pendingBrowserResults) {
+      this.pendingBrowserResults.delete(requestId);
+      clearTimeout(pending.timer);
+      pending.resolve(null);
+    }
   }
 
   /**
@@ -769,7 +777,7 @@ export class BoardSession {
       }
 
       if (message.type === "configureService") {
-        void this.serveBrowserRequest(ws, message);
+        void this.serveBrowserRequest(bridge, message);
         return;
       }
 
@@ -791,20 +799,26 @@ export class BoardSession {
       }
 
       if (message.type === "result" && message.requestId) {
-        const resolve = this.pendingBrowserResults.get(message.requestId);
-        if (resolve) {
+        const pending = this.pendingBrowserResults.get(message.requestId);
+        if (pending) {
           this.pendingBrowserResults.delete(message.requestId);
-          resolve(message.data);
+          clearTimeout(pending.timer);
+          pending.resolve(message.data);
         }
         return;
       }
 
       if (message.type === "result-from-browser" && message.runtimeId) {
-        // A run begun in this browser, by whoever attached with it.
+        // A person using the browser begins a run as the verified bridge
+        // caller. A Timer or standing subscription with no active call is the
+        // board's own and begins one with no caller. Only an owner bridge can
+        // reach this branch, so letting it say "nobody" grants it nothing.
         this.routeResult(
           message.runtimeId,
           message.data,
-          this.beginRun(bridge),
+          message.boardOrigin === true || message.callerless === true
+            ? { runId: randomUUID(), actor: { kind: "board" } }
+            : this.beginRun(bridge),
         ).catch((err) => {
           console.error(
             `[coordinator] Failed to route result from browser runtime "${message.runtimeId}":`,
@@ -819,9 +833,10 @@ export class BoardSession {
       // Only abandon in-flight browser results once nobody remains who could
       // answer them; another of the owner's bridges may still reply.
       if (this.hostingBridges().length === 0) {
-        for (const [requestId, resolve] of this.pendingBrowserResults) {
+        for (const [requestId, pending] of this.pendingBrowserResults) {
           this.pendingBrowserResults.delete(requestId);
-          resolve(null);
+          clearTimeout(pending.timer);
+          pending.resolve(null);
         }
       }
     });
@@ -863,7 +878,7 @@ export class BoardSession {
     runtimeId: string,
     serviceUuid: string,
     payload: unknown,
-    caller?: Caller,
+    context?: ProcessContext,
   ): void {
     // Pass it on as what it is. A service's notifications are its output, not
     // its state — a Monitor's message never appears in its getState — so a
@@ -871,7 +886,7 @@ export class BoardSession {
     // notifications it would have received from the runtime directly. A payload
     // is whatever the service said, string and number included; only the mount
     // address below is looked for, and only an object can carry one.
-    this.deliverNotification(runtimeId, serviceUuid, payload, caller);
+    this.deliverNotification(runtimeId, serviceUuid, payload, context);
 
     if (!payload || typeof payload !== "object") {
       return;
@@ -906,11 +921,10 @@ export class BoardSession {
   /**
    * Tells the browsers that are to hear it what a service said.
    *
-   * A notification raised inside a run somebody began is theirs: it goes to
-   * the bridges they attached with, and to nobody else — what one member's
-   * action produced is not another member's to read, and not the owner's to
-   * watch. One raised in a run nobody began — a timer, a request at a mount —
-   * is the board's own news and goes to everyone.
+   * A notification raised with a person actor goes to that person's bridges
+   * and nobody else's — what one member's action produced is not another
+   * member's to read, and not the owner's to watch. Board, mount and local
+   * actors produce shared board news, so those notifications go to everyone.
    *
    * A member is sent it only from a service the facade reads, cut down to
    * what the facade reads of it, and never the runtime's own account of its
@@ -921,12 +935,18 @@ export class BoardSession {
     runtimeId: string,
     serviceUuid: string,
     payload: unknown,
-    caller?: Caller,
+    context?: ProcessContext,
   ): void {
+    if (!this.runMayContinue(context)) {
+      return;
+    }
+    const caller =
+      context?.actor.kind === "person" ? context.actor : undefined;
     const frameOf = (said: unknown) =>
       JSON.stringify({ type: "notification", runtimeId, serviceUuid, payload: said });
     let whole: string | null = null;
     let projected: string | null = null;
+    let projectionDone = false;
     for (const bridge of this.bridges) {
       if (caller && bridge.caller?.sub !== caller.sub) {
         continue;
@@ -941,10 +961,14 @@ export class BoardSession {
         continue;
       }
       if (bridge.role === "member") {
-        projected ??= frameOf(
-          projectNotification(this.access, serviceUuid, payload),
-        );
-        bridge.ws.send(projected);
+        if (!projectionDone) {
+          const said = projectNotification(this.access, serviceUuid, payload);
+          projected = said === undefined ? null : frameOf(said);
+          projectionDone = true;
+        }
+        if (projected !== null) {
+          bridge.ws.send(projected);
+        }
       } else {
         whole ??= frameOf(payload);
         bridge.ws.send(whole);
@@ -1018,10 +1042,32 @@ export class BoardSession {
 
   /** A run a browser begins, as whoever attached with it. */
   private beginRun(bridge: BrowserBridge): ProcessContext {
+    const now = Date.now();
     return {
       runId: randomUUID(),
-      ...(bridge.caller ? { caller: bridge.caller } : {}),
+      actor: bridge.caller
+        ? {
+            kind: "person",
+            ...bridge.caller,
+            expiresAt:
+              now +
+              (this.limits.maxPersonRunAgeMs ??
+                DEFAULT_MEMBER_LIMITS.maxPersonRunAgeMs),
+          }
+        : { kind: "local" },
     };
+  }
+
+  /** Whether the authority captured by a run is still valid now. */
+  private runMayContinue(context?: ProcessContext): boolean {
+    if (!context || context.actor.kind !== "person") {
+      return true;
+    }
+    return (
+      Number.isFinite(context.actor.expiresAt) &&
+      context.actor.expiresAt > Date.now() &&
+      this.mayActAs(context.actor)
+    );
   }
 
   /**
@@ -1128,9 +1174,9 @@ export class BoardSession {
   /**
    * Asks a service on a remote runtime to do its job, for a browser.
    *
-   * The run begins here, as whoever attached with the bridge — which is what
-   * makes the caller something the runtime can rely on: it was established
-   * when the bridge was admitted, and nothing in the message can change it.
+   * The run begins here. Its person actor, when there is one, was established
+   * when the bridge was admitted, so runtimes can rely on it and nothing in
+   * the message can change it.
    *
    * The answer says only whether the work was taken. What it produces arrives
    * the way a pipeline's output always does — as notifications, and as a
@@ -1219,9 +1265,10 @@ export class BoardSession {
    * actually took effect.
    */
   private async serveBrowserRequest(
-    ws: WebSocket,
+    bridge: BrowserBridge,
     message: Extract<BridgeMessage, { type: "configureService" }>,
   ): Promise<void> {
+    const ws = bridge.ws;
     const participant = this.live.has(message.runtimeId)
       ? this.participants.get(message.runtimeId)
       : undefined;
@@ -1243,6 +1290,7 @@ export class BoardSession {
         op: "configureService",
         serviceUuid: message.serviceUuid,
         config: message.config ?? {},
+        context: this.beginRun(bridge),
       });
       const states = this.serviceStates.get(message.runtimeId) ?? {};
       states[message.serviceUuid] = data;
@@ -1347,7 +1395,12 @@ export class BoardSession {
     try {
       await this.participants
         .get(runtimeId)
-        ?.request({ op: "configureService", serviceUuid, config: state });
+        ?.request({
+          op: "configureService",
+          serviceUuid,
+          config: state,
+          context: { runId: randomUUID(), actor: { kind: "board" } },
+        });
     } catch (err) {
       console.error(
         `[coordinator] Failed to configure "${serviceUuid}" on runtime "${runtimeId}":`,
@@ -1368,6 +1421,9 @@ export class BoardSession {
     data: unknown,
     context?: ProcessContext,
   ): Promise<void> {
+    if (!this.runMayContinue(context)) {
+      return;
+    }
     const next = this.nextRuntime(fromRuntimeId, this.config.runtimes);
     if (!next) {
       return;
@@ -1405,7 +1461,17 @@ export class BoardSession {
       // Monitor) updates. The first reply resolves the chain; later replies for
       // the same requestId are no-ops since its pending entry is already gone.
       const result = await new Promise<unknown>((resolve) => {
-        this.pendingBrowserResults.set(requestId, resolve);
+        const remaining =
+          context?.actor.kind === "person"
+            ? Math.max(0, context.actor.expiresAt - Date.now())
+            : this.limits.maxPersonRunAgeMs ??
+              DEFAULT_MEMBER_LIMITS.maxPersonRunAgeMs;
+        const timer = setTimeout(() => {
+          this.pendingBrowserResults.delete(requestId);
+          resolve(null);
+        }, remaining);
+        timer.unref?.();
+        this.pendingBrowserResults.set(requestId, { resolve, timer });
         // The browser is told the run so that what it records belongs to it.
         // What continues the chain below is the context held here, not
         // whatever comes back.

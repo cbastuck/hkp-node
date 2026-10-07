@@ -36,8 +36,9 @@
  * interpolated — a subject line containing a quote is a subject line, not a
  * syntax error, and not an injection.
  *
- * **Who is calling is bound by the service, never by the input.** Three
- * names are reserved — `$caller_email`, `$caller_name`, `$caller_sub` — and
+ * **Who is calling is bound by the service, never by the input.** Four
+ * names are reserved — `$caller_email`, `$caller_name`, `$caller_sub` and
+ * `$actor_kind` — and
  * are given the caller of the run in progress: whoever the server that began
  * it verified. Each is `NULL` when the run has no caller or the caller has no
  * such value, and an input field of the same name is ignored. Reserved here
@@ -365,16 +366,20 @@ export class SqlService implements HostedService {
       input && typeof input === "object" && !Array.isArray(input)
         ? (input as JsonRecord)
         : {};
-    const caller = this.host?.currentContext()?.caller;
+    const context = this.host?.currentContext();
+    const caller = context?.actor.kind === "person" ? context.actor : undefined;
     const params: Record<string, SqlValue> = {};
     for (const match of codeOf(this.statement).matchAll(NAMED_PARAMETER)) {
       const name = match[1];
       const reserved = CALLER_PARAMETERS[name];
       // Never the input's to supply, present or not: a caller the run does
       // not have is NULL, not whatever the payload claims.
-      params[name] = reserved
-        ? bindable(caller?.[reserved])
-        : bindable(record[name]);
+      params[name] =
+        name === "actor_kind"
+          ? bindable(context?.actor.kind ?? "board")
+          : reserved
+            ? bindable(caller?.[reserved])
+            : bindable(record[name]);
     }
     return params;
   }

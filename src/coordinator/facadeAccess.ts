@@ -161,20 +161,22 @@ export function projectState(
  * A source without a path reads the notification whole, so the whole of it is
  * given. Otherwise it is cut down to the paths read: each of them resolves in
  * what is returned to exactly what it resolved to in what was said, and
- * nothing beside them is there. A notification holding none of them comes out
- * empty rather than not at all — that a service spoke, and no longer says what
- * it said before, is itself read.
+ * nothing beside them is there. A notification holding none of them is not a
+ * notification for this facade: forwarding an empty object would reveal that
+ * the service spoke but would not clear a widget, since none of its source
+ * paths changed. A service clears a value explicitly (`rows: []`, for example).
  */
 export function projectNotification(
   access: FacadeAccess,
   serviceUuid: string,
   payload: unknown,
-): unknown {
+): unknown | undefined {
   const paths = access.sources.get(serviceUuid) ?? new Set<string>();
   if (paths.has("")) {
     return payload;
   }
-  return pick(payload, paths);
+  const projected = pick(payload, paths);
+  return Object.keys(projected).length > 0 ? projected : undefined;
 }
 
 /** The values at `paths` in `value`, at the same paths in an object of their

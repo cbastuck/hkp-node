@@ -67,7 +67,16 @@ function club() {
       "give-back",
       { state: "none", dayOffset: 0, ...payload },
       () => {},
-      { runId: "run", ...(caller ? { caller } : {}) },
+      {
+        runId: "run",
+        actor: caller
+          ? {
+              kind: "person" as const,
+              ...caller,
+              expiresAt: Date.now() + 60_000,
+            }
+          : { kind: "local" as const },
+      },
     )) as { rows: Cell[] };
     return result.rows;
   };
@@ -219,21 +228,13 @@ describe("the court-booking board, shared", () => {
 });
 
 describe("the court-booking board with nobody signed in", () => {
-  it("books in the name typed into the facade", async () => {
-    const { act, cell } = club();
-
-    const mine = await act(undefined, book(1, 10, { member: "you@club.example" }));
-    const theirs = await act(undefined, { member: "other@club.example" });
-
-    expect(cell(mine, 1, 10)).toMatchObject({ state: "mine", label: "You" });
-    // Nobody named them, so nobody's address is shown.
-    expect(cell(theirs, 1, 10)).toMatchObject({ state: "taken", label: "Member" });
-  });
-
-  it("offers nothing to nobody", async () => {
+  it("offers nothing even when the payload names a member", async () => {
     const { act } = club();
 
-    const day = await act(undefined, { member: "" });
+    const day = await act(
+      undefined,
+      book(1, 10, { member: "you@club.example" }),
+    );
 
     expect(day.every((c) => c.state === "blocked")).toBe(true);
   });

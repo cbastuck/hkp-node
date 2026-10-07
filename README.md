@@ -61,6 +61,7 @@ All options are passed as environment variables.
 | `HKP_COORDINATOR_MAX_MEMBERS` | `200`     | Coordinator only. How many people one deployed board may be shared with. |
 | `HKP_COORDINATOR_MAX_MEMBER_BRIDGES` | `4` | Coordinator only. How many browsers one member may have attached to one board at once. |
 | `HKP_COORDINATOR_MAX_MEMBER_PROCESS_PER_MINUTE` | `120` | Coordinator only. How many times a minute one member may ask a shared board to do something. |
+| `HKP_COORDINATOR_MAX_PERSON_RUN_AGE_MS` | `900000` | Coordinator only. Maximum age of a person-actor run (15 minutes). The coordinator rechecks membership and this deadline whenever work crosses a runtime or sends a notification. |
 | `HKP_COORDINATOR_DATA_DIR`   | `~/.hkp/coordinator/boards` | Where the coordinator keeps the boards it has been given, one JSON file each, so they survive a restart. Set to the empty string to keep them in memory only. Files hold the board's config — which can carry service credentials — and are written `0600` under `0700` directories. One directory belongs to one coordinator: two processes sharing it will both restore every board and fight over the same runtimes. |
 
 ### Authentication

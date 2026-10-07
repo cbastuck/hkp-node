@@ -19,7 +19,7 @@ import {
   encodeBinaryFrame,
   frameBytes,
 } from "./binaryFrame";
-import { callerFromWire, contextFromLink } from "../runtime";
+import { contextFromLink } from "../runtime";
 import { ProcessContext } from "../types";
 
 /**
@@ -192,12 +192,11 @@ class SocketParticipant implements Participant {
       return;
     }
     if (message.type === "notification") {
-      const caller = callerFromWire(message.caller);
       this.listener?.({
         type: "notification",
         serviceUuid: message.serviceUuid,
         payload: message.payload,
-        ...(caller ? { caller } : {}),
+        context: contextFromLink(message.context),
       });
       return;
     }

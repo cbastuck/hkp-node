@@ -162,6 +162,11 @@ async function main() {
                   process.env.HKP_COORDINATOR_MAX_MEMBER_PROCESS_PER_MINUTE,
                   0,
                 ) || undefined,
+              maxPersonRunAgeMs:
+                readInteger(
+                  process.env.HKP_COORDINATOR_MAX_PERSON_RUN_AGE_MS,
+                  0,
+                ) || undefined,
             },
           )
         : undefined,

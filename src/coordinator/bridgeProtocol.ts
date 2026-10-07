@@ -143,8 +143,8 @@ export type BridgeMessage =
    * means on a deployed board. Answered with `response`: accepted, or why not.
    * What the pipeline produces arrives as notifications, as always.
    *
-   * The run it begins is the browser's own: its caller is whoever attached
-   * with this bridge, whatever the payload says.
+   * The run it begins has a person actor when an authenticated person attached
+   * with this bridge, whatever the payload says; otherwise its actor is local.
    */
   | {
       type: "processService";
@@ -155,8 +155,21 @@ export type BridgeMessage =
     }
   /** A result the browser produced for a `processRuntime` it was asked to run. */
   | { type: "result"; requestId: string; data?: unknown }
-  /** A browser runtime finished its own pipeline; drive the next runtime. */
-  | { type: "result-from-browser"; runtimeId: string; data?: unknown }
+  /**
+   * A browser runtime finished its own pipeline; drive the next runtime.
+   * `boardOrigin` is stated only by an owner's bridge and means the value came
+   * from the board itself — a timer or standing subscription — rather than a
+   * person using that browser. The coordinator still chooses the caller; it
+   * never accepts one from this frame.
+   */
+  | {
+      type: "result-from-browser";
+      runtimeId: string;
+      data?: unknown;
+      boardOrigin?: boolean;
+      /** Accepted during the transition from the old ambiguous vocabulary. */
+      callerless?: boolean;
+    }
   /**
    * An entry a runtime this browser hosts recorded.
    *

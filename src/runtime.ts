@@ -13,6 +13,7 @@ import {
   RuntimeDescriptor,
   RuntimeHost,
   RuntimeNotification,
+  RunActor,
   RuntimeScope,
   ServiceCreator,
   ServiceConfiguration,
@@ -34,8 +35,12 @@ export const LOG_LEVELS: Record<LogLevel, number> = {
 };
 
 /** A run with no parent: something outside the board asked for this. */
-export function newRun(): ProcessContext {
-  return { runId: randomUUID() };
+export const DEFAULT_PERSON_RUN_TTL_MS = 15 * 60 * 1000;
+
+export function newRun(
+  kind: Exclude<RunActor["kind"], "person"> = "board",
+): ProcessContext {
+  return { runId: randomUUID(), actor: { kind } };
 }
 
 /**
@@ -58,6 +63,7 @@ export function contextFromWire(value: unknown): ProcessContext | undefined {
     runId: str("runId") ?? randomUUID(),
     parentRunId: str("parentRunId"),
     requestId: str("requestId"),
+    actor: { kind: "local" },
   };
 }
 
@@ -89,9 +95,19 @@ export function contextForClient(
   wire: unknown,
   user: AuthenticatedUser | undefined,
 ): ProcessContext {
-  const context = contextFromWire(wire) ?? newRun();
+  const context =
+    contextFromWire(wire) ?? newRun("local");
   const caller = callerOf(user);
-  return caller ? { ...context, caller } : context;
+  return {
+    ...context,
+    actor: caller
+      ? {
+          kind: "person",
+          ...caller,
+          expiresAt: Date.now() + DEFAULT_PERSON_RUN_TTL_MS,
+        }
+      : { kind: "local" },
+  };
 }
 
 /** A caller as a participant link states one, or nothing when the shape is off. */
@@ -112,6 +128,36 @@ export function callerFromWire(value: unknown): Caller | undefined {
   };
 }
 
+/** An actor as a trusted participant link states it. */
+export function actorFromWire(value: unknown): RunActor | undefined {
+  if (typeof value !== "object" || value === null) {
+    return undefined;
+  }
+  const wire = value as Record<string, unknown>;
+  if (wire.kind === "person") {
+    const caller = callerFromWire(wire);
+    return caller
+      ? {
+          kind: "person",
+          ...caller,
+          expiresAt:
+            typeof wire.expiresAt === "number" &&
+            Number.isFinite(wire.expiresAt)
+              ? wire.expiresAt
+              : 0,
+        }
+      : { kind: "person", sub: "", expiresAt: 0 };
+  }
+  if (
+    wire.kind === "board" ||
+    wire.kind === "mount" ||
+    wire.kind === "local"
+  ) {
+    return { kind: wire.kind };
+  }
+  return undefined;
+}
+
 /**
  * The context of a run as it is said over a participant link, by either end:
  * a coordinator continuing a run on a runtime, or a runtime handing back what
@@ -128,10 +174,13 @@ export function contextFromLink(value: unknown): ProcessContext | undefined {
   if (!context) {
     return undefined;
   }
-  const caller = callerFromWire((value as Record<string, unknown>).caller);
+  const wire = value as Record<string, unknown>;
   // The reply address belongs to whoever was waiting at the other end.
   const { requestId: _requestId, ...run } = context;
-  return caller ? { ...run, caller } : run;
+  return {
+    ...run,
+    actor: actorFromWire(wire.actor) ?? { kind: "board" },
+  };
 }
 
 /**
@@ -147,7 +196,7 @@ export function contextToWire(
   return {
     runId: context.runId,
     ...(context.parentRunId ? { parentRunId: context.parentRunId } : {}),
-    ...(context.caller ? { caller: context.caller } : {}),
+    actor: context.actor,
   };
 }
 
@@ -157,17 +206,27 @@ export function contextToWire(
  * The child gets an identity of its own rather than borrowing its parent's, so
  * that work done inside a sub-pipeline stays distinguishable from work done
  * around it — which is the whole difference between a trace that shows nesting
- * and one that shows a flat list in timestamp order. Who began the work is the
- * same person however deep it goes, so the caller is inherited.
+ * and one that shows a flat list in timestamp order. The actor is inherited
+ * exactly, whether it is a person, the board, a mount, or local work.
  */
 export function childRun(parent: ProcessContext | null): ProcessContext {
   return parent
     ? {
         runId: randomUUID(),
         parentRunId: parent.runId,
-        ...(parent.caller ? { caller: parent.caller } : {}),
+        actor: parent.actor,
       }
     : newRun();
+}
+
+/** Whether a run's delegated person authority is no longer valid. */
+export function runExpired(
+  context: ProcessContext | null | undefined,
+  now = Date.now(),
+): boolean {
+  return (
+    context?.actor.kind === "person" && context.actor.expiresAt <= now
+  );
 }
 
 /**
@@ -393,12 +452,18 @@ export class HostedRuntime implements RuntimeHost {
     return service.getState();
   }
 
-  configureService(address: string, config: JsonRecord): JsonRecord | null {
+  configureService(
+    address: string,
+    config: JsonRecord,
+    context?: ProcessContext | null,
+  ): JsonRecord | null {
     const service = this.getService(address);
     if (!service) {
       return null;
     }
-    return service.configure(config);
+    const configure = () =>
+      this.inService(service.uuid, () => service.configure(config));
+    return context ? this.withContext(context, configure) : configure();
   }
 
   removeService(uuid: string): boolean {
@@ -617,8 +682,8 @@ export class HostedRuntime implements RuntimeHost {
     if (run.parentRunId) {
       entry.parentRunId = run.parentRunId;
     }
-    if (run.caller) {
-      entry.caller = run.caller.sub;
+    if (run.actor.kind === "person") {
+      entry.caller = run.actor.sub;
     }
     if (this.logData && data !== undefined) {
       entry.data = data;
@@ -643,7 +708,7 @@ export class HostedRuntime implements RuntimeHost {
       target({
         runId: run.runId,
         ...(run.parentRunId ? { parentRunId: run.parentRunId } : {}),
-        ...(run.caller ? { caller: run.caller.sub } : {}),
+        ...(run.actor.kind === "person" ? { caller: run.actor.sub } : {}),
         ts: new Date().toISOString(),
         runtimeId: this.id,
         serviceUuid: this.currentService ?? "",
@@ -895,6 +960,10 @@ export class HostedRuntime implements RuntimeHost {
     let result: unknown = input;
 
     for (const uuid of this.serviceOrder.slice(startIndex)) {
+      if (runExpired(this.currentContext())) {
+        this.log("warn", "run.expired");
+        return null;
+      }
       const service = this.services.get(uuid);
       if (!service) {
         continue;
@@ -928,9 +997,14 @@ export class HostedRuntime implements RuntimeHost {
         // about *what ran* is not asking to write payloads to disk. What flows
         // through is recorded only where a service was configured to record it.
         this.log("debug", "service.process");
+        const notificationContext = this.currentContext() ?? undefined;
         return service.process(result, (payload, instanceId) => {
           this.emitNotification(
-            { instanceId: instanceId ?? uuid, payload },
+            {
+              instanceId: instanceId ?? uuid,
+              payload,
+              context: notificationContext,
+            },
             onNotification,
           );
         });
@@ -974,9 +1048,15 @@ export class HostedRuntime implements RuntimeHost {
     notification: RuntimeNotification,
     onNotification: (notification: RuntimeNotification) => void,
   ): void {
-    onNotification(notification);
+    const contextual = notification.context
+      ? notification
+      : {
+          ...notification,
+          context: this.currentContext() ?? newRun("board"),
+        };
+    onNotification(contextual);
     for (const target of this.notificationTargets) {
-      target(notification);
+      target(contextual);
     }
   }
 }

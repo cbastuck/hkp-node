@@ -51,7 +51,11 @@ function session(fakes: ReturnType<typeof fakeParticipants>, board = config) {
 }
 
 /** A browser attached to the session, over a real socket pair. */
-async function attach(target: BoardSession, runtimeIds: string[] = ["ui"]) {
+async function attach(
+  target: BoardSession,
+  runtimeIds: string[] = ["ui"],
+  caller?: { sub: string; email?: string; name?: string },
+) {
   const received: BridgeMessage[] = [];
   const httpServer = http.createServer();
   const sockets = new WebSocketServer({ server: httpServer });
@@ -67,7 +71,10 @@ async function attach(target: BoardSession, runtimeIds: string[] = ["ui"]) {
     received.push(JSON.parse(raw.toString()) as BridgeMessage),
   );
   await new Promise<void>((resolve) => client.on("open", () => resolve()));
-  target.registerBrowserSocket(await serverSide, runtimeIds);
+  target.registerBrowserSocket(await serverSide, runtimeIds, {
+    role: "owner",
+    ...(caller ? { caller } : {}),
+  });
   cleanups.push(async () => {
     client.close();
     sockets.close();
@@ -335,6 +342,45 @@ describe("driving the chain", () => {
 });
 
 describe("acting on a board's runtimes", () => {
+  it("configures a service as the owner attached to the browser", async () => {
+    const fakes = fakeParticipants();
+    const a = fakes.join("a");
+    fakes.join("b");
+    const board = session(fakes);
+    await board.start();
+    const browser = await attach(board, ["ui"], {
+      sub: "auth0|owner",
+      email: "owner@example.com",
+    });
+
+    browser.send({
+      type: "configureService",
+      requestId: "req-context",
+      runtimeId: "a",
+      serviceUuid: "a-1",
+      config: { n: 2 },
+    });
+
+    await eventually(() => !!browser.last("response"), "the answer");
+    const request = [...a.requests]
+      .reverse()
+      .find((candidate) => candidate.op === "configureService");
+    expect(request).toMatchObject({
+      op: "configureService",
+      serviceUuid: "a-1",
+      config: { n: 2 },
+      context: {
+        runId: expect.any(String),
+        actor: {
+          kind: "person",
+          sub: "auth0|owner",
+          email: "owner@example.com",
+          expiresAt: expect.any(Number),
+        },
+      },
+    });
+  });
+
   it("refuses to configure a service on a runtime that is away, saying so", async () => {
     const fakes = fakeParticipants();
     fakes.join("a");

@@ -109,9 +109,10 @@ async function introduceOver(
   host: CoordinatorHost,
   boardName: string,
   placement: Array<readonly [string, string]>,
+  userId = "user-1",
 ): Promise<void> {
   const tickets = await host.coordinator.issueTickets(
-    "user-1",
+    userId,
     boardName,
     placement.map(([runtimeId]) => runtimeId),
   );
@@ -207,13 +208,22 @@ describe.skipIf(!RT_BIN)("a board across hkp-node and hkp-rt", () => {
         ],
       },
     };
-    await introduceOver(host, shared.boardName, [
-      ["cpp", rt.baseUrl],
-      ["node", node.baseUrl],
-    ]);
-    const session = await host.coordinator.registerBoard("user-1", shared);
+    const alice = {
+      sub: "auth0|alice",
+      email: "alice@example.com",
+      name: "Alice",
+    };
+    await introduceOver(
+      host,
+      shared.boardName,
+      [
+        ["cpp", rt.baseUrl],
+        ["node", node.baseUrl],
+      ],
+      alice.sub,
+    );
+    const session = await host.coordinator.registerBoard(alice.sub, shared);
     expect(session.getErrors()).toEqual([]);
-    const alice = { sub: "auth0|alice", email: "alice@example.com", name: "Alice" };
     const browser = await attachBrowser(session, [], { role: "owner", caller: alice });
 
     try {

@@ -193,6 +193,8 @@ export type HostedServiceFactory = {
 export type RuntimeNotification = {
   instanceId: string;
   payload: unknown;
+  /** The run in which it was raised, captured at the service call boundary. */
+  context?: ProcessContext;
 };
 
 /**
@@ -245,6 +247,13 @@ export type Caller = {
   name?: string;
 };
 
+/** What is acting in a run. Person identity is present only in that case. */
+export type RunActor =
+  | ({ kind: "person"; expiresAt: number } & Caller)
+  | { kind: "board" }
+  | { kind: "mount" }
+  | { kind: "local" };
+
 export type ProcessContext = {
   /**
    * Identifies one invocation of a board — one webhook, one timer tick, one
@@ -264,11 +273,10 @@ export type ProcessContext = {
    */
   requestId?: string;
   /**
-   * Who began this run, when somebody did. It travels with the run — into a
-   * nested pipeline, and across the runtimes of a deployed board — so a
-   * service asks here rather than trusting a field of its input.
+   * What is acting in this run. A person actor is stated only by the server
+   * that verified them and carries the deadline of that delegated authority.
    */
-  caller?: Caller;
+  actor: RunActor;
 };
 
 export type LogLevel = "debug" | "info" | "warn" | "error";
