@@ -1,10 +1,25 @@
 import { CloudBoardConfig, BoardSessionInfo } from "./types";
-import { BoardSession } from "./session";
+import { BoardSession, CLOSE_NOT_A_MEMBER } from "./session";
 import { BoardStore, createMemoryBoardStore } from "./boardStore";
 import { LogStore } from "./logStore";
 import { LogEntry, LogLevel } from "../types";
 import { ParticipantRegistry } from "./participants";
 import { isRemoteRuntime } from "./types";
+import {
+  BoardMember,
+  DEFAULT_MEMBER_LIMITS,
+  MemberLimitError,
+  MemberLimits,
+  SharedBoardInfo,
+  findMember,
+  readMembers,
+} from "./members";
+import { normalizeEmail } from "../auth";
+
+// NUL occurs in neither part, so the join is unambiguous.
+function boardKey(userId: string, boardName: string): string {
+  return `${userId}\u0000${boardName}`;
+}
 
 export class BoardCoordinator {
   // userId → boardName → BoardSession
@@ -12,6 +27,13 @@ export class BoardCoordinator {
   // In-flight registrations, keyed by user and board, so a second one waits for
   // the first rather than tearing down what it is building.
   private readonly registrations = new Map<string, Promise<BoardSession>>();
+  // Who each board is shared with, by owner and board. Kept here rather than
+  // on a session: a session is one run of a board and is replaced on every
+  // deploy, while the list is the board's and outlives all of them.
+  private readonly members = new Map<string, BoardMember[]>();
+  // What is being asked of the store, by owner and board: the end of the line
+  // each board's writes and its removal wait in. See inStoreOrder.
+  private readonly storeWork = new Map<string, Promise<void>>();
 
   /** Where the boards themselves are kept; see BoardStore. In memory unless a
    *  caller supplies somewhere that outlives the process. */
@@ -31,7 +53,7 @@ export class BoardCoordinator {
      * What this coordinator's operator allows. `maxFrameBytes` bounds a single
      * value passed between runtimes; unset means no limit.
      */
-    private readonly limits: { maxFrameBytes?: number } = {},
+    private readonly limits: { maxFrameBytes?: number } & MemberLimits = {},
   ) {
     this.participants =
       participants ??
@@ -42,7 +64,7 @@ export class BoardCoordinator {
         onTicketsChanged: (userId, boardName) => {
           const session = this.getBoard(userId, boardName);
           if (session) {
-            void this.persist(session);
+            void this.persist(userId, boardName);
           }
         },
       });
@@ -81,6 +103,10 @@ export class BoardCoordinator {
         board.boardName,
         board.tickets ?? [],
       );
+      this.members.set(
+        boardKey(board.userId, board.boardName),
+        readMembers(board.members),
+      );
       // Written by a coordinator that kept no tickets: there is nothing that
       // could reconnect, so the board is as stopped as it always came back.
       const stopped = board.stopped ?? true;
@@ -92,6 +118,7 @@ export class BoardCoordinator {
         { createdAt: board.createdAt, stopped },
         this.logStore,
         this.limits,
+        (caller) => this.mayActAs(board.userId, board.boardName, caller),
       );
       this.userSessions(board.userId).set(board.boardName, session);
       if (!stopped) {
@@ -127,7 +154,7 @@ export class BoardCoordinator {
     // once — one for a runtime it had none for.
     const session = this.getBoard(userId, boardName);
     if (session) {
-      await this.persist(session);
+      await this.persist(userId, boardName);
     }
     return tickets;
   }
@@ -148,8 +175,47 @@ export class BoardCoordinator {
     }
   }
 
-  /** Writes a board down, with its tickets and whether it is stopped. */
-  private async persist(session: BoardSession): Promise<void> {
+  /**
+   * Runs something against the store for a board after whatever was asked of
+   * the store for that board before it.
+   *
+   * A store finishes what it is asked in no particular order — a write that
+   * began first can land last — so two things asked at once would leave
+   * whichever happened to finish later, and a removal could be undone by a
+   * write that was already on its way.
+   */
+  private inStoreOrder(key: string, task: () => Promise<void>): Promise<void> {
+    const queued = (this.storeWork.get(key) ?? Promise.resolve()).then(task);
+    // Kept as something that cannot reject: what follows it runs either way.
+    const settled = queued.catch(() => undefined);
+    this.storeWork.set(key, settled);
+    void settled.then(() => {
+      if (this.storeWork.get(key) === settled) {
+        this.storeWork.delete(key);
+      }
+    });
+    return queued;
+  }
+
+  /**
+   * Writes a board down, with its tickets, its members and whether it is
+   * stopped — as it is when the write begins, not as it was when it was asked
+   * for. Whatever asked may have waited behind another write, or may have
+   * been holding a session that a deploy has replaced since; the board
+   * registered under the name by then is the one that is true.
+   */
+  private persist(userId: string, boardName: string): Promise<void> {
+    return this.inStoreOrder(boardKey(userId, boardName), () =>
+      this.write(userId, boardName),
+    );
+  }
+
+  private async write(userId: string, boardName: string): Promise<void> {
+    const session = this.getBoard(userId, boardName);
+    if (!session) {
+      // Removed since: writing it would bring it back.
+      return;
+    }
     try {
       await this.store.save({
         userId: session.userId,
@@ -161,6 +227,7 @@ export class BoardCoordinator {
           session.userId,
           session.boardName,
         ),
+        members: this.getMembers(session.userId, session.boardName),
       });
     } catch (err) {
       // The board is as it should be in this process; only its survival of a
@@ -186,7 +253,7 @@ export class BoardCoordinator {
       return null;
     }
     await session.stop();
-    await this.persist(session);
+    await this.persist(userId, boardName);
     return session;
   }
 
@@ -257,13 +324,27 @@ export class BoardCoordinator {
       undefined,
       this.logStore,
       this.limits,
+      (caller) => this.mayActAs(userId, config.boardName, caller),
     );
     await session.start();
 
+    const members = this.getMembers(userId, config.boardName);
     for (const bridge of existingBridges) {
-      if (bridge.ws.readyState === 1 /* OPEN */) {
-        session.registerBrowserSocket(bridge.ws, bridge.runtimeIds);
+      if (bridge.ws.readyState !== 1 /* OPEN */) {
+        continue;
       }
+      const { ws, runtimeIds, role, caller } = bridge;
+      // The list is asked again rather than taken on trust from the session
+      // being replaced: it is the board's, and may have changed since this
+      // browser attached.
+      if (role === "member" && !findMember(members, caller?.email)) {
+        ws.close(CLOSE_NOT_A_MEMBER, "no longer shared");
+        continue;
+      }
+      session.registerBrowserSocket(ws, runtimeIds, {
+        role,
+        ...(caller ? { caller } : {}),
+      });
     }
 
     this.userSessions(userId).set(config.boardName, session);
@@ -271,7 +352,7 @@ export class BoardCoordinator {
     // Deploying is what makes a board the coordinator's, so it is what the
     // store is told about. Starting a stopped board registers the same config
     // again and lands here too.
-    await this.persist(session);
+    await this.persist(userId, config.boardName);
     return session;
   }
 
@@ -294,7 +375,7 @@ export class BoardCoordinator {
     }
 
     const unreachable = await session.setLogging(enabled, level);
-    await this.persist(session);
+    await this.persist(userId, boardName);
 
     return { unreachable };
   }
@@ -337,10 +418,133 @@ export class BoardCoordinator {
     // After the runtimes were released over them: the tickets are the board's,
     // and a deleted board has no participants.
     this.participants.revokeBoard(userId, boardName);
+    // The list goes with the board: sharing is of a board that exists.
+    this.members.delete(boardKey(userId, boardName));
     // Deleting a board that outlived a restart has to delete it there too, or
-    // the next restore brings it back.
-    await this.store.remove(userId, boardName);
+    // the next restore brings it back. Behind any write of it still on its
+    // way, which would otherwise land afterwards and do the same.
+    await this.inStoreOrder(boardKey(userId, boardName), () =>
+      this.store.remove(userId, boardName),
+    );
     return true;
+  }
+
+  // ── Members ────────────────────────────────────────────────────────────────
+
+  /** Who a board is shared with. Empty for a board nobody shared. */
+  getMembers(userId: string, boardName: string): BoardMember[] {
+    return [...(this.members.get(boardKey(userId, boardName)) ?? [])];
+  }
+
+  /**
+   * Shares a board with somebody, or changes what the list calls them.
+   *
+   * One entry per email: naming one that is already listed replaces its name.
+   * Returns the list, or null for a board this coordinator does not hold.
+   */
+  async setMember(
+    userId: string,
+    boardName: string,
+    member: BoardMember,
+  ): Promise<BoardMember[] | null> {
+    const session = this.getBoard(userId, boardName);
+    if (!session) {
+      return null;
+    }
+    const key = boardKey(userId, boardName);
+    const current = this.members.get(key) ?? [];
+    const known = current.some((entry) => entry.email === member.email);
+    const limit =
+      this.limits.maxMembersPerBoard ?? DEFAULT_MEMBER_LIMITS.maxMembersPerBoard;
+    if (!known && current.length >= limit) {
+      throw new MemberLimitError(
+        `A board can be shared with at most ${limit} people`,
+      );
+    }
+    const next = known
+      ? current.map((entry) => (entry.email === member.email ? member : entry))
+      : [...current, member];
+    this.members.set(key, next);
+    // Somebody already attached as this address is called the new name from
+    // their next action on.
+    session.renameMember(member.email, member.name);
+    await this.persist(userId, boardName);
+    return [...next];
+  }
+
+  /**
+   * Stops sharing a board with somebody, and closes what they have open on it
+   * at once. Returns the list, or null for a board this coordinator does not
+   * hold.
+   */
+  async removeMember(
+    userId: string,
+    boardName: string,
+    email: string,
+  ): Promise<BoardMember[] | null> {
+    const session = this.getBoard(userId, boardName);
+    if (!session) {
+      return null;
+    }
+    const key = boardKey(userId, boardName);
+    const address = normalizeEmail(email);
+    const next = (this.members.get(key) ?? []).filter(
+      (entry) => entry.email !== address,
+    );
+    this.members.set(key, next);
+    session.evictMember(address);
+    // The owner keeps their own bridge, and only loses the name the list
+    // gave them.
+    session.renameMember(address, undefined);
+    await this.persist(userId, boardName);
+    return [...next];
+  }
+
+  /** A person actor's authority is live only while they are still the owner
+   * or appear on the board's current member list. */
+  private mayActAs(
+    userId: string,
+    boardName: string,
+    caller: { sub: string; email?: string },
+  ): boolean {
+    return (
+      caller.sub === userId ||
+      !!findMember(this.getMembers(userId, boardName), caller.email)
+    );
+  }
+
+  /** The boards whose list names an email, across every owner. */
+  getSharedBoards(email: string | undefined): SharedBoardInfo[] {
+    if (!email) {
+      return [];
+    }
+    const shared: SharedBoardInfo[] = [];
+    for (const sessions of this.sessions.values()) {
+      for (const session of sessions.values()) {
+        const member = findMember(
+          this.getMembers(session.userId, session.boardName),
+          email,
+        );
+        if (member) {
+          shared.push({
+            owner: session.userId,
+            boardName: session.boardName,
+            // Running or not; why it is not is its owner's to read.
+            status: session.getStatus(),
+            name: member.name,
+          });
+        }
+      }
+    }
+    return shared;
+  }
+
+  /** How many bridges one member may hold on one board at once. */
+  get maxBridgesPerMember(): number {
+    return (
+      this.limits.maxBridgesPerMember ??
+      DEFAULT_MEMBER_LIMITS.maxBridgesPerMember
+    );
   }
 
   destroyAll(): void {

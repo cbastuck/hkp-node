@@ -2,6 +2,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 
 import {
+  Caller,
   HostedService,
   HostedServiceFactory,
   JsonRecord,
@@ -12,6 +13,7 @@ import {
   RuntimeDescriptor,
   RuntimeHost,
   RuntimeNotification,
+  RunActor,
   RuntimeScope,
   ServiceCreator,
   ServiceConfiguration,
@@ -21,7 +23,7 @@ import {
 import { ADDRESS_SEPARATOR, descend, splitAddress } from "./address";
 import { SecretVault } from "./secrets";
 import { AssetDescriptor, AssetStore, AssetStoreOptions } from "./assets";
-import { ANONYMOUS_SUB } from "./auth";
+import { ANONYMOUS_SUB, AuthenticatedUser } from "./auth";
 import { MountHandle, MountHandlers } from "./mounts";
 
 /** Severity order, so a runtime can drop anything below what it records. */
@@ -33,8 +35,12 @@ export const LOG_LEVELS: Record<LogLevel, number> = {
 };
 
 /** A run with no parent: something outside the board asked for this. */
-export function newRun(): ProcessContext {
-  return { runId: randomUUID() };
+export const DEFAULT_PERSON_RUN_TTL_MS = 15 * 60 * 1000;
+
+export function newRun(
+  kind: Exclude<RunActor["kind"], "person"> = "board",
+): ProcessContext {
+  return { runId: randomUUID(), actor: { kind } };
 }
 
 /**
@@ -57,6 +63,140 @@ export function contextFromWire(value: unknown): ProcessContext | undefined {
     runId: str("runId") ?? randomUUID(),
     parentRunId: str("parentRunId"),
     requestId: str("requestId"),
+    actor: { kind: "local" },
+  };
+}
+
+/**
+ * Who a signed-in user is to a run they begin, or nothing where there is no
+ * identity to state.
+ *
+ * A server running without authentication resolves everybody to the one
+ * anonymous tenant. That is *no caller*, not a caller called anonymous —
+ * otherwise everybody on a development machine would be the same person.
+ */
+export function callerOf(user: AuthenticatedUser | undefined): Caller | undefined {
+  if (!user || user.sub === ANONYMOUS_SUB) {
+    return undefined;
+  }
+  return { sub: user.sub, ...(user.email ? { email: user.email } : {}) };
+}
+
+/**
+ * The context of a run a client holding a token begins: a REST process call,
+ * or a `processRuntime` on a runtime's socket.
+ *
+ * The run metadata the client sent is kept, as `contextFromWire` reads it.
+ * Whatever it said about a caller is not read at all: who is calling is what
+ * the server verified, so a client cannot act in another person's name by
+ * saying so.
+ */
+export function contextForClient(
+  wire: unknown,
+  user: AuthenticatedUser | undefined,
+): ProcessContext {
+  const context =
+    contextFromWire(wire) ?? newRun("local");
+  const caller = callerOf(user);
+  return {
+    ...context,
+    actor: caller
+      ? {
+          kind: "person",
+          ...caller,
+          expiresAt: Date.now() + DEFAULT_PERSON_RUN_TTL_MS,
+        }
+      : { kind: "local" },
+  };
+}
+
+/** A caller as a participant link states one, or nothing when the shape is off. */
+export function callerFromWire(value: unknown): Caller | undefined {
+  if (typeof value !== "object" || value === null) {
+    return undefined;
+  }
+  const wire = value as Record<string, unknown>;
+  if (typeof wire.sub !== "string" || !wire.sub) {
+    return undefined;
+  }
+  return {
+    sub: wire.sub,
+    ...(typeof wire.email === "string" && wire.email
+      ? { email: wire.email }
+      : {}),
+    ...(typeof wire.name === "string" && wire.name ? { name: wire.name } : {}),
+  };
+}
+
+/** An actor as a trusted participant link states it. */
+export function actorFromWire(value: unknown): RunActor | undefined {
+  if (typeof value !== "object" || value === null) {
+    return undefined;
+  }
+  const wire = value as Record<string, unknown>;
+  if (wire.kind === "person") {
+    const caller = callerFromWire(wire);
+    return caller
+      ? {
+          kind: "person",
+          ...caller,
+          expiresAt:
+            typeof wire.expiresAt === "number" &&
+            Number.isFinite(wire.expiresAt)
+              ? wire.expiresAt
+              : 0,
+        }
+      : { kind: "person", sub: "", expiresAt: 0 };
+  }
+  if (
+    wire.kind === "board" ||
+    wire.kind === "mount" ||
+    wire.kind === "local"
+  ) {
+    return { kind: wire.kind };
+  }
+  return undefined;
+}
+
+/**
+ * The context of a run as it is said over a participant link, by either end:
+ * a coordinator continuing a run on a runtime, or a runtime handing back what
+ * it produced.
+ *
+ * The one path on which a caller is taken as stated. The link is the board's
+ * own — opened by a runtime server with the board's ticket — and the
+ * coordinator on it is what verified the person. Kept apart from
+ * `contextFromWire` so that no other entry point can come to trust a caller by
+ * sharing a parser.
+ */
+export function contextFromLink(value: unknown): ProcessContext | undefined {
+  const context = contextFromWire(value);
+  if (!context) {
+    return undefined;
+  }
+  const wire = value as Record<string, unknown>;
+  // The reply address belongs to whoever was waiting at the other end.
+  const { requestId: _requestId, ...run } = context;
+  return {
+    ...run,
+    actor: actorFromWire(wire.actor) ?? { kind: "board" },
+  };
+}
+
+/**
+ * A run as it is said to another runtime: which run, and who began it. The
+ * reply address is left out — it means something only to whoever is waiting.
+ */
+export function contextToWire(
+  context: ProcessContext | null | undefined,
+): ProcessContext | undefined {
+  if (!context) {
+    return undefined;
+  }
+  return {
+    runId: context.runId,
+    ...(context.parentRunId ? { parentRunId: context.parentRunId } : {}),
+    actor: context.actor,
   };
 }
 
@@ -66,13 +206,59 @@ export function contextFromWire(value: unknown): ProcessContext | undefined {
  * The child gets an identity of its own rather than borrowing its parent's, so
  * that work done inside a sub-pipeline stays distinguishable from work done
  * around it — which is the whole difference between a trace that shows nesting
- * and one that shows a flat list in timestamp order.
+ * and one that shows a flat list in timestamp order. The actor is inherited
+ * exactly, whether it is a person, the board, a mount, or local work.
  */
 export function childRun(parent: ProcessContext | null): ProcessContext {
   return parent
-    ? { runId: randomUUID(), parentRunId: parent.runId }
+    ? {
+        runId: randomUUID(),
+        parentRunId: parent.runId,
+        actor: parent.actor,
+      }
     : newRun();
 }
+
+/** Whether a run's delegated person authority is no longer valid. */
+export function runExpired(
+  context: ProcessContext | null | undefined,
+  now = Date.now(),
+): boolean {
+  return (
+    context?.actor.kind === "person" && context.actor.expiresAt <= now
+  );
+}
+
+/**
+ * Where work that belongs to no call begins, across every runtime in the
+ * process. A run's frame remembers which of these it was begun under, and is
+ * only the current one while that still holds.
+ */
+const detachments = new AsyncLocalStorage<object>();
+
+/**
+ * Runs `fn` outside whatever run it was scheduled from.
+ *
+ * A callback keeps the async context of the code that scheduled it, so a tick
+ * armed from inside a call would otherwise go on reading that call's run —
+ * and its caller, and its expiry — for as long as it fires. A service that
+ * emits by itself wraps the emission in this, and what it emits begins a run
+ * of its own. Nested runtimes are covered by the one call: each keeps its own
+ * frame, and none of them outlives the detachment.
+ */
+export function detached<T>(fn: () => T): T {
+  return detachments.run({}, fn);
+}
+
+/** One call in progress on a runtime; see `HostedRuntime.runState`. */
+type RunFrame = {
+  context: ProcessContext;
+  service: string | null;
+  /** The detachment this frame was begun under; see `detached`. */
+  detachment: object | undefined;
+  /** Set once the call it stood for has returned; see `configureService`. */
+  ended?: boolean;
+};
 
 /**
  * Grants a runtime's services public endpoints. Supplied by the server, which
@@ -112,7 +298,9 @@ export class HostedRuntime implements RuntimeHost {
   private readonly notificationTargets = new Set<
     (notification: RuntimeNotification) => void
   >();
-  private readonly resultTargets = new Set<(result: unknown) => void>();
+  private readonly resultTargets = new Set<
+    (result: unknown, context: ProcessContext | null) => void
+  >();
   private readonly createService: ServiceCreator;
   private readonly mounts?: RuntimeMounts;
   /**
@@ -137,10 +325,7 @@ export class HostedRuntime implements RuntimeHost {
    * and restores the outer one on the way out, which is what a nested pull
    * needs.
    */
-  private readonly runState = new AsyncLocalStorage<{
-    context: ProcessContext;
-    service: string | null;
-  }>();
+  private readonly runState = new AsyncLocalStorage<RunFrame>();
   private readonly logTargets = new Set<(entry: LogEntry) => void>();
   /** See RuntimeConfiguration.logData. A board-wide override, not the gate. */
   private logData = true;
@@ -295,12 +480,35 @@ export class HostedRuntime implements RuntimeHost {
     return service.getState();
   }
 
-  configureService(address: string, config: JsonRecord): JsonRecord | null {
+  configureService(
+    address: string,
+    config: JsonRecord,
+    context?: ProcessContext | null,
+  ): JsonRecord | null {
     const service = this.getService(address);
     if (!service) {
       return null;
     }
-    return service.configure(config);
+    const configure = () =>
+      this.inService(service.uuid, () => service.configure(config));
+    if (!context) {
+      return configure();
+    }
+    // Configuring is over when `configure` returns, and the run ends with it.
+    // What a service arms while being configured — an interval, a socket, a
+    // poll — keeps this frame as its async context, and without an end it
+    // would go on emitting as whoever configured it, until their authority
+    // expired and the board stopped with it.
+    const frame: RunFrame = {
+      context,
+      service: this.currentService,
+      detachment: detachments.getStore(),
+    };
+    try {
+      return this.runState.run(frame, configure);
+    } finally {
+      frame.ended = true;
+    }
   }
 
   removeService(uuid: string): boolean {
@@ -336,16 +544,24 @@ export class HostedRuntime implements RuntimeHost {
     };
   }
 
-  registerResultTarget(target: (result: unknown) => void): () => void {
+  /**
+   * Where what this runtime emits goes. A target is told the run the value was
+   * emitted in, or null when it was emitted outside one, so that whoever
+   * carries it on can say which run it continues.
+   */
+  registerResultTarget(
+    target: (result: unknown, context: ProcessContext | null) => void,
+  ): () => void {
     this.resultTargets.add(target);
     return () => {
       this.resultTargets.delete(target);
     };
   }
 
-  emitResult(output: unknown): void {
+  emitResult(output: unknown, context?: ProcessContext | null): void {
+    context = context ?? this.currentContext();
     for (const target of this.resultTargets) {
-      target(output);
+      target(output, context);
     }
   }
 
@@ -378,12 +594,25 @@ export class HostedRuntime implements RuntimeHost {
   // ── RuntimeHost ────────────────────────────────────────────────────────────
 
   currentContext(): ProcessContext | null {
-    return this.runState.getStore()?.context ?? null;
+    return this.frame?.context ?? null;
   }
 
   /** Which service the current pass is inside, for a log entry to name. */
   private get currentService(): string | null {
-    return this.runState.getStore()?.service ?? null;
+    return this.frame?.service ?? null;
+  }
+
+  /**
+   * The call in progress, or nothing when the frame this code inherited is no
+   * longer one: its call has returned, or the work has been detached from it.
+   */
+  private get frame(): RunFrame | undefined {
+    const frame = this.runState.getStore();
+    return frame &&
+      !frame.ended &&
+      frame.detachment === detachments.getStore()
+      ? frame
+      : undefined;
   }
 
   processFrom(
@@ -477,8 +706,15 @@ export class HostedRuntime implements RuntimeHost {
     );
   }
 
-  notify(payload: unknown, instanceId: string): void {
-    this.emitNotification({ instanceId, payload }, () => {});
+  notify(
+    payload: unknown,
+    instanceId: string,
+    context?: ProcessContext | null,
+  ): void {
+    this.emitNotification(
+      { instanceId, payload, ...(context ? { context } : {}) },
+      () => {},
+    );
   }
 
   log(level: LogLevel, event: string, data?: unknown): void {
@@ -511,6 +747,9 @@ export class HostedRuntime implements RuntimeHost {
     if (run.parentRunId) {
       entry.parentRunId = run.parentRunId;
     }
+    if (run.actor.kind === "person") {
+      entry.caller = run.actor.sub;
+    }
     if (this.logData && data !== undefined) {
       entry.data = data;
     }
@@ -534,6 +773,7 @@ export class HostedRuntime implements RuntimeHost {
       target({
         runId: run.runId,
         ...(run.parentRunId ? { parentRunId: run.parentRunId } : {}),
+        ...(run.actor.kind === "person" ? { caller: run.actor.sub } : {}),
         ts: new Date().toISOString(),
         runtimeId: this.id,
         serviceUuid: this.currentService ?? "",
@@ -759,12 +999,19 @@ export class HostedRuntime implements RuntimeHost {
   private withContext<T>(context: ProcessContext, fn: () => T): T {
     // The service is carried alongside the context so both are restored
     // together on the way out of a nested pull.
-    return this.runState.run({ context, service: this.currentService }, fn);
+    return this.runState.run(
+      {
+        context,
+        service: this.currentService,
+        detachment: detachments.getStore(),
+      },
+      fn,
+    );
   }
 
   /** Runs `fn` with the pass recorded as being inside `uuid`. */
   private inService<T>(uuid: string | null, fn: () => T): T {
-    const store = this.runState.getStore();
+    const store = this.frame;
     if (!store) {
       return fn();
     }
@@ -785,6 +1032,10 @@ export class HostedRuntime implements RuntimeHost {
     let result: unknown = input;
 
     for (const uuid of this.serviceOrder.slice(startIndex)) {
+      if (runExpired(this.currentContext())) {
+        this.log("warn", "run.expired");
+        return null;
+      }
       const service = this.services.get(uuid);
       if (!service) {
         continue;
@@ -818,9 +1069,14 @@ export class HostedRuntime implements RuntimeHost {
         // about *what ran* is not asking to write payloads to disk. What flows
         // through is recorded only where a service was configured to record it.
         this.log("debug", "service.process");
+        const notificationContext = this.currentContext() ?? undefined;
         return service.process(result, (payload, instanceId) => {
           this.emitNotification(
-            { instanceId: instanceId ?? uuid, payload },
+            {
+              instanceId: instanceId ?? uuid,
+              payload,
+              context: notificationContext,
+            },
             onNotification,
           );
         });
@@ -864,9 +1120,15 @@ export class HostedRuntime implements RuntimeHost {
     notification: RuntimeNotification,
     onNotification: (notification: RuntimeNotification) => void,
   ): void {
-    onNotification(notification);
+    const contextual = notification.context
+      ? notification
+      : {
+          ...notification,
+          context: this.currentContext() ?? newRun("board"),
+        };
+    onNotification(contextual);
     for (const target of this.notificationTargets) {
-      target(notification);
+      target(contextual);
     }
   }
 }

@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { CloudBoardConfig } from "../src/coordinator/types";
 import {
   CoordinatorHost,
+  attachBrowser,
   boardRuntime,
   RuntimeServer,
   eventually,
@@ -196,6 +197,91 @@ describe.skipIf(!hasPython)("a board across hkp-node and hkp-python", () => {
         ),
       "the python monitor to see what node emitted",
     );
+  });
+
+  it("begins a run on python as the browser's caller, and carries it on to node", async () => {
+    // A facade's process action on a deployed board: the coordinator begins
+    // the run on the runtime holding the service, as whoever attached with
+    // the bridge. Python runs it and hands back the run with its result,
+    // which is what lets node — the board's next runtime — know who began it.
+    const host = await startCoordinator();
+    hosts.push(host);
+    const node = await startRuntimeServer();
+    servers.push(node.server);
+    const pythonUrl = await startPython();
+    const shared: CloudBoardConfig = {
+      boardName: "who-across-languages",
+      runtimes: [
+        { id: "py", name: "Python", type: "rest" },
+        { id: "node", name: "Node", type: "rest" },
+      ],
+      services: {
+        py: [{ uuid: "seen", serviceId: "monitor" }],
+        node: [
+          {
+            uuid: "who",
+            serviceId: "sql",
+            state: {
+              mode: "query",
+              statement:
+                "SELECT $caller_sub AS sub, $caller_email AS email, $caller_name AS name",
+            },
+          },
+        ],
+      },
+    };
+    const tickets = await host.coordinator.issueTickets(
+      "user-1",
+      shared.boardName,
+      ["py", "node"],
+    );
+    for (const [runtimeId, baseUrl] of [
+      ["py", pythonUrl],
+      ["node", node.baseUrl],
+    ] as const) {
+      const res = await fetch(`${baseUrl}/coordinator-links`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          coordinatorUrl: host.url,
+          ticket: tickets[runtimeId],
+          boardName: shared.boardName,
+          runtimeId,
+        }),
+      });
+      expect(res.status).toBe(201);
+    }
+    const session = await host.coordinator.registerBoard("user-1", shared);
+    expect(session.getErrors()).toEqual([]);
+    const alice = { sub: "user-1", email: "alice@example.com", name: "Alice" };
+    const browser = await attachBrowser(session, [], { role: "owner", caller: alice });
+
+    try {
+      const answer = await browser.ask({
+        type: "processService",
+        requestId: "p-1",
+        runtimeId: "py",
+        serviceUuid: "seen",
+        payload: { hello: "there" },
+      });
+      expect(answer.error).toBeUndefined();
+      expect(answer.data).toEqual({ accepted: true });
+
+      const rows = () =>
+        browser
+          .all("notification")
+          .filter((n) => n.serviceUuid === "who")
+          .map((n) => (n.payload as { rows?: unknown[] }).rows)
+          .find((found) => Array.isArray(found));
+      await eventually(() => !!rows(), "node to say who began the run");
+      expect(rows()).toEqual([alice]);
+      // Python's own service spoke inside her run too, and it reached her.
+      expect(
+        browser.all("notification").some((n) => n.serviceUuid === "seen"),
+      ).toBe(true);
+    } finally {
+      await browser.stop();
+    }
   });
 
   it("carries bytes into python and out again unchanged", async () => {

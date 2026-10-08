@@ -193,6 +193,8 @@ export type HostedServiceFactory = {
 export type RuntimeNotification = {
   instanceId: string;
   payload: unknown;
+  /** The run in which it was raised, captured at the service call boundary. */
+  context?: ProcessContext;
 };
 
 /**
@@ -223,6 +225,35 @@ export type RuntimeScope = {
  * A run outlives any number of those, so the two are not interchangeable — see
  * plans/TODO-CONSOLIDATION.md section 4.
  */
+/**
+ * Who took the action a run began with.
+ *
+ * Stated by the server that verified their token, never read from what they
+ * sent: a payload saying who its sender is proves nothing about them. A run
+ * nobody began — a timer tick, a request arriving at a mount — has none, and
+ * neither does anything on a server running without authentication, where
+ * there is nobody to tell apart.
+ */
+export type Caller = {
+  /** The token's `sub`. */
+  sub: string;
+  /** Present only when the token carried a verified one; normalised. */
+  email?: string;
+  /**
+   * What the board's member list calls that email. Set by a coordinator that
+   * keeps such a list, and absent everywhere else — a name from the token
+   * would be the person's own choice.
+   */
+  name?: string;
+};
+
+/** What is acting in a run. Person identity is present only in that case. */
+export type RunActor =
+  | ({ kind: "person"; expiresAt: number } & Caller)
+  | { kind: "board" }
+  | { kind: "mount" }
+  | { kind: "local" };
+
 export type ProcessContext = {
   /**
    * Identifies one invocation of a board — one webhook, one timer tick, one
@@ -241,6 +272,11 @@ export type ProcessContext = {
    * here so the shape matches the runtimes that do carry one.
    */
   requestId?: string;
+  /**
+   * What is acting in this run. A person actor is stated only by the server
+   * that verified them and carries the deadline of that delegated authority.
+   */
+  actor: RunActor;
 };
 
 export type LogLevel = "debug" | "info" | "warn" | "error";
@@ -270,6 +306,11 @@ export type LogEntry = {
   event: string;
   data?: unknown;
   durationMs?: number;
+  /**
+   * The `sub` of whoever began the run, when somebody did. Enough to answer
+   * "who did this" from a board's log without the log collecting addresses.
+   */
+  caller?: string;
 };
 
 /**
@@ -303,8 +344,24 @@ export interface RuntimeHost {
     onNotification: (notification: RuntimeNotification) => void,
     context?: ProcessContext,
   ): Promise<unknown>;
-  notify(payload: unknown, instanceId: string): void;
-  emitResult(output: unknown): void;
+  /**
+   * Reports something to whoever is watching. Said from inside a run, it is
+   * reported as part of it; `context` names the run instead where the report
+   * is being carried out of a nested pipeline, which knows the run it was made
+   * in when the runtime around it does not.
+   */
+  notify(
+    payload: unknown,
+    instanceId: string,
+    context?: ProcessContext | null,
+  ): void;
+  /**
+   * Hands a value to whatever follows this runtime. Called from inside a run,
+   * the value goes on as part of it — the next runtime of a deployed board is
+   * told the same run and the same caller. `context` names the run where the
+   * value is handed on from outside the call that produced it.
+   */
+  emitResult(output: unknown, context?: ProcessContext | null): void;
   /**
    * The context of the call currently being processed, or null outside one.
    *

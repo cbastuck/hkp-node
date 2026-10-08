@@ -12,12 +12,12 @@
  */
 import {
   JsonRecord,
-  ProcessContext,
   RuntimeHost,
   RuntimeNotification,
   ServiceConfiguration,
   ServiceRegistryEntry,
 } from "../types";
+import { detached } from "../runtime";
 
 export const timerDescriptor: ServiceRegistryEntry = {
   serviceId: "timer",
@@ -175,9 +175,9 @@ export class TimerService {
           durationMs(this._periodicValue, this._periodicUnit),
           this.minIntervalMs,
         );
-        this._timer = setInterval(() => void this._tick(), ms);
+        this._timer = setInterval(() => detached(() => void this._tick()), ms);
         if (immediate) {
-          setTimeout(() => void this._tick(), 1);
+          setTimeout(() => detached(() => void this._tick()), 1);
         }
       } else {
         if (this._timer) {
@@ -186,7 +186,7 @@ export class TimerService {
         const ms = immediate
           ? 1
           : durationMs(this._oneShotDelay, this._oneShotDelayUnit);
-        setTimeout(() => void this._tick(), ms);
+        setTimeout(() => detached(() => void this._tick()), ms);
       }
     }
 
@@ -203,11 +203,9 @@ export class TimerService {
     // One-shot: schedule a delayed fire and return input immediately.
     if (!this._periodic) {
       const ms = durationMs(this._oneShotDelay, this._oneShotDelayUnit);
-      // Delaying data does not make it a different arrival: what fires later is
-      // the run that handed this input over, resumed. Captured now because by
-      // the time the timer fires the call it belongs to is long gone.
-      const context = this._host?.currentContext() ?? undefined;
-      setTimeout(() => void this._tickWithInput(input, context), ms);
+      // The call passes through now; the later tick is a timer emission, not a
+      // delayed answer carrying the person who happened to start it.
+      setTimeout(() => detached(() => void this._tickWithInput(input)), ms);
     }
     return input;
   }
@@ -240,10 +238,7 @@ export class TimerService {
     }
   }
 
-  private async _tickWithInput(
-    input: unknown,
-    context?: ProcessContext,
-  ): Promise<void> {
+  private async _tickWithInput(input: unknown): Promise<void> {
     const triggerCount = ++this._counter;
     this._notify({ counter: triggerCount });
     if (this._host) {
@@ -257,7 +252,6 @@ export class TimerService {
         // No-op: the runtime already fans these out to its notification
         // targets. Re-notifying through the host would deliver every one twice.
         (_n: RuntimeNotification) => {},
-        context,
       );
       this._host.emitResult(result);
     }

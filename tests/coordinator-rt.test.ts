@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { CloudBoardConfig } from "../src/coordinator/types";
 import {
+  attachBrowser,
   CoordinatorHost,
   boardRuntime,
   RuntimeServer,
@@ -108,9 +109,10 @@ async function introduceOver(
   host: CoordinatorHost,
   boardName: string,
   placement: Array<readonly [string, string]>,
+  userId = "user-1",
 ): Promise<void> {
   const tickets = await host.coordinator.issueTickets(
-    "user-1",
+    userId,
     boardName,
     placement.map(([runtimeId]) => runtimeId),
   );
@@ -170,6 +172,91 @@ describe.skipIf(!RT_BIN)("a board across hkp-node and hkp-rt", () => {
 
     expect(said.server).toBe("c++");
     expect(said.coordinatorLinks).toBe(true);
+  });
+
+  it("begins a run on hkp-rt as the browser's caller, and carries it on to node", async () => {
+    // A facade's process action on a deployed board: the coordinator begins
+    // the run on the runtime holding the service, as whoever attached with
+    // the bridge. hkp-rt runs it and its result leaves with the run, which is
+    // what lets node — the board's next runtime — know who began it.
+    const host = await startCoordinator();
+    hosts.push(host);
+    const node = await startRuntimeServer();
+    servers.push(node.server);
+    const rt = await startRt();
+    const shared: CloudBoardConfig = {
+      boardName: "who-through-cpp",
+      runtimes: [
+        { id: "cpp", name: "C++", type: "rest" },
+        { id: "node", name: "Node", type: "rest" },
+      ],
+      services: {
+        cpp: [
+          { uuid: "first", serviceId: "map", state: { mode: "add", template: { first: true } } },
+          { uuid: "second", serviceId: "map", state: { mode: "add", template: { via: "cpp" } } },
+        ],
+        node: [
+          {
+            uuid: "who",
+            serviceId: "sql",
+            state: {
+              mode: "query",
+              statement:
+                "SELECT $caller_sub AS sub, $caller_email AS email, $caller_name AS name, $via AS via, $first AS first",
+            },
+          },
+        ],
+      },
+    };
+    const alice = {
+      sub: "auth0|alice",
+      email: "alice@example.com",
+      name: "Alice",
+    };
+    await introduceOver(
+      host,
+      shared.boardName,
+      [
+        ["cpp", rt.baseUrl],
+        ["node", node.baseUrl],
+      ],
+      alice.sub,
+    );
+    const session = await host.coordinator.registerBoard(alice.sub, shared);
+    expect(session.getErrors()).toEqual([]);
+    const browser = await attachBrowser(session, [], { role: "owner", caller: alice });
+
+    try {
+      const answer = await browser.ask({
+        type: "processService",
+        requestId: "p-1",
+        runtimeId: "cpp",
+        serviceUuid: "second",
+        payload: { hello: "there" },
+      });
+      expect(answer.error).toBeUndefined();
+      expect(answer.data).toEqual({ accepted: true });
+
+      const rows = () =>
+        browser
+          .all("notification")
+          .filter((n) => n.serviceUuid === "who")
+          .map((n) => (n.payload as { rows?: unknown[] }).rows)
+          .find((found) => Array.isArray(found));
+      await eventually(() => !!rows(), "node to say who began the run");
+      // Begun at the second service — the first never ran — and as Alice.
+      expect(rows()).toEqual([{ ...alice, via: "cpp", first: null }]);
+
+      const missing = await browser.ask({
+        type: "processService",
+        requestId: "p-2",
+        runtimeId: "cpp",
+        serviceUuid: "nobody",
+      });
+      expect(missing.error).toMatch(/no service "nobody"/);
+    } finally {
+      await browser.stop();
+    }
   });
 
   it("is built on both and driven from one to the other, with nothing dialled", async () => {

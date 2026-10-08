@@ -605,7 +605,8 @@ describe("over the wire", () => {
           middleware: (_req: unknown, res: { sendStatus: (status: number) => void }) => {
             res.sendStatus(401);
           },
-          verifyToken: async () => null,
+          identifyToken: async () => null,
+          authorizeOwner: async () => null,
         }),
       } as never);
 

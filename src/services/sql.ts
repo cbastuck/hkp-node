@@ -36,6 +36,16 @@
  * interpolated — a subject line containing a quote is a subject line, not a
  * syntax error, and not an injection.
  *
+ * **Who is calling is bound by the service, never by the input.** Four
+ * names are reserved — `$caller_email`, `$caller_name`, `$caller_sub` and
+ * `$actor_kind` — and
+ * are given the caller of the run in progress: whoever the server that began
+ * it verified. Each is `NULL` when the run has no caller or the caller has no
+ * such value, and an input field of the same name is ignored. Reserved here
+ * rather than stamped onto the input by a service placed in front, because a
+ * stamp can be walked around: a process call that enters the pipeline *at*
+ * this service never passes the one before it.
+ *
  * **A database can leave as SQL and arrive as SQL.** `export` hands on the
  * whole database as an SQLite dump and `import` runs one arriving as input —
  * the same format the browser's `sql` writes and reads (`sql-dump.ts`), which
@@ -54,6 +64,7 @@
  * what a service says about itself is not what it passes on.
  */
 import {
+  Caller,
   HostedService,
   JsonRecord,
   RuntimeHost,
@@ -85,6 +96,16 @@ const EMITS: SqlEmit[] = ["result", "input"];
 
 /** `$name`, `:name` and `@name` are all named parameters to SQLite. */
 const NAMED_PARAMETER = /[$:@]([A-Za-z_][A-Za-z0-9_]*)/g;
+
+/**
+ * The parameter names a statement is given the run's caller under, and what of
+ * the caller each one is. Whatever the prefix — `$`, `:` or `@`.
+ */
+const CALLER_PARAMETERS: Record<string, keyof Caller> = {
+  caller_email: "email",
+  caller_name: "name",
+  caller_sub: "sub",
+};
 
 type Notify = (payload: unknown, instanceId?: string) => void;
 
@@ -336,15 +357,29 @@ export class SqlService implements HostedService {
    * Only the names the statement mentions are bound: SQLite rejects a
    * parameter it was not asked for, so handing it a whole input object would
    * fail on every field the statement happens not to use.
+   *
+   * The reserved caller names are the exception to "from the input": they are
+   * bound from the run in progress.
    */
   private parameters(input: unknown): Record<string, SqlValue> {
     const record =
       input && typeof input === "object" && !Array.isArray(input)
         ? (input as JsonRecord)
         : {};
+    const context = this.host?.currentContext();
+    const caller = context?.actor.kind === "person" ? context.actor : undefined;
     const params: Record<string, SqlValue> = {};
     for (const match of codeOf(this.statement).matchAll(NAMED_PARAMETER)) {
-      params[match[1]] = bindable(record[match[1]]);
+      const name = match[1];
+      const reserved = CALLER_PARAMETERS[name];
+      // Never the input's to supply, present or not: a caller the run does
+      // not have is NULL, not whatever the payload claims.
+      params[name] =
+        name === "actor_kind"
+          ? bindable(context?.actor.kind ?? "board")
+          : reserved
+            ? bindable(caller?.[reserved])
+            : bindable(record[name]);
     }
     return params;
   }

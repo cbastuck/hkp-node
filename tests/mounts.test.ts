@@ -43,7 +43,8 @@ function twoPrincipalAuth(options: AuthenticatorOptions): Authenticator {
         next();
       });
     },
-    verifyToken,
+    identifyToken: verifyToken,
+    authorizeOwner: verifyToken,
   };
 }
 

@@ -88,10 +88,10 @@ describe("hkp-node authentication", () => {
       resolveOpaqueToken: (token) =>
         token === "sess-1" ? { sub: "auth0|user-1" } : null,
     });
-    expect(await authenticator.verifyToken("sess-1")).toEqual({
+    expect(await authenticator.authorizeOwner("sess-1")).toEqual({
       sub: "auth0|user-1",
     });
-    expect(await authenticator.verifyToken(undefined)).toBeNull();
+    expect(await authenticator.authorizeOwner(undefined)).toBeNull();
   });
 
   it("rejects WebSocket upgrades without a valid token under JWT auth", async () => {
@@ -243,7 +243,8 @@ function twoPrincipalAuth(options: AuthenticatorOptions): Authenticator {
         next();
       });
     },
-    verifyToken,
+    identifyToken: verifyToken,
+    authorizeOwner: verifyToken,
   };
 }
 

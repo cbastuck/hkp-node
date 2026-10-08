@@ -1,14 +1,32 @@
 import { Router, Request, Response } from "express";
 import { BoardCoordinator } from "./coordinator";
-import { createAuthMiddleware, requireSelf } from "./auth";
-import { AuthConfig } from "../auth";
+import {
+  createAuthMiddleware,
+  createIdentifyMiddleware,
+  requireSelf,
+} from "./auth";
+import { AuthConfig, Authenticator } from "../auth";
+import { MemberLimitError, readMember } from "./members";
 import { AssetDescriptor, readAssetsPayload } from "../assets";
 import { CloudBoardConfig, CloudRuntimeDescriptor, CloudServiceDescriptor } from "./types";
 
 export type CoordinatorRouterOptions = {
   coordinator?: BoardCoordinator;
   auth?: AuthConfig;
+  /**
+   * The authenticator of the server this router is mounted on. Absent, the
+   * router builds one from `auth`.
+   */
+  authenticator?: Authenticator;
 };
+
+/**
+ * Where a member asks which boards are shared with them, relative to the
+ * router. It authenticates its own caller — by identity, not by the server's
+ * allowlist — so a server mounting the router has to let it past the check
+ * every other route gets; see `addSelfAuthenticatedRoute`.
+ */
+export const SHARED_BOARDS_PATH = "/shared";
 
 /** A board has a handful of runtimes; this only bounds a malformed request. */
 const MAX_TICKETS_PER_REQUEST = 64;
@@ -19,10 +37,83 @@ export function createCoordinatorRouter(
   const authConfig: AuthConfig = options.auth ?? { mode: "none" };
   const coordinator = options.coordinator ?? new BoardCoordinator();
   const router = Router();
-  const auth = createAuthMiddleware(authConfig);
+  const auth = createAuthMiddleware(authConfig, options.authenticator);
+  const identify = createIdentifyMiddleware(authConfig, options.authenticator);
 
   // All /users/:username routes require a valid token that matches the username.
   router.use("/users/:username", auth, requireSelf);
+
+  /**
+   * The boards shared with whoever is asking: every board, of any owner, whose
+   * member list names their verified email.
+   *
+   * Open to anybody with a verified identity. The server's allowlist says who
+   * may own boards here; being on one board's list is permission to use that
+   * board, and somebody the operator never listed has to be able to find it.
+   */
+  router.get(SHARED_BOARDS_PATH, identify, (req: Request, res: Response) => {
+    res.json({
+      boards: coordinator.getSharedBoards(req.authenticatedUser?.email),
+    });
+  });
+
+  /** Who a board is shared with. The owner's to read: it is a list of addresses. */
+  router.get(
+    "/users/:username/boards/:boardName/members",
+    (req: Request, res: Response) => {
+      const { username, boardName } = req.params as Record<string, string>;
+      if (!coordinator.getBoard(username, boardName)) {
+        res.sendStatus(404);
+        return;
+      }
+      res.json({ members: coordinator.getMembers(username, boardName) });
+    },
+  );
+
+  /**
+   * Shares the board with an email, under a name — or renames the entry that
+   * email already has. POST for both, like every other change this server
+   * takes.
+   */
+  router.post(
+    "/users/:username/boards/:boardName/members",
+    async (req: Request, res: Response) => {
+      const { username, boardName } = req.params as Record<string, string>;
+      const member = readMember(req.body);
+      if (!member) {
+        res.status(400).json({ error: "A member is an email and a name" });
+        return;
+      }
+      try {
+        const members = await coordinator.setMember(username, boardName, member);
+        if (!members) {
+          res.sendStatus(404);
+          return;
+        }
+        res.json({ members });
+      } catch (err) {
+        if (err instanceof MemberLimitError) {
+          res.status(429).json({ error: err.message });
+          return;
+        }
+        throw err;
+      }
+    },
+  );
+
+  /** Stops sharing with an email. Whatever they have open on the board closes. */
+  router.delete(
+    "/users/:username/boards/:boardName/members/:email",
+    async (req: Request, res: Response) => {
+      const { username, boardName, email } = req.params as Record<string, string>;
+      const members = await coordinator.removeMember(username, boardName, email);
+      if (!members) {
+        res.sendStatus(404);
+        return;
+      }
+      res.json({ members });
+    },
+  );
 
   router.get("/users/:username/boards", (req: Request, res: Response) => {
     const { username } = req.params as Record<string, string>;

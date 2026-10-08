@@ -22,6 +22,7 @@ import {
   toBinaryPayload,
 } from "./coordinator/binaryFrame";
 import { SecretEntry } from "./secrets";
+import { ProcessContext } from "./types";
 
 /**
  * This runtime server's connections to the coordinators its runtimes belong to.
@@ -136,14 +137,32 @@ export type LinkHost = {
     runtime: LinkedRuntime,
     serviceUuid: string,
     config: unknown,
+    context: unknown,
   ): Promise<unknown>;
+  /**
+   * Begins the runtime's pipeline at one service, as the run `context` names.
+   * Returns once the work is taken — throwing when it cannot be — and reports
+   * what the pipeline produced through `done`, with the run it belongs to.
+   */
+  processService(
+    runtime: LinkedRuntime,
+    serviceUuid: string,
+    params: unknown,
+    context: unknown,
+    done: (result: { data: unknown; context?: ProcessContext }) => void,
+  ): void;
   setState(runtime: LinkedRuntime, state: Record<string, unknown>): unknown;
   remove(runtime: LinkedRuntime): void;
+  /**
+   * Runs the runtime's pipeline as the run `context` names. Answers with what
+   * it produced and the run it produced it in, which the coordinator hands to
+   * the next runtime.
+   */
   process(
     runtime: LinkedRuntime,
     params: unknown,
     context: unknown,
-  ): Promise<unknown>;
+  ): Promise<{ data: unknown; context?: ProcessContext }>;
 };
 
 export type CoordinatorLinksOptions = {
@@ -309,7 +328,8 @@ class Link {
         message = {
           type: "processRuntime",
           params: fromBinaryPayload(frame.payload),
-          context: frame.header.context,
+          // Read where it is used; see LinkHost.process.
+          context: frame.header.context as ProcessContext | undefined,
         };
       } else {
         try {
@@ -386,12 +406,13 @@ class Link {
       return;
     }
     // A result holding bytes goes as a binary frame; as text it would arrive
-    // as an object of numbered keys.
+    // as an object of numbered keys. The header is the message without its
+    // value, so the run it belongs to travels in it either way.
     const binary =
       message.type === "result" ? toBinaryPayload(message.data) : null;
     this.socket.send(
-      binary
-        ? encodeBinaryFrame({ type: "result" }, binary)
+      binary && message.type === "result"
+        ? encodeBinaryFrame({ type: "result", context: message.context }, binary)
         : JSON.stringify(message),
     );
   }
@@ -418,12 +439,12 @@ class Link {
         return;
       }
       try {
-        const result = await this.host.process(
+        const { data, context } = await this.host.process(
           this.record,
           message.params,
           message.context,
         );
-        this.send({ type: "result", data: result });
+        this.send({ type: "result", data, context });
       } catch (err) {
         console.error(
           `[coordinator-link] Runtime "${runtimeId}" failed to process:`,
@@ -474,7 +495,19 @@ class Link {
           runtime,
           request.serviceUuid,
           request.config,
+          request.context,
         );
+      case "processService":
+        this.host.processService(
+          runtime,
+          request.serviceUuid,
+          request.params,
+          request.context,
+          // What the pipeline made of it goes to the coordinator the way any
+          // of this runtime's output does, to be carried to the next runtime.
+          ({ data, context }) => this.emit({ type: "result", data, context }),
+        );
+        return { accepted: true };
       case "setState":
         return this.host.setState(runtime, request.state ?? {});
       case "remove":

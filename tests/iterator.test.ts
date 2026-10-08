@@ -215,7 +215,10 @@ describe("when an item goes wrong", () => {
 
 describe("attribution", () => {
   it("gives each item a run of its own, descended from the caller's", async () => {
-    const t = iterator({}, {}, { runId: "outer-run" });
+    const t = iterator({}, {}, {
+      runId: "outer-run",
+      actor: { kind: "board" },
+    });
 
     await t.run([1, 2, 3]);
 
