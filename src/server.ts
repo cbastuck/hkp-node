@@ -1577,7 +1577,12 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
   // No ceiling of the library's own; see attachCoordinatorJoin.
   const bridgeWsServer = new WebSocketServer({ noServer: true, maxPayload: 0 });
   let bridgeUpgradeHandler:
-    | ((ws: WebSocket, user: AuthenticatedUser, mayOwn: boolean) => void)
+    | ((
+        ws: WebSocket,
+        user: AuthenticatedUser,
+        mayOwn: boolean,
+        transport?: Duplex,
+      ) => void)
     | undefined;
 
   function rejectUpgrade(
@@ -1646,12 +1651,19 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
             rejectUpgrade(socket, 401, "Unauthorized");
             return;
           }
+          // Somebody who may not own and has no verified email can be neither
+          // a board's owner nor on its list, whichever board they go on to
+          // name — so there is nothing to open a socket for.
+          if (!owner && !identity.email) {
+            rejectUpgrade(socket, 401, "Unauthorized");
+            return;
+          }
           if (!bridgeUpgradeHandler) {
             rejectUpgrade(socket, 503, "Service Unavailable");
             return;
           }
           bridgeWsServer.handleUpgrade(request, socket, head, (ws) => {
-            bridgeUpgradeHandler!(ws, identity, !!owner);
+            bridgeUpgradeHandler!(ws, identity, !!owner, socket);
           });
         })
         .catch(() => {
@@ -1808,7 +1820,12 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
      * whether the server's allowlist lets them own; it decides the rest.
      */
     setBridgeUpgradeHandler(
-      handler: (ws: WebSocket, user: AuthenticatedUser, mayOwn: boolean) => void,
+      handler: (
+        ws: WebSocket,
+        user: AuthenticatedUser,
+        mayOwn: boolean,
+        transport?: Duplex,
+      ) => void,
     ) {
       bridgeUpgradeHandler = handler;
     },

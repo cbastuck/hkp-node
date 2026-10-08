@@ -3,9 +3,11 @@ import { describe, expect, it } from "vitest";
 import {
   childRun,
   contextFromWire,
+  detached,
   HostedRuntime,
   newRun,
 } from "../src/runtime";
+import { SubService } from "../src/services/sub-service";
 import {
   HostedService,
   JsonRecord,
@@ -81,8 +83,62 @@ class Puller implements HostedService {
   }
 }
 
+/**
+ * Emits by itself, a moment after whatever armed it: on being configured, or
+ * on being called with `{ arm: "detached" | "attached" }`.
+ */
+class Emitter implements HostedService {
+  readonly serviceId = "emitter";
+  readonly serviceName = "Emitter";
+  readonly uuid: string;
+  readonly emitted: Array<Promise<unknown>> = [];
+
+  private host: RuntimeHost | null = null;
+
+  constructor(config: ServiceConfiguration) {
+    this.uuid = config.uuid;
+  }
+
+  setHost(host: RuntimeHost): void {
+    this.host = host;
+  }
+
+  private emit(): void {
+    const done = this.host?.processFrom(this.uuid, { tick: true }, () => {});
+    if (done) {
+      this.emitted.push(done);
+    }
+  }
+
+  configure(): JsonRecord {
+    setTimeout(() => this.emit(), 1);
+    return {};
+  }
+
+  getState(): JsonRecord {
+    return {};
+  }
+
+  process(input: unknown): unknown {
+    const arm = (input as { arm?: string } | null)?.arm;
+    if (arm === "detached") {
+      setTimeout(() => detached(() => this.emit()), 1);
+    } else if (arm === "attached") {
+      setTimeout(() => this.emit(), 1);
+    }
+    return null;
+  }
+}
+
+const person = (sub = "auth0|member"): ProcessContext => ({
+  runId: `run-of-${sub}`,
+  actor: { kind: "person", sub, expiresAt: Date.now() + 60_000 },
+});
+
+const soon = () => new Promise((resolve) => setTimeout(resolve, 20));
+
 function runtimeOf(
-  services: Array<{ uuid: string; kind?: "spy" | "puller" }>,
+  services: Array<{ uuid: string; kind?: "spy" | "puller" | "emitter" }>,
 ): { runtime: HostedRuntime; spies: Map<string, ContextSpy> } {
   const spies = new Map<string, ContextSpy>();
   const runtime = new HostedRuntime(
@@ -95,6 +151,9 @@ function runtimeOf(
       const kind = services.find((s) => s.uuid === config.uuid)?.kind ?? "spy";
       if (kind === "puller") {
         return new Puller(config);
+      }
+      if (kind === "emitter") {
+        return new Emitter(config);
       }
       const spy = new ContextSpy(config);
       spies.set(config.uuid, spy);
@@ -224,6 +283,115 @@ describe("process context", () => {
 
     expect(spies.get("a")!.configured).toEqual([run, null]);
     expect(runtime.currentContext()).toBeNull();
+  });
+
+  it("ends a configure's run when configure returns", async () => {
+    // What a service arms while being configured outlives the call, and keeps
+    // its async context. It must not keep the run: the tick is the board's,
+    // and a person's run expires.
+    const { runtime, spies } = runtimeOf([
+      { uuid: "source", kind: "emitter" },
+      { uuid: "after" },
+    ]);
+    const seenBefore = spies.get("after")!.seen.length;
+
+    runtime.configureService("source", {}, person());
+    await soon();
+
+    const seen = spies.get("after")!.seen.slice(seenBefore);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.actor).toEqual({ kind: "board" });
+    expect(seen[0]?.runId).not.toBe(person().runId);
+  });
+
+  it("begins a run for work detached from the call that armed it", async () => {
+    const { runtime, spies } = runtimeOf([
+      { uuid: "source", kind: "emitter" },
+      { uuid: "after" },
+    ]);
+    await soon();
+    const seenBefore = spies.get("after")!.seen.length;
+
+    await runtime.processAt("source", { arm: "attached" }, () => {}, person());
+    await soon();
+    await runtime.processAt("source", { arm: "detached" }, () => {}, person());
+    await soon();
+
+    const [attached, detachedRun] = spies.get("after")!.seen.slice(seenBefore);
+    // Left alone, a callback continues the run it was scheduled in — which is
+    // what lets a late answer still be the caller's.
+    expect(attached?.actor.kind).toBe("person");
+    expect(detachedRun?.actor).toEqual({ kind: "board" });
+  });
+
+  it("reports no run inside a detachment, and its own runs within it", () => {
+    const { runtime, spies } = runtimeOf([{ uuid: "a" }]);
+    let inside: ProcessContext | null | undefined;
+
+    runtime.configureService("a", {}, person());
+    const spy = spies.get("a")!;
+    // From inside a call: the detachment hides it, and a pass begun there is
+    // seen by the services it runs.
+    spy.process = function (this: ContextSpy, input: unknown) {
+      detached(() => {
+        inside = runtime.currentContext();
+        runtime.configureService("a", {}, person("auth0|other"));
+      });
+      return input;
+    };
+    runtime.process({}, () => {}, person());
+
+    expect(inside).toBeNull();
+    expect(spy.configured.at(-1)?.actor).toMatchObject({ sub: "auth0|other" });
+  });
+});
+
+describe("a nested pipeline entered at a scoped address", () => {
+  function scoped() {
+    const spies = new Map<string, ContextSpy>();
+    const create = (config: ServiceConfiguration): HostedService => {
+      if (config.serviceId === "sub-service") {
+        return new SubService(config, create as never);
+      }
+      const spy = new ContextSpy(config);
+      spies.set(config.uuid, spy);
+      return spy;
+    };
+    const runtime = new HostedRuntime(
+      {
+        id: "test",
+        name: "test",
+        services: [
+          {
+            serviceId: "sub-service",
+            uuid: "scope",
+            state: { pipeline: [{ serviceId: "spy", uuid: "inner" }] },
+          },
+        ],
+      },
+      create,
+    );
+    return { runtime, spies };
+  }
+
+  it("reports what happens inside as the run that entered it", async () => {
+    // The runtime around the scope is never in a call here, so only the
+    // nested runtime knows whose run a report belongs to. Reported without
+    // it, a member's answer reads as the board's and is sent to everybody.
+    const { runtime } = scoped();
+    const actors: unknown[] = [];
+    runtime.registerNotificationTarget((notification) => {
+      if (notification.instanceId === "scope.inner") {
+        actors.push(notification.context?.actor);
+      }
+    });
+
+    await runtime.processAt("scope.inner", { n: 1 }, () => {}, person());
+
+    expect(actors.length).toBeGreaterThan(0);
+    for (const actor of actors) {
+      expect(actor).toMatchObject({ kind: "person", sub: "auth0|member" });
+    }
   });
 });
 

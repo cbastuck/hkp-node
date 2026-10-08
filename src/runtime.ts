@@ -230,6 +230,37 @@ export function runExpired(
 }
 
 /**
+ * Where work that belongs to no call begins, across every runtime in the
+ * process. A run's frame remembers which of these it was begun under, and is
+ * only the current one while that still holds.
+ */
+const detachments = new AsyncLocalStorage<object>();
+
+/**
+ * Runs `fn` outside whatever run it was scheduled from.
+ *
+ * A callback keeps the async context of the code that scheduled it, so a tick
+ * armed from inside a call would otherwise go on reading that call's run —
+ * and its caller, and its expiry — for as long as it fires. A service that
+ * emits by itself wraps the emission in this, and what it emits begins a run
+ * of its own. Nested runtimes are covered by the one call: each keeps its own
+ * frame, and none of them outlives the detachment.
+ */
+export function detached<T>(fn: () => T): T {
+  return detachments.run({}, fn);
+}
+
+/** One call in progress on a runtime; see `HostedRuntime.runState`. */
+type RunFrame = {
+  context: ProcessContext;
+  service: string | null;
+  /** The detachment this frame was begun under; see `detached`. */
+  detachment: object | undefined;
+  /** Set once the call it stood for has returned; see `configureService`. */
+  ended?: boolean;
+};
+
+/**
  * Grants a runtime's services public endpoints. Supplied by the server, which
  * owns the listening socket; absent for inner sub-service pipelines, which are
  * not addressable from outside.
@@ -294,10 +325,7 @@ export class HostedRuntime implements RuntimeHost {
    * and restores the outer one on the way out, which is what a nested pull
    * needs.
    */
-  private readonly runState = new AsyncLocalStorage<{
-    context: ProcessContext;
-    service: string | null;
-  }>();
+  private readonly runState = new AsyncLocalStorage<RunFrame>();
   private readonly logTargets = new Set<(entry: LogEntry) => void>();
   /** See RuntimeConfiguration.logData. A board-wide override, not the gate. */
   private logData = true;
@@ -463,7 +491,24 @@ export class HostedRuntime implements RuntimeHost {
     }
     const configure = () =>
       this.inService(service.uuid, () => service.configure(config));
-    return context ? this.withContext(context, configure) : configure();
+    if (!context) {
+      return configure();
+    }
+    // Configuring is over when `configure` returns, and the run ends with it.
+    // What a service arms while being configured — an interval, a socket, a
+    // poll — keeps this frame as its async context, and without an end it
+    // would go on emitting as whoever configured it, until their authority
+    // expired and the board stopped with it.
+    const frame: RunFrame = {
+      context,
+      service: this.currentService,
+      detachment: detachments.getStore(),
+    };
+    try {
+      return this.runState.run(frame, configure);
+    } finally {
+      frame.ended = true;
+    }
   }
 
   removeService(uuid: string): boolean {
@@ -513,8 +558,8 @@ export class HostedRuntime implements RuntimeHost {
     };
   }
 
-  emitResult(output: unknown): void {
-    const context = this.currentContext();
+  emitResult(output: unknown, context?: ProcessContext | null): void {
+    context = context ?? this.currentContext();
     for (const target of this.resultTargets) {
       target(output, context);
     }
@@ -549,12 +594,25 @@ export class HostedRuntime implements RuntimeHost {
   // ── RuntimeHost ────────────────────────────────────────────────────────────
 
   currentContext(): ProcessContext | null {
-    return this.runState.getStore()?.context ?? null;
+    return this.frame?.context ?? null;
   }
 
   /** Which service the current pass is inside, for a log entry to name. */
   private get currentService(): string | null {
-    return this.runState.getStore()?.service ?? null;
+    return this.frame?.service ?? null;
+  }
+
+  /**
+   * The call in progress, or nothing when the frame this code inherited is no
+   * longer one: its call has returned, or the work has been detached from it.
+   */
+  private get frame(): RunFrame | undefined {
+    const frame = this.runState.getStore();
+    return frame &&
+      !frame.ended &&
+      frame.detachment === detachments.getStore()
+      ? frame
+      : undefined;
   }
 
   processFrom(
@@ -648,8 +706,15 @@ export class HostedRuntime implements RuntimeHost {
     );
   }
 
-  notify(payload: unknown, instanceId: string): void {
-    this.emitNotification({ instanceId, payload }, () => {});
+  notify(
+    payload: unknown,
+    instanceId: string,
+    context?: ProcessContext | null,
+  ): void {
+    this.emitNotification(
+      { instanceId, payload, ...(context ? { context } : {}) },
+      () => {},
+    );
   }
 
   log(level: LogLevel, event: string, data?: unknown): void {
@@ -934,12 +999,19 @@ export class HostedRuntime implements RuntimeHost {
   private withContext<T>(context: ProcessContext, fn: () => T): T {
     // The service is carried alongside the context so both are restored
     // together on the way out of a nested pull.
-    return this.runState.run({ context, service: this.currentService }, fn);
+    return this.runState.run(
+      {
+        context,
+        service: this.currentService,
+        detachment: detachments.getStore(),
+      },
+      fn,
+    );
   }
 
   /** Runs `fn` with the pass recorded as being inside `uuid`. */
   private inService<T>(uuid: string | null, fn: () => T): T {
-    const store = this.runState.getStore();
+    const store = this.frame;
     if (!store) {
       return fn();
     }

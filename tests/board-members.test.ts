@@ -1,4 +1,5 @@
 import request from "supertest";
+import { WebSocket } from "ws";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { AuthenticatedUser } from "../src/auth";
@@ -525,6 +526,86 @@ describe("attaching to a board", () => {
     expect(await second.closed).toBe(CLOSE_TOO_MANY_BRIDGES);
     expect(second.received).toEqual([]);
     expect(first.socket.readyState).toBe(first.socket.OPEN);
+  });
+});
+
+describe("a bridge nobody has admitted yet", () => {
+  async function hostAllowing(
+    admission: Parameters<typeof startCoordinator>[3],
+    allowedEmails?: string[],
+  ) {
+    const host = await startCoordinator(
+      new BoardCoordinator(),
+      0,
+      { people: PEOPLE, allowedEmails },
+      admission,
+    );
+    cleanups.push(host.stop);
+    return host;
+  }
+
+  /** Opens the socket and says nothing, which is all it takes to hold one. */
+  async function openSilent(host: CoordinatorHost, person: AuthenticatedUser) {
+    const socket = new WebSocket(
+      `ws://127.0.0.1:${host.port}/coordinator/bridge?access_token=${encodeURIComponent(person.sub)}`,
+    );
+    cleanups.push(async () => socket.terminate());
+    const closed = new Promise<number>((resolve) =>
+      socket.once("close", (code) => resolve(code)),
+    );
+    await new Promise<void>((resolve, reject) => {
+      socket.once("open", () => resolve());
+      socket.once("error", reject);
+    });
+    return { socket, closed };
+  }
+
+  it("is closed when it does not say which board it wants", async () => {
+    const host = await hostAllowing({ connectTimeoutMs: 30 });
+
+    const silent = await openSilent(host, MALLORY);
+
+    expect(await silent.closed).toBe(1008);
+  });
+
+  it("is dropped when it sends more than a connect message weighs", async () => {
+    const host = await hostAllowing({ maxConnectBytes: 1024 });
+
+    const loud = await openSilent(host, MALLORY);
+    loud.socket.send(Buffer.alloc(64 * 1024));
+
+    // Dropped, not answered: there is nothing to say to it.
+    expect(await loud.closed).toBe(1006);
+  });
+
+  it("is one of only so many its identity may have waiting", async () => {
+    const host = await hostAllowing({ maxPendingPerIdentity: 1 });
+
+    const first = await openSilent(host, MALLORY);
+    const second = await openSilent(host, MALLORY);
+    // Counted by who is asking: somebody else is not kept out by it.
+    const other = await openSilent(host, ANNA);
+
+    expect(await second.closed).toBe(1006);
+    expect(first.socket.readyState).toBe(first.socket.OPEN);
+    expect(other.socket.readyState).toBe(other.socket.OPEN);
+
+    // And a place is given back when a socket goes.
+    first.socket.terminate();
+    await first.closed;
+    await settle();
+    const third = await openSilent(host, MALLORY);
+    await settle();
+    expect(third.socket.readyState).toBe(third.socket.OPEN);
+  });
+
+  it("is not opened for somebody who could be nothing to any board", async () => {
+    // May not own, and has no verified email for a list to name.
+    const host = await hostAllowing({}, [OWNER.email!]);
+
+    await expect(
+      openBridge(host, UNVERIFIED.sub, OWNER.sub, BOARD.boardName),
+    ).rejects.toThrow(/401/);
   });
 });
 

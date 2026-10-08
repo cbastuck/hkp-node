@@ -235,6 +235,10 @@ export class NestedPipeline {
         this.host?.notify(
           notification.payload,
           joinAddress(this.owner, notification.instanceId),
+          // The run it was reported in, which only the nested runtime knows
+          // when its pipeline was entered directly rather than through this
+          // service's own call.
+          notification.context,
         ),
     );
 

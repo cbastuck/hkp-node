@@ -444,7 +444,10 @@ export class SubService implements HostedService {
    * services after this one are run here, and what they produce leaves the
    * board the way this service's own output would.
    */
-  private async emitOutward(result: unknown): Promise<void> {
+  private async emitOutward(
+    result: unknown,
+    context: ProcessContext | null,
+  ): Promise<void> {
     // Null is a nested pipeline saying it has nothing to pass on, and that
     // answer is this service's answer too — the services after it do not run.
     if (result === null || result === undefined) {
@@ -466,8 +469,13 @@ export class SubService implements HostedService {
     }
     // No-op: the runtime fans these out to its own targets, and forwarding
     // them again here would deliver every one twice.
-    const output = await host.processFrom(this.uuid, result, () => {});
-    host.emitResult(output);
+    // Still inside the call around this service, the value goes on as part
+    // of it. Otherwise the run is the one the nested pipeline produced it in —
+    // entered at a scoped address, the runtime around it was never in a call,
+    // and beginning a run here would lose whoever asked.
+    const run = host.currentContext() ?? context ?? undefined;
+    const output = await host.processFrom(this.uuid, result, () => {}, run);
+    host.emitResult(output, run);
   }
 
   private rebuild(): void {
@@ -500,6 +508,10 @@ export class SubService implements HostedService {
         this.host?.notify(
           notification.payload,
           joinAddress(this.uuid, notification.instanceId),
+          // The run it was reported in, which only the nested runtime knows
+          // when its pipeline was entered directly rather than through this
+          // service's own call.
+          notification.context,
         ),
       );
 
@@ -514,7 +526,7 @@ export class SubService implements HostedService {
     // emitOutward.
     this.releasePipelineResults?.();
     this.releasePipelineResults = this.pipeline.registerResultTarget(
-      (result) => void this.emitOutward(result),
+      (result, context) => void this.emitOutward(result, context),
     );
 
     this.applyLogSettings();

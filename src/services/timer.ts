@@ -17,6 +17,7 @@ import {
   ServiceConfiguration,
   ServiceRegistryEntry,
 } from "../types";
+import { detached } from "../runtime";
 
 export const timerDescriptor: ServiceRegistryEntry = {
   serviceId: "timer",
@@ -174,9 +175,9 @@ export class TimerService {
           durationMs(this._periodicValue, this._periodicUnit),
           this.minIntervalMs,
         );
-        this._timer = setInterval(() => void this._tick(), ms);
+        this._timer = setInterval(() => detached(() => void this._tick()), ms);
         if (immediate) {
-          setTimeout(() => void this._tick(), 1);
+          setTimeout(() => detached(() => void this._tick()), 1);
         }
       } else {
         if (this._timer) {
@@ -185,7 +186,7 @@ export class TimerService {
         const ms = immediate
           ? 1
           : durationMs(this._oneShotDelay, this._oneShotDelayUnit);
-        setTimeout(() => void this._tick(), ms);
+        setTimeout(() => detached(() => void this._tick()), ms);
       }
     }
 
@@ -204,7 +205,7 @@ export class TimerService {
       const ms = durationMs(this._oneShotDelay, this._oneShotDelayUnit);
       // The call passes through now; the later tick is a timer emission, not a
       // delayed answer carrying the person who happened to start it.
-      setTimeout(() => void this._tickWithInput(input), ms);
+      setTimeout(() => detached(() => void this._tickWithInput(input)), ms);
     }
     return input;
   }

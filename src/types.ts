@@ -344,13 +344,24 @@ export interface RuntimeHost {
     onNotification: (notification: RuntimeNotification) => void,
     context?: ProcessContext,
   ): Promise<unknown>;
-  notify(payload: unknown, instanceId: string): void;
+  /**
+   * Reports something to whoever is watching. Said from inside a run, it is
+   * reported as part of it; `context` names the run instead where the report
+   * is being carried out of a nested pipeline, which knows the run it was made
+   * in when the runtime around it does not.
+   */
+  notify(
+    payload: unknown,
+    instanceId: string,
+    context?: ProcessContext | null,
+  ): void;
   /**
    * Hands a value to whatever follows this runtime. Called from inside a run,
    * the value goes on as part of it — the next runtime of a deployed board is
-   * told the same run and the same caller.
+   * told the same run and the same caller. `context` names the run where the
+   * value is handed on from outside the call that produced it.
    */
-  emitResult(output: unknown): void;
+  emitResult(output: unknown, context?: ProcessContext | null): void;
   /**
    * The context of the call currently being processed, or null outside one.
    *

@@ -10,7 +10,10 @@ import {
   mayOwn,
   ownerKeyOf,
 } from "../src/auth";
-import { createBridgeHandler } from "../src/coordinator/bridge";
+import {
+  BridgeAdmissionOptions,
+  createBridgeHandler,
+} from "../src/coordinator/bridge";
 import { BridgeMessage } from "../src/coordinator/bridgeProtocol";
 import { BridgeAttach } from "../src/coordinator/session";
 import { SHARED_BOARDS_PATH } from "../src/coordinator/router";
@@ -135,6 +138,8 @@ export async function startCoordinator(
    * by identity, as a deployed coordinator's does.
    */
   auth?: { people: AuthenticatedUser[]; allowedEmails?: string[] },
+  /** What an unadmitted bridge is allowed, where a test is about that. */
+  admission: Partial<BridgeAdmissionOptions> = {},
 ): Promise<CoordinatorHost> {
   const host = createRuntimeServer({
     externalHost: "127.0.0.1",
@@ -166,6 +171,7 @@ export async function startCoordinator(
       // not hold a test up.
       attempts: 3,
       attemptDelayMs: 10,
+      ...admission,
     }),
   );
   attachCoordinatorJoin(host, coordinator);

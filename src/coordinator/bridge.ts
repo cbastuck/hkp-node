@@ -1,3 +1,5 @@
+import { Duplex } from "node:stream";
+
 import { WebSocket } from "ws";
 
 import { AuthenticatedUser } from "../auth";
@@ -44,6 +46,24 @@ export type BridgeAdmissionOptions = {
   /** How often a board that is not there yet is looked for again. */
   attempts?: number;
   attemptDelayMs?: number;
+  /** How long a socket may stay open without saying which board it wants. */
+  connectTimeoutMs?: number;
+  /** How much a socket may send before it has been admitted to a board. */
+  maxConnectBytes?: number;
+  /** How many sockets one identity may have waiting to be admitted. */
+  maxPendingPerIdentity?: number;
+};
+
+/**
+ * What is allowed of a socket nobody has admitted yet. The upgrade establishes
+ * only who is asking, and that may be anybody able to sign in — so until a
+ * board has taken the socket it gets a short time, a small message and few
+ * siblings. Once admitted, what a bridge may carry is the board's to say.
+ */
+export const DEFAULT_ADMISSION_LIMITS = {
+  connectTimeoutMs: 10_000,
+  maxConnectBytes: 64 * 1024,
+  maxPendingPerIdentity: 8,
 };
 
 type ConnectMessage = {
@@ -56,9 +76,23 @@ type ConnectMessage = {
 export function createBridgeHandler(
   coordinator: BoardCoordinator,
   options: BridgeAdmissionOptions,
-): (ws: WebSocket, user: AuthenticatedUser, mayOwn: boolean) => void {
+): (
+  ws: WebSocket,
+  user: AuthenticatedUser,
+  mayOwn: boolean,
+  transport?: Duplex,
+) => void {
   const attempts = options.attempts ?? 30;
   const attemptDelayMs = options.attemptDelayMs ?? 100;
+  const connectTimeoutMs =
+    options.connectTimeoutMs ?? DEFAULT_ADMISSION_LIMITS.connectTimeoutMs;
+  const maxConnectBytes =
+    options.maxConnectBytes ?? DEFAULT_ADMISSION_LIMITS.maxConnectBytes;
+  const maxPendingPerIdentity =
+    options.maxPendingPerIdentity ??
+    DEFAULT_ADMISSION_LIMITS.maxPendingPerIdentity;
+  /** Sockets waiting to be admitted, counted by who opened them. */
+  const pending = new Map<string, number>();
 
   /** What this person is to the board, or null when they are nothing to it. */
   function admit(
@@ -87,8 +121,66 @@ export function createBridgeHandler(
     return listed ? { role: "member", caller } : null;
   }
 
-  return (ws, user, mayOwn) => {
+  return (ws, user, mayOwn, transport) => {
+    // Without authentication everybody is the one anonymous tenant, and there
+    // is no identity to count by.
+    const counted = options.authMode !== "none";
+    const waiting = pending.get(user.sub) ?? 0;
+    if (counted && waiting >= maxPendingPerIdentity) {
+      console.warn(
+        `[bridge] Too many sockets waiting for "${user.sub}" — closing`,
+      );
+      ws.terminate();
+      return;
+    }
+    if (counted) {
+      pending.set(user.sub, waiting + 1);
+    }
+
+    // Counted on the connection rather than on the message: the socket has no
+    // ceiling of its own, so a message is only seen once all of it has been
+    // buffered, which is too late to refuse it.
+    let received = 0;
+    const count = (chunk: Buffer) => {
+      received += chunk.length;
+      if (received > maxConnectBytes) {
+        console.warn(
+          `[bridge] "${user.sub}" sent more than ${maxConnectBytes} bytes before being admitted — closing`,
+        );
+        ws.terminate();
+      }
+    };
+    transport?.on("data", count);
+
+    const deadline = setTimeout(() => {
+      console.warn(`[bridge] No connect message from "${user.sub}" — closing`);
+      ws.close(1008, "connect expected");
+    }, connectTimeoutMs);
+
+    let settled = false;
+    /** The socket stops waiting: a board took it, or it is gone. */
+    const settle = () => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(deadline);
+      transport?.off("data", count);
+      if (counted) {
+        const left = (pending.get(user.sub) ?? 1) - 1;
+        if (left > 0) {
+          pending.set(user.sub, left);
+        } else {
+          pending.delete(user.sub);
+        }
+      }
+    };
+    ws.once("close", settle);
+
     ws.once("message", (raw) => {
+      // Said which board, or failed to: either way the wait for it is over.
+      // The rest of what applies to an unadmitted socket stays until `settle`.
+      clearTimeout(deadline);
       let msg: ConnectMessage;
       try {
         msg = JSON.parse(raw.toString());
@@ -131,6 +223,7 @@ export function createBridgeHandler(
             ws.close(CLOSE_TOO_MANY_BRIDGES, "open in too many places");
             return;
           }
+          settle();
           session.registerBrowserSocket(ws, runtimeIds, attach);
           return;
         }
