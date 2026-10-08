@@ -30,7 +30,7 @@
  * nothing, so the pipeline stops rather than continuing on that basis.
  */
 
-import nodemailer, { Transporter } from "nodemailer";
+import nodemailer, { TransportOptions, Transporter } from "nodemailer";
 
 import { normalizeMessageId, normalizeReferences } from "./imap-email";
 import { resolveCredential } from "../secrets";
@@ -75,7 +75,7 @@ type SmtpEmailState = {
 
 /** Injectable so tests can drive the whole service without an SMTP server. */
 export type TransportFactory = (
-  options: nodemailer.TransportOptions | Record<string, unknown>,
+  options: TransportOptions | Record<string, unknown>,
 ) => Transporter;
 
 export class SmtpEmailService implements HostedService {
@@ -102,7 +102,7 @@ export class SmtpEmailService implements HostedService {
   constructor(
     config: ServiceConfiguration,
     private readonly createTransport: TransportFactory = (options) =>
-      nodemailer.createTransport(options as nodemailer.TransportOptions),
+      nodemailer.createTransport(options as TransportOptions),
   ) {
     this.uuid = config.uuid;
     if (config.state) {
