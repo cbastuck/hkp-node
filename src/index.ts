@@ -16,7 +16,8 @@ import {
 } from "./coordinator";
 import { createFileBoardStore } from "./coordinator/fileBoardStore";
 import { createFileLogStore } from "./coordinator/logStore";
-import { AllowedOrigins, AuthConfig, isLoopbackHost } from "./auth";
+import { AuthConfig, isLoopbackHost } from "./auth";
+import { parseAllowedOrigins } from "./origins";
 
 /**
  * The key public mount addresses are derived from.
@@ -266,16 +267,6 @@ function parseAllowedEmails(value: string | undefined): string[] | undefined {
     .map((email) => email.trim().toLowerCase())
     .filter(Boolean);
   return emails.length ? emails : undefined;
-}
-
-function parseAllowedOrigins(value: string | undefined): AllowedOrigins {
-  if (!value || value.trim() === "*") {
-    return "*";
-  }
-  return value
-    .split(",")
-    .map((origin) => origin.trim())
-    .filter(Boolean);
 }
 
 /**

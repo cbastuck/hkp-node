@@ -112,6 +112,11 @@ import {
   ownerKeyOf,
 } from "./auth";
 import {
+  admitsWithoutCredential,
+  allowsOrigin,
+  allowsOriginWithoutCredential,
+} from "./origins";
+import {
   HostedServiceFactory,
   JsonRecord,
   LogEntry,
@@ -329,11 +334,16 @@ function readInbound(
   return { type: "processRuntime", params: message.data };
 }
 
+/** A header a client may have sent more than once, as the first it sent. */
+function singleHeader(value: string | string[] | undefined): string | undefined {
+  return Array.isArray(value) ? value[0] : value;
+}
+
 export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
   // Tests and local dev default to no auth; index.ts always resolves an explicit
   // config and fails closed for the published package (see resolveServerAuthConfig).
   const authConfig: AuthConfig = options.auth ?? { mode: "none" };
-  const allowedOrigins: AllowedOrigins = options.allowedOrigins ?? "*";
+  const allowedOrigins: AllowedOrigins = options.allowedOrigins ?? "default";
 
   // Coordinator session tokens this runtime has issued (see POST .../session-token).
   // Opaque, in-memory, and bound to the minting user — so they resolve back to a
@@ -658,14 +668,52 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
     },
     { maxInlineBytes: maxInlineAssetBytes },
   );
+  // A server without auth lets a request in for where it comes from, so it
+  // asks that this is not a foreign page; see origins.ts. With auth a request
+  // is let in for the token it carries, and the origin list says only which
+  // pages may send one.
+  const noAuth = authConfig.mode === "none";
+  const ownNames = [externalHost];
+  const admitsUnauthenticated = (request: http.IncomingMessage): boolean =>
+    admitsWithoutCredential(
+      {
+        origin: request.headers.origin,
+        secFetchSite: singleHeader(request.headers["sec-fetch-site"]),
+        host: request.headers.host,
+      },
+      allowedOrigins,
+      ownNames,
+    );
+
   const expressApp = express();
   expressApp.use(
     cors({
-      origin: allowedOrigins === "*" ? true : allowedOrigins,
+      // Which page may read an answer: the one asking, when it is one this
+      // server allows. Without auth there are no credentials, so `*` — any
+      // page, with one — allows nobody.
+      origin: (origin, callback) =>
+        callback(
+          null,
+          noAuth
+            ? allowsOriginWithoutCredential(origin, allowedOrigins)
+            : allowsOrigin(origin, allowedOrigins),
+        ),
       methods: ["GET", "POST", "DELETE", "OPTIONS"],
       allowedHeaders: ["Content-Type", "Authorization"],
     }),
   );
+  // Ahead of everything that reads the request. Answered with nothing a page
+  // could read — the CORS headers above were not set for it — so to the page
+  // that sent it this is what a server that is not there looks like.
+  if (noAuth) {
+    expressApp.use((req, res, next) => {
+      if (admitsUnauthenticated(req)) {
+        next();
+        return;
+      }
+      res.status(403).end();
+    });
+  }
   // Not strict: a JSON `null` is a payload here, and the one that means "no
   // input". A pipeline is started with it whenever nothing precedes the first
   // service — a panel's Send button, an external trigger — and the strict
@@ -1621,8 +1669,13 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
     // Authenticate every upgrade with the same rules as HTTP routes. Browsers
     // can't set headers on a WS handshake, so the token rides in ?access_token=.
     // The Origin check blocks cross-site WebSocket hijacking from a page a local
-    // user happens to visit.
-    if (!isOriginAllowed(request.headers.origin, allowedOrigins)) {
+    // user happens to visit — and without auth, where nothing else stands in
+    // the way, it is the whole rule a request is let in by.
+    if (
+      noAuth
+        ? !admitsUnauthenticated(request)
+        : !isOriginAllowed(request.headers.origin, allowedOrigins)
+    ) {
       rejectUpgrade(socket, 403, "Forbidden");
       return;
     }

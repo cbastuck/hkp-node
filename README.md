@@ -44,7 +44,7 @@ All options are passed as environment variables.
 | `PORT`                       | `8080`      | HTTP and WebSocket listen port                                                                                                                                                          |
 | `HOST`                       | `0.0.0.0`   | Bind address                                                                                                                                                                            |
 | `EXTERNAL_HOST`              | `127.0.0.1` | Hostname written into runtime `outputUrl` (use your machine's LAN/public IP when connecting from other devices)                                                                         |
-| `ALLOWED_ORIGINS`            | `*`         | Comma-separated list of allowed origins for CORS **and** the WebSocket Origin check. Leave as `*` only for local development. A native app's webview is its own origin — the Readymade apps send `hkp://app` (iOS), `saucer://embedded` (packaged desktop) and `https://appassets.androidplatform.net` (Android). |
+| `ALLOWED_ORIGINS`            | the Readymade apps and pages served from this machine | Comma-separated list of the browser origins that may call this server; it **replaces** the default. Applies to CORS and the WebSocket Origin check, and — on a server running without authentication — decides which pages are let in at all (see [Who may call from a browser](#who-may-call-from-a-browser)). A page loaded from anywhere else, the public playground included, has to be named here. `*` allows any page that carries a token, never one that carries none. The apps' own origins are `hkp://app` (iOS), `saucer://embedded` (packaged desktop) and `https://appassets.androidplatform.net` (Android). |
 | `AUTH0_DOMAIN`               | —           | Auth0 tenant domain. **Required** (with `AUTH0_AUDIENCE`) to start.                                                                                                                     |
 | `AUTH0_AUDIENCE`             | —           | Accepted `aud` values, comma-separated — the Auth0 client id of each application whose users this runtime serves (the frontend sends its id_token). **Required** to start.               |
 | `ALLOWED_EMAILS`             | —           | Comma-separated email allowlist of who may **own** things here — runtimes, deployed boards. When set, only tokens with a **verified** `email` claim on the list pass; requires Auth0 config (refuses to start without it). A coordinator additionally admits the people a deployed board is shared with, to that board only, whether or not they are on this list. |
@@ -63,6 +63,31 @@ All options are passed as environment variables.
 | `HKP_COORDINATOR_MAX_MEMBER_PROCESS_PER_MINUTE` | `120` | Coordinator only. How many times a minute one member may ask a shared board to do something. |
 | `HKP_COORDINATOR_MAX_PERSON_RUN_AGE_MS` | `900000` | Coordinator only. Maximum age of a person-actor run (15 minutes). The coordinator rechecks membership and this deadline whenever work crosses a runtime or sends a notification. |
 | `HKP_COORDINATOR_DATA_DIR`   | `~/.hkp/coordinator/boards` | Where the coordinator keeps the boards it has been given, one JSON file each, so they survive a restart. Set to the empty string to keep them in memory only. Files hold the board's config — which can carry service credentials — and are written `0600` under `0700` directories. One directory belongs to one coordinator: two processes sharing it will both restore every board and fight over the same runtimes. |
+
+### Who may call from a browser
+
+A server reachable only from its own machine is still reachable by every page
+open in a browser on that machine — any site can address `127.0.0.1`. So a
+server running **without authentication** lets a request in only when it does
+not come from a foreign page:
+
+- its `Origin` is absent (a caller that is not a browser: a coordinator,
+  `curl`, another runtime) or one the server allows — by default the Readymade
+  apps and any page served from this machine (`http://localhost:<port>`,
+  `http://127.0.0.1:<port>`), otherwise exactly what `ALLOWED_ORIGINS` names;
+- and its `Host` is an address, `localhost` or `EXTERNAL_HOST`, which is what
+  stops a page that resolved its own name to this machine.
+
+Anything else is answered `403` with nothing a page can read, so the page
+cannot tell it from a server that is not running. To use a local server from
+the playground on the public website, start it with
+`ALLOWED_ORIGINS=https://readymadeit.com`; the playground says so when it gets
+no answer, and has a button to check again. Service endpoints (mounts) are not
+subject to any of this: they exist for callers holding no token and no origin
+worth naming.
+
+With authentication a request is let in by its token; the origin list then
+says only which pages may send one and read the answer.
 
 ### Authentication
 
