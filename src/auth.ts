@@ -1,3 +1,4 @@
+import { allowsOrigin, type AllowedOrigins } from "./origins";
 import { Request, Response, NextFunction } from "express";
 import jwt from "jsonwebtoken";
 import jwksClient from "jwks-rsa";
@@ -292,16 +293,13 @@ export function createAuthenticator(
   };
 }
 
-/**
- * List of origins permitted to talk to this instance. `"*"` reflects any origin
- * (only sensible for local/no-auth development).
- */
-export type AllowedOrigins = "*" | string[];
+export type { AllowedOrigins } from "./origins";
 
 /**
  * True when the bind address is reachable only from the local machine. A
- * loopback bind is itself an access-control boundary — nothing off-machine can
- * connect — so running without authentication there is safe.
+ * loopback bind keeps other machines out — nothing off-machine can connect —
+ * which is why running without authentication is permitted there. It does not
+ * keep out a page in a browser on this machine; origins.ts does.
  */
 export function isLoopbackHost(host: string): boolean {
   const h = host.trim().toLowerCase();
@@ -311,20 +309,21 @@ export function isLoopbackHost(host: string): boolean {
 }
 
 /**
- * Cross-Site WebSocket Hijacking protection. Browsers always send an Origin
- * header on the WS handshake, so a mismatched one is a cross-site attempt and is
- * rejected. Non-browser clients (e.g. the coordinator) send no Origin; they are
- * allowed through here and gated by the token check instead.
+ * Cross-Site WebSocket Hijacking protection, for an upgrade that carries a
+ * credential. Browsers always send an Origin header on the WS handshake, so a
+ * mismatched one is a cross-site attempt and is rejected. Non-browser clients
+ * (e.g. the coordinator) send no Origin; they are allowed through here and
+ * gated by the token check instead.
+ *
+ * An upgrade that carries no credential is asked more of; see
+ * `admitsWithoutCredential` in origins.ts.
  */
 export function isOriginAllowed(
   origin: string | undefined,
   allowed: AllowedOrigins,
 ): boolean {
-  if (allowed === "*") {
-    return true;
-  }
   if (origin === undefined) {
     return true;
   }
-  return allowed.includes(origin);
+  return allowsOrigin(origin, allowed);
 }
