@@ -130,6 +130,29 @@ describe("the meeting poll, shared", () => {
     expect(asked["the-poll"].rows[0].name).toBe("Sprint review");
   });
 
+  it("keeps whoever answers on the meeting they answer, after a newer one is called", async () => {
+    const { act, meeting, dates } = office();
+    await meeting("Sprint review", "2026-11-02 10:00");
+    const opened = dates(await act(ANNA));
+    expect(opened[0].poll).toBe("Sprint review");
+
+    await meeting("Roadmap", "2026-11-03 10:00");
+    // What the date's button sends: its own meeting, not whatever is newest.
+    const answered = await act(ANNA, {
+      intent: "vote",
+      option: opened[0].id,
+      poll: opened[0].poll,
+    });
+
+    expect(answered["the-poll"].rows[0].name).toBe("Sprint review");
+    expect(dates(answered)[0]).toMatchObject({ yes: 1, mine: 1 });
+    // Both are still there to go back to.
+    expect(answered["the-meetings"].rows.map((row: Said) => row.name)).toEqual([
+      "Roadmap",
+      "Sprint review",
+    ]);
+  });
+
   it("tells somebody with nothing to answer why, and the owner what to do", async () => {
     const { act } = office();
     expect((await act(ANNA))["the-poll"].rows[0].notice).toMatch(/no meeting has been called/);
@@ -149,6 +172,43 @@ describe("the meeting poll, shared", () => {
     const annas = await act(ANNA);
     expect(annas["organising"].rows).toEqual([]);
     expect(annas["withdrawable"].rows).toEqual([]);
+  });
+
+  it("lets the owner organise any meeting, not only the newest", async () => {
+    const { act, meeting, dates } = office();
+    await meeting("Sprint review", "2026-11-02 10:00");
+    await meeting("Roadmap");
+
+    // Picking a meeting is a run naming it; what the owner organises follows.
+    const picked = await act(OWNER, { poll: "Sprint review" });
+    expect(picked["organising"].rows[0]).toMatchObject({
+      name: "Sprint review",
+      heading: "Organising Sprint review",
+    });
+
+    await act(OWNER, {
+      intent: "propose",
+      poll: picked["organising"].rows[0].name,
+      starts: "2026-11-04 10:00",
+    });
+    expect(dates(await act(ANNA, { poll: "Sprint review" }))).toHaveLength(2);
+    expect(dates(await act(ANNA, { poll: "Roadmap" }))).toHaveLength(0);
+  });
+
+  it("takes a date as the facade's picker gives it", async () => {
+    const { act, meeting, dates } = office();
+    await meeting("Sprint review");
+
+    await act(OWNER, {
+      intent: "propose",
+      poll: "Sprint review",
+      starts: "2026-11-04T10:00",
+    });
+
+    expect(dates(await act(ANNA))[0]).toMatchObject({
+      starts: "2026-11-04 10:00",
+      label: "Wed 2026-11-04 at 10:00",
+    });
   });
 
   it("refuses a member's date, close and withdrawal, whatever they send", async () => {
