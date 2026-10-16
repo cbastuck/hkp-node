@@ -1,4 +1,5 @@
 import { normalizeEmail } from "../auth";
+import { Caller } from "../types";
 
 /**
  * The people a deployed board is shared with.
@@ -112,4 +113,21 @@ export function findMember(
   }
   const address = normalizeEmail(email);
   return members.find((member) => member.email === address);
+}
+
+/**
+ * Whether a person's authority on a board is still live: they are its owner,
+ * or a current member who does not claim to be its owner. A run is checked
+ * again at every hop, and a role that changed hands in between would let a
+ * member's run set up what only the owner may.
+ */
+export function mayActOn(
+  owner: string,
+  members: BoardMember[],
+  caller: Caller,
+): boolean {
+  if (caller.sub === owner) {
+    return true;
+  }
+  return caller.role !== "owner" && !!findMember(members, caller.email);
 }

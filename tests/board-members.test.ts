@@ -18,7 +18,7 @@ import {
   projectState,
   readFacadeAccess,
 } from "../src/coordinator/facadeAccess";
-import { readMember } from "../src/coordinator/members";
+import { mayActOn, readMember } from "../src/coordinator/members";
 import { BoardSession, CLOSE_NOT_A_MEMBER } from "../src/coordinator/session";
 import { CloudBoardConfig } from "../src/coordinator/types";
 import { mapDescriptor } from "../src/services/map";
@@ -72,7 +72,7 @@ const whoami = (uuid: string) => ({
   state: {
     mode: "query",
     statement:
-      "SELECT $caller_sub AS sub, $caller_email AS email, $caller_name AS name",
+      "SELECT $caller_sub AS sub, $caller_email AS email, $caller_name AS name, $caller_role AS role",
   },
 });
 
@@ -735,7 +735,36 @@ describe("what a member may send", () => {
     expect(answer.data).toEqual({ accepted: true });
     await eventually(() => rowsOf(anna).length > 0, "the answer");
     expect(rowsOf(anna)[0]).toEqual([
-      { sub: ANNA.sub, email: ANNA.email, name: "Anna" },
+      { sub: ANNA.sub, email: ANNA.email, name: "Anna", role: "member" },
+    ]);
+  });
+
+  it("tells a statement the owner from a member", async () => {
+    const { host } = await shared();
+    const owner = await attached(host, OWNER);
+    const anna = await attached(host, ANNA);
+
+    for (const [end, requestId] of [
+      [owner, "p-owner"],
+      [anna, "p-anna"],
+    ] as const) {
+      await end.ask({
+        type: "processService",
+        requestId,
+        runtimeId: "node",
+        serviceUuid: "book",
+        // A member claiming to be the owner says so in vain.
+        payload: { caller_role: "owner" },
+      });
+    }
+
+    await eventually(() => rowsOf(owner).length > 0, "the owner's answer");
+    await eventually(() => rowsOf(anna).length > 0, "Anna's answer");
+    expect(rowsOf(owner)[0]).toEqual([
+      { sub: OWNER.sub, email: OWNER.email, name: null, role: "owner" },
+    ]);
+    expect(rowsOf(anna)[0]).toEqual([
+      { sub: ANNA.sub, email: ANNA.email, name: "Anna", role: "member" },
     ]);
   });
 
@@ -951,6 +980,17 @@ describe("a member's bridge and the board's runtimes", () => {
     await settle();
 
     expect(b.processed).toEqual([]);
+  });
+
+  it("takes nobody but the owner as the owner, however a run says it", () => {
+    const list = [{ email: ANNA.email!, name: "Anna" }];
+    const anna = { sub: ANNA.sub, email: ANNA.email };
+
+    expect(mayActOn(OWNER.sub, list, { sub: OWNER.sub, role: "owner" })).toBe(true);
+    expect(mayActOn(OWNER.sub, list, { ...anna, role: "member" })).toBe(true);
+    // A run claiming the owner's role for a member is not the owner's.
+    expect(mayActOn(OWNER.sub, list, { ...anna, role: "owner" })).toBe(false);
+    expect(mayActOn(OWNER.sub, [], { ...anna, role: "member" })).toBe(false);
   });
 
   it("drops an expired person's notification", async () => {

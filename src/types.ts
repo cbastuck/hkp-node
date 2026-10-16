@@ -245,7 +245,17 @@ export type Caller = {
    * would be the person's own choice.
    */
   name?: string;
+  /**
+   * What they are to the board: its `owner`, in whose tenant it runs, or a
+   * `member` its list admitted. Stated by whoever admitted them — the
+   * coordinator for a bridge, the runtime server for a client acting in its
+   * own tenant — so a statement can tell who may set things up from who may
+   * only take part.
+   */
+  role?: CallerRole;
 };
+
+export type CallerRole = "owner" | "member";
 
 /** What is acting in a run. Person identity is present only in that case. */
 export type RunActor =

@@ -71,6 +71,10 @@ export function contextFromWire(value: unknown): ProcessContext | undefined {
  * Who a signed-in user is to a run they begin, or nothing where there is no
  * identity to state.
  *
+ * A client holding a token reaches only the runtimes of its own tenant, so it
+ * is their owner. A member reaches somebody else's board only through its
+ * coordinator, which says so itself.
+ *
  * A server running without authentication resolves everybody to the one
  * anonymous tenant. That is *no caller*, not a caller called anonymous —
  * otherwise everybody on a development machine would be the same person.
@@ -79,7 +83,11 @@ export function callerOf(user: AuthenticatedUser | undefined): Caller | undefine
   if (!user || user.sub === ANONYMOUS_SUB) {
     return undefined;
   }
-  return { sub: user.sub, ...(user.email ? { email: user.email } : {}) };
+  return {
+    sub: user.sub,
+    ...(user.email ? { email: user.email } : {}),
+    role: "owner",
+  };
 }
 
 /**
@@ -125,6 +133,9 @@ export function callerFromWire(value: unknown): Caller | undefined {
       ? { email: wire.email }
       : {}),
     ...(typeof wire.name === "string" && wire.name ? { name: wire.name } : {}),
+    ...(wire.role === "owner" || wire.role === "member"
+      ? { role: wire.role }
+      : {}),
   };
 }
 

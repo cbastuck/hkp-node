@@ -2,7 +2,7 @@ import { CloudBoardConfig, BoardSessionInfo } from "./types";
 import { BoardSession, CLOSE_NOT_A_MEMBER } from "./session";
 import { BoardStore, createMemoryBoardStore } from "./boardStore";
 import { LogStore } from "./logStore";
-import { LogEntry, LogLevel } from "../types";
+import { Caller, LogEntry, LogLevel } from "../types";
 import { ParticipantRegistry } from "./participants";
 import { isRemoteRuntime } from "./types";
 import {
@@ -12,6 +12,7 @@ import {
   MemberLimits,
   SharedBoardInfo,
   findMember,
+  mayActOn,
   readMembers,
 } from "./members";
 import { normalizeEmail } from "../auth";
@@ -505,12 +506,9 @@ export class BoardCoordinator {
   private mayActAs(
     userId: string,
     boardName: string,
-    caller: { sub: string; email?: string },
+    caller: Caller,
   ): boolean {
-    return (
-      caller.sub === userId ||
-      !!findMember(this.getMembers(userId, boardName), caller.email)
-    );
+    return mayActOn(userId, this.getMembers(userId, boardName), caller);
   }
 
   /** The boards whose list names an email, across every owner. */

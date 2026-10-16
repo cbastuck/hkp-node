@@ -305,7 +305,7 @@ describe("reading a context", () => {
   it("states no caller for the anonymous tenant", () => {
     expect(callerOf({ sub: "anonymous" })).toBeUndefined();
     expect(callerOf(undefined)).toBeUndefined();
-    expect(callerOf(CAROL)).toEqual({ sub: CAROL.sub });
+    expect(callerOf(CAROL)).toEqual({ sub: CAROL.sub, role: "owner" });
   });
 
   it("hands the caller down to a child run", () => {
@@ -430,6 +430,29 @@ describe("sql's caller parameters", () => {
 
     expect(run({ caller_email: "carol@claims.example" })).toEqual([
       { email: null, name: null, sub: CAROL.sub },
+    ]);
+  });
+
+  it("binds the caller's role from the run, never from the input", () => {
+    const statement = "SELECT $caller_role AS role";
+    const person = (role?: "owner" | "member") => ({
+      kind: "person" as const,
+      sub: ALICE.sub,
+      ...(role ? { role } : {}),
+      expiresAt: Date.now() + 60_000,
+    });
+
+    expect(sqlAs(person("owner"), statement)({ caller_role: "member" })).toEqual([
+      { role: "owner" },
+    ]);
+    expect(sqlAs(person("member"), statement)({ caller_role: "owner" })).toEqual([
+      { role: "member" },
+    ]);
+    expect(sqlAs(person(), statement)({ caller_role: "owner" })).toEqual([
+      { role: null },
+    ]);
+    expect(sqlAs({ kind: "board" }, statement)({ caller_role: "owner" })).toEqual([
+      { role: null },
     ]);
   });
 
