@@ -2,7 +2,6 @@
 // Copyright (c) 2026 cbastuck
 // SPDX-License-Identifier: AGPL-3.0-only
 import fs from "fs";
-import os from "os";
 import path from "path";
 import { randomBytes } from "crypto";
 import { config as loadEnv } from "dotenv";
@@ -18,6 +17,13 @@ import { createFileBoardStore } from "./coordinator/fileBoardStore";
 import { createFileLogStore } from "./coordinator/logStore";
 import { AuthConfig, isLoopbackHost } from "./auth";
 import { parseAllowedOrigins } from "./origins";
+import {
+  InstanceError,
+  acquireInstanceLock,
+  legacyState,
+  resolveInstance,
+} from "./instance";
+import { describeReset, resetInstance } from "./reset";
 
 /**
  * The key public mount addresses are derived from.
@@ -29,11 +35,10 @@ import { parseAllowedOrigins } from "./origins";
  * what makes an endpoint configured in somebody else's product stop working
  * after a restart.
  */
-function resolveMountSecret(): string {
+function resolveMountSecret(file: string): string {
   if (process.env.HKP_MOUNT_SECRET) {
     return process.env.HKP_MOUNT_SECRET;
   }
-  const file = path.join(os.homedir(), ".hkp", "node", "mount-secret");
   try {
     const existing = fs.readFileSync(file, "utf8").trim();
     if (existing) {
@@ -56,18 +61,92 @@ function resolveMountSecret(): string {
   return secret;
 }
 
-async function main() {
+/** The settings this server is started with: the environment, then `.env`. */
+function loadEnvironment(): void {
   if (!process.env.SKIP_LOADING_ENV) {
     loadEnv({ path: path.join(__dirname, "..", ".env") });
   }
+}
+
+/**
+ * `hkp-node reset [--yes] [--all]`: moves this instance's folder aside so the
+ * next start begins empty. The instance is the one the server would start as
+ * — the same environment, the same `.env` — so a reset reaches exactly what
+ * that server keeps, and nothing of another. See reset.ts.
+ */
+function reset(args: string[]): void {
+  loadEnvironment();
+  const known = new Set(["--yes", "--all"]);
+  const unknown = args.filter((arg) => !known.has(arg));
+  if (unknown.length) {
+    console.error(
+      `[hkp-node] reset does not know ${unknown.join(", ")}. ` +
+        "Usage: hkp-node reset [--yes] [--all]",
+    );
+    process.exitCode = 1;
+    return;
+  }
+  try {
+    const instance = resolveInstance(process.env.HKP_INSTANCE);
+    const outcome = resetInstance(instance, {
+      apply: args.includes("--yes"),
+      includeMountSecret: args.includes("--all"),
+    });
+    console.log(describeReset(instance, outcome));
+  } catch (error) {
+    // Every failure ends here rather than at the process's handler below,
+    // which keeps a server serving and would let a failed reset exit 0.
+    console.error(
+      error instanceof InstanceError ? `[hkp-node] ${error.message}` : error,
+    );
+    process.exitCode = 1;
+  }
+}
+
+async function main() {
+  loadEnvironment();
 
   const port = readInteger(process.env.PORT, 8080);
+
+  // Which server this is, before anything is read from or written to disk:
+  // every default location below is inside its folder. See instance.ts.
+  let instance;
+  try {
+    instance = resolveInstance(process.env.HKP_INSTANCE);
+    const release = acquireInstanceLock(instance, { port });
+    process.on("exit", release);
+    for (const signal of ["SIGINT", "SIGTERM"] as const) {
+      process.once(signal, () => {
+        release();
+        process.exit(signal === "SIGINT" ? 130 : 143);
+      });
+    }
+  } catch (error) {
+    if (error instanceof InstanceError) {
+      console.error(`[hkp-node] ${error.message}`);
+      process.exitCode = 1;
+      return;
+    }
+    throw error;
+  }
+  const instanceDir = instance.dir;
+  console.log(`hkp-node instance "${instance.name}": ${instanceDir}`);
+  const legacy = legacyState();
+  if (legacy.length) {
+    console.warn(
+      "[hkp-node] Found state from before servers were named instances, " +
+        `which is no longer read:\n  ${legacy.join("\n  ")}\n` +
+        `Move what this server should keep into ${instanceDir} — its mount ` +
+        "secret too, or its public endpoint addresses change — or delete it.",
+    );
+  }
   const host = process.env.HOST ?? "0.0.0.0";
   const externalHost = process.env.EXTERNAL_HOST ?? "127.0.0.1";
   const externalSecure = process.env.EXTERNAL_SECURE === "true";
   const allowedOrigins = parseAllowedOrigins(process.env.ALLOWED_ORIGINS);
   const coordinatorEnabled = process.env.COORDINATOR_ENABLED === "true";
   const authConfig = resolveServerAuthConfig(host);
+  const storeDir = process.env.HKP_STORE_DIR ?? path.join(instanceDir, "store");
 
   const server = createRuntimeServer({
     auth: authConfig,
@@ -75,34 +154,31 @@ async function main() {
     externalHost,
     externalSecure,
     host,
-    name: process.env.NAME ?? "hkp-node",
+    // What clients are told this server is called: the instance's name,
+    // unless it is meant to be shown as something else.
+    name: process.env.NAME ?? instance.name,
     // Keeps public endpoint addresses the same across restarts; see
     // MountRegistry. Without a stable key every restart hands every webhook
     // configured elsewhere a dead URL.
-    mountSecret: resolveMountSecret(),
+    mountSecret: resolveMountSecret(path.join(instanceDir, "mount-secret")),
     // What boards remember between runs. On by default, because a `store` that
     // silently forgot everything on restart would be worse than one that is not
     // there: HKP_STORE_DIR="" keeps records in memory instead.
-    recordStore:
-      process.env.HKP_STORE_DIR ??
-      path.join(os.homedir(), ".hkp", "node", "store"),
+    recordStore: storeDir,
     // Where a board's SQL tables live. Persisted for the same reason records
     // are: HKP_DB_DIR="" keeps them in memory instead.
-    database:
-      process.env.HKP_DB_DIR ?? path.join(os.homedir(), ".hkp", "node", "db"),
+    database: process.env.HKP_DB_DIR ?? path.join(instanceDir, "db"),
     // Where the bytes a board keeps are written. Persisted for the same reason,
     // and a real directory rather than a derived one all the way down: what is
     // here is meant to be findable, copyable and servable by its owner.
     // HKP_FILES_DIR="" keeps them in memory instead.
-    files:
-      process.env.HKP_FILES_DIR ??
-      path.join(os.homedir(), ".hkp", "node", "files"),
+    files: process.env.HKP_FILES_DIR ?? path.join(instanceDir, "files"),
     // The tickets this server reconnects to coordinators with, beside the
     // mount secret. HKP_COORDINATOR_LINKS_FILE="" keeps them in memory, so a
     // restart leaves every deployed board waiting to be deployed again.
     coordinatorLinks:
       process.env.HKP_COORDINATOR_LINKS_FILE ??
-      path.join(os.homedir(), ".hkp", "node", "coordinator-links.json"),
+      path.join(instanceDir, "coordinator-links.json"),
     quotas: {
       maxRuntimesPerUser: readInteger(process.env.HKP_MAX_RUNTIMES_PER_USER, 0),
       maxServicesPerRuntime: readInteger(
@@ -129,7 +205,7 @@ async function main() {
     // nowhere: HKP_COORDINATOR_DATA_DIR="" keeps the boards in memory.
     const dataDir =
       process.env.HKP_COORDINATOR_DATA_DIR ??
-      path.join(os.homedir(), ".hkp", "coordinator", "boards");
+      path.join(instanceDir, "coordinator", "boards");
     // Beside the boards, and governed by the same switch: a coordinator told to
     // keep nothing on disk keeps no log either, and one that persists boards
     // records what they did. Entries carry board data, so createFileLogStore
@@ -204,8 +280,6 @@ async function main() {
   // Once this server is listening: a coordinator it reconnects to may build a
   // runtime at once, and that runtime's mounts need an address to publish.
   server.coordinatorLinks.restore();
-  const storeDir =
-    process.env.HKP_STORE_DIR ?? path.join(os.homedir(), ".hkp", "node", "store");
   console.log(
     storeDir
       ? `hkp-node board store: ${storeDir}`
@@ -229,10 +303,14 @@ process.on("unhandledRejection", (reason) => {
   console.error("[hkp-node] Unhandled rejection — continuing:", reason);
 });
 
-void main().catch((error) => {
-  console.error(error);
-  process.exitCode = 1;
-});
+if (process.argv[2] === "reset") {
+  reset(process.argv.slice(3));
+} else {
+  void main().catch((error) => {
+    console.error(error);
+    process.exitCode = 1;
+  });
+}
 
 function readInteger(value: string | undefined, fallback: number): number {
   if (!value) {

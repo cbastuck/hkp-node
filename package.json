@@ -13,12 +13,14 @@
     "build": "tsc -p tsconfig.json",
     "dev": "tsx src/index.ts",
     "start": "npm run dev",
-    "localOnly": "SKIP_LOADING_ENV=true HOST=127.0.0.1 ALLOWED_ORIGINS=http://localhost:8555 COORDINATOR_ENABLED=true npm run dev",
+    "localOnly": "SKIP_LOADING_ENV=true HKP_INSTANCE=local HOST=127.0.0.1 ALLOWED_ORIGINS=http://localhost:8555 COORDINATOR_ENABLED=true npm run dev",
     "withCoordinator": "COORDINATOR_ENABLED=true npm run dev",
     "test": "vitest run",
     "prepublishOnly": "npm run build",
     "publish:npm": "npm publish --access public",
-    "withPublicCoordinator": "tsx --env-file=.env.public-coordinator src/index.ts"
+    "withPublicCoordinator": "tsx --env-file=.env.public-coordinator src/index.ts",
+    "reset": "tsx src/index.ts reset",
+    "resetPublicCoordinator": "tsx --env-file=.env.public-coordinator src/index.ts reset"
   },
   "author": "cbastuck <mail@cbastuck.de>",
   "license": "AGPL-3.0-only",

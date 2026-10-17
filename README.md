@@ -14,24 +14,54 @@ Node.js runtime server for the [Readymade](https://hookitapp.com) platform. Impl
 No installation required:
 
 ```sh
-npx hkp-node
+HKP_INSTANCE=dev npx hkp-node
 ```
 
 Or install globally:
 
 ```sh
 npm install -g hkp-node
-hkp-node
+HKP_INSTANCE=dev hkp-node
 ```
 
-Or run from source:
+Or run from source, with the name in `.env` (see [`.env.example`](.env.example)):
 
 ```sh
 npm install
+cp .env.example .env
 npm run dev
 ```
 
 The server starts on port `8080` by default and prints the address on startup.
+
+Every server is a named **instance**: `HKP_INSTANCE` is required, and
+everything the server keeps between runs — boards' data, coordinator tickets,
+deployed boards, its mount secret — lives in `~/.hkp/node-<instance>/`. Two
+servers on one machine therefore keep apart by having different names, and two
+cannot run as the same instance at once: the second is refused while the first
+holds the folder.
+
+### Starting fresh
+
+What a server restores on starting — a deployed board, a ticket to a
+coordinator, a table with an old schema — can be the cause of a problem and
+the last place anybody looks. `reset` moves the instance's folder aside, so the
+next start begins empty:
+
+```sh
+HKP_INSTANCE=dev npx hkp-node reset          # says what it would move
+HKP_INSTANCE=dev npx hkp-node reset --yes    # moves it
+```
+
+From a checkout, `npm run reset` (and `npm run reset -- --yes`) resets the
+instance `.env` names, and `npm run resetPublicCoordinator` the one in
+`.env.public-coordinator` — the same instance the matching start script runs.
+
+The folder is moved to `~/.hkp/node-<instance>.reset-<date>T<hh-mm>/`, never
+deleted: nothing depends on it, and deleting it is yours to do once the stale
+state is of no more interest. The mount secret is copied back, so public
+endpoint addresses stay the same; `--all` leaves it behind too. A running
+server is never reset from under — stop it first.
 
 ---
 
@@ -41,6 +71,7 @@ All options are passed as environment variables.
 
 | Variable                     | Default     | Description                                                                                                                                                                             |
 | ---------------------------- | ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `HKP_INSTANCE`               | —           | Which server this is. **Required** to start. Its state is kept in `~/.hkp/node-<instance>/`, and a second server is refused while one runs as the same instance. Letters, digits, `.`, `-` and `_`, not starting with a dot. |
 | `PORT`                       | `8080`      | HTTP and WebSocket listen port                                                                                                                                                          |
 | `HOST`                       | `0.0.0.0`   | Bind address                                                                                                                                                                            |
 | `EXTERNAL_HOST`              | `127.0.0.1` | Hostname written into runtime `outputUrl` (use your machine's LAN/public IP when connecting from other devices)                                                                         |
@@ -49,20 +80,20 @@ All options are passed as environment variables.
 | `AUTH0_AUDIENCE`             | —           | Accepted `aud` values, comma-separated — the Auth0 client id of each application whose users this runtime serves (the frontend sends its id_token). **Required** to start.               |
 | `ALLOWED_EMAILS`             | —           | Comma-separated email allowlist of who may **own** things here — runtimes, deployed boards. When set, only tokens with a **verified** `email` claim on the list pass; requires Auth0 config (refuses to start without it). A coordinator additionally admits the people a deployed board is shared with, to that board only, whether or not they are on this list. |
 | `ALLOW_NO_AUTH`              | —           | Set to `true` to run **without authentication**. Only honoured for a local source checkout; the published npm package ignores it. Local development only.                               |
-| `NAME`                       | `hkp-node`  | Server name reported to clients                                                                                                                                                         |
+| `NAME`                       | `HKP_INSTANCE` | Server name reported to clients                                                                                                                                                      |
 | `HKP_MAX_RUNTIMES_PER_USER`  | —           | Maximum runtimes one tenant may hold. Unset or `0` means unlimited. Reconnecting to a runtime that already exists is never refused.                                                      |
 | `HKP_MAX_SERVICES_PER_RUNTIME` | —         | Maximum services per runtime. Unset or `0` means unlimited.                                                                                                                             |
 | `HKP_MIN_TIMER_INTERVAL_MS`  | —           | Lower bound on the Timer service's periodic interval; shorter periods are clamped to it. Unset or `0` means no floor.                                                                    |
 | `HKP_MAX_INLINE_ASSET_BYTES` | `8388608`   | Largest content one asset may carry inline as `text` or `base64` (8 MB); larger content is named by URL.                                                                                 |
 | `HKP_MAX_ASSET_REQUEST_BODY_BYTES` | `33554432` | Largest body of a request that carries asset descriptors — creating a runtime, pushing assets, deploying a board (32 MB) — accepted only from an authenticated caller. It bounds how much inline content one runtime, or one deployed board, may be handed at once, counted as it travels (base64, JSON-escaped). Left unset it is never less than one asset at the inline limit needs. |
 | `HKP_MAX_REQUEST_BODY_BYTES` | `26214400`  | Largest request body accepted on a service endpoint (25 MB). Oversized requests get `413`. Set `0` to disable — unwise, since these endpoints take no token.                             |
-| `HKP_COORDINATOR_LINKS_FILE` | `~/.hkp/node/coordinator-links.json` | Where this server keeps the tickets it connects to coordinators with, so a deployed board's runtimes are re-established after a restart. Set to the empty string to keep them in memory only. Written `0600`: a ticket is a bearer credential for one runtime of one board. |
+| `HKP_COORDINATOR_LINKS_FILE` | `~/.hkp/node-<instance>/coordinator-links.json` | Where this server keeps the tickets it connects to coordinators with, so a deployed board's runtimes are re-established after a restart. Set to the empty string to keep them in memory only. Written `0600`: a ticket is a bearer credential for one runtime of one board. |
 | `HKP_COORDINATOR_MAX_FRAME_BYTES` | —      | Coordinator only. The largest single frame a runtime server or an attached browser may send that is passed on — in practice, the largest value one runtime may hand the next. Unset means no limit. A larger frame is dropped and recorded in the board's log as `frame-dropped`; the connection stays up. |
 | `HKP_COORDINATOR_MAX_MEMBERS` | `200`     | Coordinator only. How many people one deployed board may be shared with. |
 | `HKP_COORDINATOR_MAX_MEMBER_BRIDGES` | `4` | Coordinator only. How many browsers one member may have attached to one board at once. |
 | `HKP_COORDINATOR_MAX_MEMBER_PROCESS_PER_MINUTE` | `120` | Coordinator only. How many times a minute one member may ask a shared board to do something. |
 | `HKP_COORDINATOR_MAX_PERSON_RUN_AGE_MS` | `900000` | Coordinator only. Maximum age of a person-actor run (15 minutes). The coordinator rechecks membership and this deadline whenever work crosses a runtime or sends a notification. |
-| `HKP_COORDINATOR_DATA_DIR`   | `~/.hkp/coordinator/boards` | Where the coordinator keeps the boards it has been given, one JSON file each, so they survive a restart. Set to the empty string to keep them in memory only. Files hold the board's config — which can carry service credentials — and are written `0600` under `0700` directories. One directory belongs to one coordinator: two processes sharing it will both restore every board and fight over the same runtimes. |
+| `HKP_COORDINATOR_DATA_DIR`   | `~/.hkp/node-<instance>/coordinator/boards` | Where the coordinator keeps the boards it has been given, one JSON file each, so they survive a restart. Set to the empty string to keep them in memory only. Files hold the board's config — which can carry service credentials — and are written `0600` under `0700` directories. One directory belongs to one coordinator: two processes sharing it will both restore every board and fight over the same runtimes. |
 
 ### Who may call from a browser
 
@@ -240,16 +271,16 @@ Example:
 # Production (public bind → Auth0 required)
 # AUTH0_AUDIENCE lists every client id whose users this runtime serves: the website's
 # SPA application and the native apps' one are necessarily separate Auth0 applications.
-AUTH0_DOMAIN=hookitapp.eu.auth0.com AUTH0_AUDIENCE=x4iF0MBYfd25oLdJbATNe03dCDUtBs74,gpk8IFPKfaOTQUzpDRO7vBajOnB72rkM ALLOWED_ORIGINS=https://node.readymadeit.com npx hkp-node
+AUTH0_DOMAIN=hookitapp.eu.auth0.com AUTH0_AUDIENCE=x4iF0MBYfd25oLdJbATNe03dCDUtBs74,gpk8IFPKfaOTQUzpDRO7vBajOnB72rkM ALLOWED_ORIGINS=https://node.readymadeit.com HKP_INSTANCE=public npx hkp-node
 
 # Same, but restricted to specific users (verified email claim must be on the list)
 AUTH0_DOMAIN=your.eu.auth0.com AUTH0_AUDIENCE=your-api ALLOWED_ORIGINS=https://app.example \
-  ALLOWED_EMAILS=alice@example.com,bob@example.com npx hkp-node
+  ALLOWED_EMAILS=alice@example.com,bob@example.com HKP_INSTANCE=team npx hkp-node
 
 # Local only (loopback bind → no auth needed)
-HOST=127.0.0.1 npx hkp-node
+HOST=127.0.0.1 HKP_INSTANCE=local npx hkp-node
 
-# No auth on a non-loopback bind (from a checkout only)
+# No auth on a non-loopback bind (from a checkout only; the name from .env)
 ALLOW_NO_AUTH=true npm run dev
 ```
 
@@ -274,6 +305,7 @@ container binds `0.0.0.0` — a non-loopback bind — so Auth0 config is **requi
 
 ```sh
 docker run -p 8080:8080 \
+  -e HKP_INSTANCE=team \
   -e AUTH0_DOMAIN=your.eu.auth0.com \
   -e AUTH0_AUDIENCE=your-api \
   -e ALLOWED_ORIGINS=https://app.example \
@@ -285,6 +317,7 @@ Or keep the settings in a file and use `--env-file`:
 
 ```sh
 # hkp-node.env
+HKP_INSTANCE=team
 AUTH0_DOMAIN=your.eu.auth0.com
 AUTH0_AUDIENCE=your-api
 ALLOWED_ORIGINS=https://app.example
