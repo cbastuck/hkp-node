@@ -113,7 +113,7 @@ describe("the meeting poll, shared", () => {
     expect(annas["the-meetings"]).toBeUndefined();
 
     const owners = await act(OWNER, { intent: "create", poll: "Offsite" });
-    expect(owners["the-meetings"].rows).toEqual([{ name: "Offsite", label: "• Offsite" }]);
+    expect(owners["the-meetings"].rows).toEqual([{ name: "Offsite", label: "Offsite", current: 1 }]);
   });
 
   it("shows everybody the meeting called last, until they ask for another", async () => {
