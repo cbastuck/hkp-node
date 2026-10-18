@@ -36,9 +36,9 @@
  * interpolated — a subject line containing a quote is a subject line, not a
  * syntax error, and not an injection.
  *
- * **Who is calling is bound by the service, never by the input.** Four
- * names are reserved — `$caller_email`, `$caller_name`, `$caller_sub` and
- * `$actor_kind` — and
+ * **Who is calling is bound by the service, never by the input.** Five
+ * names are reserved — `$caller_email`, `$caller_name`, `$caller_sub`,
+ * `$caller_role` and `$actor_kind` — and
  * are given the caller of the run in progress: whoever the server that began
  * it verified. Each is `NULL` when the run has no caller or the caller has no
  * such value, and an input field of the same name is ignored. Reserved here
@@ -105,6 +105,7 @@ const CALLER_PARAMETERS: Record<string, keyof Caller> = {
   caller_email: "email",
   caller_name: "name",
   caller_sub: "sub",
+  caller_role: "role",
 };
 
 type Notify = (payload: unknown, instanceId?: string) => void;

@@ -116,9 +116,9 @@ export function createBridgeHandler(
       ...(listed ? { name: listed.name } : {}),
     };
     if (user.sub === userId && mayOwn) {
-      return { role: "owner", caller };
+      return { role: "owner", caller: { ...caller, role: "owner" } };
     }
-    return listed ? { role: "member", caller } : null;
+    return listed ? { role: "member", caller: { ...caller, role: "member" } } : null;
   }
 
   return (ws, user, mayOwn, transport) => {
