@@ -99,6 +99,17 @@ describe("the meeting poll, shared", () => {
     expect([...readFacadeAccess(board.facade).processTargets]).toEqual(["who-is-here"]);
   });
 
+  it("shows a member the Vote tab and not Organise, nor what only Organise reads", () => {
+    const { facade, sources } = readFacadeAccess(board.facade);
+    const shown = facade as { tabs: Array<{ id: string }>; panels: Array<{ id: string }> };
+    expect(shown.tabs.map((tab) => tab.id)).toEqual(["answer"]);
+    // Not left above the tabs either, as a panel no tab names would be.
+    expect(shown.panels.map((panel) => panel.id)).toEqual(["vote"]);
+    // Only the notices still name these, and a notice reads nothing but errors.
+    expect([...(sources.get("organising") ?? [])]).toEqual(["error"]);
+    expect([...(sources.get("withdrawable") ?? [])]).toEqual(["error"]);
+  });
+
   it("lets only the owner call a meeting, and says why to anybody else", async () => {
     const { act } = office();
 

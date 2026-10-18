@@ -21,6 +21,12 @@ import { CloudBoardConfig, isRemoteRuntime } from "./types";
 
 export type FacadeAccess = {
   /**
+   * The facade as a member is shown it: the board's, without what it keeps for
+   * its owner. Everything below is read from this, so an item kept for the
+   * owner grants a member nothing, and is not sent to them either.
+   */
+  facade: unknown;
+  /**
    * Services a `process` action names. Naming one makes it callable by a
    * member with *any* payload — the entry point is the capability, not what
    * the widget would have sent — so whatever matters is checked behind it.
@@ -95,13 +101,100 @@ function walk(value: unknown, access: FacadeAccess, under = ""): void {
 }
 
 export function readFacadeAccess(facade: unknown): FacadeAccess {
+  const shown = facadeForMembers(facade);
   const access: FacadeAccess = {
+    facade: shown,
     processTargets: new Set(),
     sources: new Map(),
     named: new Set(),
   };
-  walk(facade, access);
+  walk(shown, access);
   return access;
+}
+
+/** Whether an entry is one a facade keeps for the board's owner. */
+function isOwners(value: unknown): boolean {
+  return isRecord(value) && value.visibleTo === "owner";
+}
+
+/** A value with every entry kept for the owner left out, at any depth. */
+function withoutOwners(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.filter((entry) => !isOwners(entry)).map(withoutOwners);
+  }
+  if (!isRecord(value)) {
+    return value;
+  }
+  const out: Record<string, unknown> = {};
+  for (const [name, entry] of Object.entries(value)) {
+    if (!isOwners(entry)) {
+      out[name] = withoutOwners(entry);
+    }
+  }
+  return out;
+}
+
+/**
+ * The facade without the panels only an owner's tab names. A panel no tab
+ * names is on screen whatever tab is chosen, so leaving out the tab alone
+ * would put its panels in front of a member rather than keep them from one.
+ */
+function withoutOwnersPanels(facade: unknown): unknown {
+  if (!isRecord(facade) || !Array.isArray(facade.tabs) || !Array.isArray(facade.panels)) {
+    return facade;
+  }
+  const named = (owners: boolean) =>
+    new Set(
+      (facade.tabs as unknown[])
+        .filter((tab) => isRecord(tab) && isOwners(tab) === owners)
+        .flatMap((tab) => (isRecord(tab) && Array.isArray(tab.panels) ? tab.panels : [])),
+    );
+  const everybodys = named(false);
+  const owners = named(true);
+  return {
+    ...facade,
+    panels: facade.panels.filter(
+      (panel) =>
+        !isRecord(panel) || !owners.has(panel.id) || everybodys.has(panel.id),
+    ),
+  };
+}
+
+/**
+ * The facade without what `visibleTo: "owner"` keeps for the board's owner —
+ * a widget, a container, a panel, a tab, a notice.
+ *
+ * Left out of what a member is sent rather than hidden by the page they are
+ * shown it on: a control a member cannot see but is sent still names its
+ * service and what it would send there, and a value only the owner reads
+ * would still be projected to them. A tab left with none of its panels goes
+ * with them, a panel only an owner's tab names goes with that tab, and so does
+ * a default naming a tab that went.
+ */
+export function facadeForMembers(facade: unknown): unknown {
+  const shown = withoutOwners(withoutOwnersPanels(facade));
+  if (!isRecord(shown) || !Array.isArray(shown.tabs)) {
+    return shown;
+  }
+  const panels = new Set(
+    (Array.isArray(shown.panels) ? shown.panels : [])
+      .map((panel) => (isRecord(panel) ? panel.id : undefined))
+      .filter((id): id is string => typeof id === "string"),
+  );
+  const tabs = shown.tabs.flatMap((tab) => {
+    if (!isRecord(tab) || !Array.isArray(tab.panels)) {
+      return [tab];
+    }
+    const kept = tab.panels.filter((id) => panels.has(id as string));
+    // A tab that never named a panel is the board's to have; one that lost
+    // all of them to the owner is the owner's.
+    return kept.length === 0 && tab.panels.length > 0 ? [] : [{ ...tab, panels: kept }];
+  });
+  const result: Record<string, unknown> = { ...shown, tabs };
+  if (!tabs.some((tab) => isRecord(tab) && tab.id === shown.defaultTab)) {
+    delete result.defaultTab;
+  }
+  return result;
 }
 
 /** The first segment of an address: the service a board lists. */
@@ -262,6 +355,6 @@ export function projectConfig(
       .filter((runtime) => runtime.id in services)
       .map(({ id, name, type }) => ({ id, name, type })),
     services,
-    facade: config.facade,
+    facade: access.facade,
   };
 }

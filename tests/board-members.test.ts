@@ -656,6 +656,70 @@ describe("what a member is sent", () => {
     expect(wire).not.toContain("127.0.0.1");
   });
 
+  it("is not what the facade keeps for its owner", async () => {
+    // An owner's panel that acts on one service and reads another, and a
+    // notice of theirs reading a third path.
+    const facade = BOARD.facade as { panels: unknown[]; notices: unknown[] };
+    const board: CloudBoardConfig = {
+      ...BOARD,
+      facade: {
+        ...facade,
+        panels: [
+          ...facade.panels,
+          {
+            id: "desk",
+            visibleTo: "owner",
+            layout: {
+              direction: "column",
+              items: [
+                {
+                  type: "button",
+                  label: "Run",
+                  actions: [{ type: "process", serviceUuid: "admin", payload: {} }],
+                },
+                { type: "text", source: { serviceUuid: "tail", path: "apiKey" } },
+              ],
+            },
+          },
+        ],
+        notices: [
+          ...facade.notices,
+          { source: { serviceUuid: "book", path: "count" }, visibleTo: "owner" },
+        ],
+      },
+    };
+    const { host } = await hostWith({ board });
+    await host.coordinator.setMember(OWNER.sub, BOARD.boardName, {
+      email: ANNA.email!,
+      name: "Anna",
+    });
+
+    const owner = await attached(host, OWNER);
+    const anna = await attached(host, ANNA);
+
+    // The owner is sent the board as written; a member, the facade without it.
+    expect((owner.last("snapshot")!.config as CloudBoardConfig).facade).toEqual(
+      board.facade,
+    );
+    const shown = (anna.last("snapshot")!.config as CloudBoardConfig).facade;
+    expect(shown).toEqual(BOARD.facade);
+    const wire = JSON.stringify(anna.received);
+    expect(wire).not.toContain("desk");
+    expect(wire).not.toContain("tail");
+    expect(wire).not.toContain("count");
+
+    // And it grants nothing: the service only the owner's panel acts on is
+    // not a member's to call.
+    const answer = await anna.ask({
+      type: "processService",
+      requestId: "p-admin",
+      runtimeId: "node",
+      serviceUuid: "admin",
+      payload: {},
+    });
+    expect(answer.error).toBe("This board does not offer that");
+  });
+
   it("is never the board's log", async () => {
     const board = {
       ...BOARD,
