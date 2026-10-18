@@ -134,10 +134,20 @@ export function isEmailAllowed(
   if (!allowedEmails) {
     return true;
   }
-  if (typeof claims.email !== "string" || claims.email_verified !== true) {
+  const email = ownClaim(claims, "email");
+  if (typeof email !== "string" || ownClaim(claims, "email_verified") !== true) {
     return false;
   }
-  return allowedEmails.includes(normalizeEmail(claims.email));
+  return allowedEmails.includes(normalizeEmail(email));
+}
+
+/**
+ * A claim the token itself carries. What the claims object inherits is not
+ * something the token says, so a value written onto `Object.prototype` by
+ * anything in the process cannot become somebody's identity.
+ */
+function ownClaim(claims: { [claim: string]: unknown }, name: string): unknown {
+  return Object.hasOwn(claims, name) ? claims[name] : undefined;
 }
 
 /**
@@ -159,17 +169,17 @@ export function mayOwn(
 export function identityFromClaims(claims: {
   [claim: string]: unknown;
 }): AuthenticatedUser | null {
-  const sub = typeof claims.sub === "string" ? claims.sub : null;
-  if (!sub) {
+  const sub = ownClaim(claims, "sub");
+  if (typeof sub !== "string" || !sub) {
     return null;
   }
   // Dropped, not refused: a person whose address is unverified can still sign
   // in wherever no list is asked, and is simply nobody's listed member.
-  const email =
-    typeof claims.email === "string" && claims.email_verified === true
-      ? normalizeEmail(claims.email)
-      : "";
-  return { sub, ...(email ? { email } : {}) };
+  const email = ownClaim(claims, "email");
+  const verified = ownClaim(claims, "email_verified") === true;
+  const address =
+    typeof email === "string" && verified ? normalizeEmail(email) : "";
+  return { sub, ...(address ? { email: address } : {}) };
 }
 
 function createJwtVerifier(

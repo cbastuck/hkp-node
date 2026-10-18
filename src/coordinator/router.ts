@@ -8,6 +8,7 @@ import {
 import { AuthConfig, Authenticator } from "../auth";
 import { MemberLimitError, readMember } from "./members";
 import { AssetDescriptor, readAssetsPayload } from "../assets";
+import { refusedFacadePaths } from "./facadeAccess";
 import { CloudBoardConfig, CloudRuntimeDescriptor, CloudServiceDescriptor } from "./types";
 
 export type CoordinatorRouterOptions = {
@@ -189,6 +190,13 @@ export function createCoordinatorRouter(
       const config = parseCloudBoardConfig(req.body);
       if (!config) {
         res.sendStatus(400);
+        return;
+      }
+      const refused = refusedFacadePaths(config.facade);
+      if (refused.length > 0) {
+        res.status(400).json({
+          error: `A facade source may not read ${refused.join(", ")}`,
+        });
         return;
       }
 
