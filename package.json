@@ -43,6 +43,7 @@
     "mailparser": "^3.9.8",
     "nodemailer": "^10.0.16",
     "peer": "^1.0.2",
+    "undici": "^6.29.1",
     "ws": "^8.18.3"
   },
   "devDependencies": {
