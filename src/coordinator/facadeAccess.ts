@@ -39,6 +39,12 @@ export type FacadeAccess = {
   sources: Map<string, Set<string>>;
   /** Every service the facade names, for whatever reason. */
   named: Set<string>;
+  /**
+   * Source paths that name an object's machinery rather than its data
+   * (`isPlainPath`). They grant nothing; a board whose facade has one is not
+   * taken in the first place (`refusedFacadePaths`).
+   */
+  refused: Set<string>;
 };
 
 /**
@@ -53,6 +59,18 @@ function isReference(name: string): boolean {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+/**
+ * Segments that lead from a value into what every object inherits. A path
+ * through one reaches `Object.prototype`, so writing along it changes every
+ * object in the process, for every tenant.
+ */
+const MACHINERY = new Set(["__proto__", "constructor", "prototype"]);
+
+/** Whether a dotted path names only data: no segment is `MACHINERY`. */
+export function isPlainPath(path: string): boolean {
+  return path.split(".").every((key) => !MACHINERY.has(key));
 }
 
 /** An address a template has yet to fill in names nothing a member may call. */
@@ -80,9 +98,16 @@ function walk(value: unknown, access: FacadeAccess, under = ""): void {
     if (value.type === "process") {
       access.processTargets.add(uuid);
     } else if (SOURCES.has(under)) {
-      const paths = access.sources.get(uuid) ?? new Set<string>();
-      paths.add(typeof value.path === "string" ? value.path : "");
-      access.sources.set(uuid, paths);
+      const path = typeof value.path === "string" ? value.path : "";
+      // Refused rather than kept: it would read nothing a member may see, and
+      // projecting it would write through to every object in the process.
+      if (isPlainPath(path)) {
+        const paths = access.sources.get(uuid) ?? new Set<string>();
+        paths.add(path);
+        access.sources.set(uuid, paths);
+      } else {
+        access.refused.add(path);
+      }
     }
   }
 
@@ -100,16 +125,33 @@ function walk(value: unknown, access: FacadeAccess, under = ""): void {
   }
 }
 
-export function readFacadeAccess(facade: unknown): FacadeAccess {
-  const shown = facadeForMembers(facade);
-  const access: FacadeAccess = {
-    facade: shown,
+function emptyAccess(facade: unknown): FacadeAccess {
+  return {
+    facade,
     processTargets: new Set(),
     sources: new Map(),
     named: new Set(),
+    refused: new Set(),
   };
+}
+
+export function readFacadeAccess(facade: unknown): FacadeAccess {
+  const shown = facadeForMembers(facade);
+  const access = emptyAccess(shown);
   walk(shown, access);
   return access;
+}
+
+/**
+ * The source paths a facade may not have, anywhere in it — kept for the owner
+ * or not, since what the owner keeps today a member may be shown tomorrow.
+ * Asked where a board is taken in, so that one carrying them is refused there
+ * rather than run with those sources silently reading nothing.
+ */
+export function refusedFacadePaths(facade: unknown): string[] {
+  const access = emptyAccess(facade);
+  walk(facade, access);
+  return [...access.refused];
 }
 
 /** Whether an entry is one a facade keeps for the board's owner. */
@@ -203,10 +245,17 @@ function rootOf(address: string): string {
   return dot < 0 ? address : address.slice(0, dot);
 }
 
+/**
+ * The value at a dotted path, through own properties only: what a value
+ * inherits is not part of it, and is not a member's to be sent.
+ */
 function readPath(value: unknown, path: string): unknown {
   let current = value;
   for (const key of path.split(".")) {
     if (!isRecord(current) && !Array.isArray(current)) {
+      return undefined;
+    }
+    if (MACHINERY.has(key) || !Object.hasOwn(current, key)) {
       return undefined;
     }
     current = (current as Record<string, unknown>)[key];
@@ -214,17 +263,26 @@ function readPath(value: unknown, path: string): unknown {
   return current;
 }
 
+/**
+ * Sets a dotted path in an object `pick` built, creating what leads to it.
+ * Every object it creates has no prototype, and a path through `MACHINERY` is
+ * written nowhere — the checks here stand even where a path was let through
+ * on its way in.
+ */
 function writePath(
   target: Record<string, unknown>,
   path: string,
   value: unknown,
 ): void {
+  if (!isPlainPath(path)) {
+    return;
+  }
   const keys = path.split(".");
   let current = target;
   for (const key of keys.slice(0, -1)) {
-    const next = current[key];
+    const next = Object.hasOwn(current, key) ? current[key] : undefined;
     if (!isRecord(next)) {
-      current[key] = {};
+      current[key] = Object.create(null);
     }
     current = current[key] as Record<string, unknown>;
   }
@@ -275,7 +333,7 @@ export function projectNotification(
 /** The values at `paths` in `value`, at the same paths in an object of their
  *  own. A pathless entry names no part of it and picks nothing. */
 function pick(value: unknown, paths: Iterable<string>): Record<string, unknown> {
-  const picked: Record<string, unknown> = {};
+  const picked: Record<string, unknown> = Object.create(null);
   for (const path of paths) {
     if (!path) {
       continue;

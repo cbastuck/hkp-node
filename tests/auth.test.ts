@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { createRuntimeServer } from "../src/server";
 import {
   createAuthenticator,
+  identityFromClaims,
   isEmailAllowed,
   isLoopbackHost,
   type AuthConfig,
@@ -169,6 +170,16 @@ describe("hkp-node authentication", () => {
 
 describe("hkp-node email allowlist", () => {
   const allowed = ["alice@example.com", "bob@example.com"];
+
+  it("reads only the claims a token carries, never what they inherit", () => {
+    // Were anything in the process to write onto Object.prototype, a token
+    // carrying no email would otherwise be taken for that address.
+    const claims = Object.create({ email: "alice@example.com", email_verified: true });
+    claims.sub = "auth0|nobody";
+    expect(isEmailAllowed(claims, allowed)).toBe(false);
+    expect(identityFromClaims(claims)).toEqual({ sub: "auth0|nobody" });
+    expect(identityFromClaims(Object.create({ sub: "auth0|inherited" }))).toBeNull();
+  });
 
   it("passes everyone when no allowlist is configured", () => {
     expect(isEmailAllowed({}, undefined)).toBe(true);

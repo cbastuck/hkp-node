@@ -65,6 +65,27 @@ describe("a template a board wrote", () => {
     expect(svc.process({ n: 21 }, () => {})).toEqual({ doubled: 42 });
   });
 });
+describe("a template key into what every object inherits", () => {
+  it("sets nothing there, wherever the key is used", () => {
+    const svc = new MapService({
+      uuid: "m",
+      serviceId: "map",
+      state: {
+        mode: "replace",
+        template: {
+          kept: 1,
+          "__proto__.polluted": "static",
+          "constructor.prototype.polluted": "static",
+          "out.__proto__.polluted=": "'term'",
+        },
+      },
+    } as never);
+
+    expect(svc.process({}, () => {})).toEqual({ kept: 1 });
+    expect(Object.prototype).not.toHaveProperty("polluted");
+  });
+});
+
 
 /**
  * An address a board mentions rather than dials.

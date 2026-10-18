@@ -2,7 +2,7 @@ import request from "supertest";
 import { WebSocket } from "ws";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { AuthenticatedUser } from "../src/auth";
+import { AuthenticatedUser, identityFromClaims } from "../src/auth";
 import {
   BoardStore,
   createMemoryBoardStore,
@@ -17,6 +17,7 @@ import {
   projectNotification,
   projectState,
   readFacadeAccess,
+  refusedFacadePaths,
 } from "../src/coordinator/facadeAccess";
 import { mayActOn, readMember } from "../src/coordinator/members";
 import { BoardSession, CLOSE_NOT_A_MEMBER } from "../src/coordinator/session";
@@ -1359,5 +1360,93 @@ describe("reading a facade for what it grants", () => {
     expect(projected.services).toEqual({
       node: [{ uuid: "list", serviceId: "sql", serviceName: "sql", state: {} }],
     });
+  });
+});
+
+/**
+ * A source path is something an owner writes, and projecting it writes along
+ * it. A path through `__proto__` therefore wrote into `Object.prototype` —
+ * every object in the coordinator, every tenant's — and from there into who a
+ * token without an email claim was taken to be.
+ */
+describe("a facade path into what every object inherits", () => {
+  const facade = (...paths: string[]) => ({
+    layout: "single",
+    panels: [
+      {
+        id: "p",
+        layout: {
+          direction: "column",
+          items: paths.map((path) => ({
+            type: "text",
+            source: { serviceUuid: "svc", path },
+          })),
+        },
+      },
+    ],
+  });
+  const MACHINERY = [
+    "__proto__.email",
+    "__proto__.email_verified",
+    "constructor.prototype.email",
+    "rows.__proto__.email",
+    "prototype",
+  ];
+
+  afterEach(() => {
+    // Should a test fail, it leaves nothing behind for the next one.
+    for (const key of ["email", "email_verified"]) {
+      delete (Object.prototype as Record<string, unknown>)[key];
+    }
+  });
+
+  it("grants none of them and keeps the paths beside them", () => {
+    const access = readFacadeAccess(facade("rows", ...MACHINERY));
+    expect([...(access.sources.get("svc") ?? [])]).toEqual(["rows"]);
+    expect([...access.refused].sort()).toEqual([...MACHINERY].sort());
+  });
+
+  it("leaves Object.prototype as it was, and nobody's identity changes", () => {
+    const access = readFacadeAccess(facade(...MACHINERY));
+    // What the review sent: a notification parsed from JSON, so `__proto__`
+    // is an own key of it rather than its prototype.
+    const said = JSON.parse(
+      '{"__proto__":{"email":"victim@example.com","email_verified":true},' +
+        '"rows":{"__proto__":{"email":"victim@example.com"}}}',
+    );
+
+    expect(projectNotification(access, "svc", said)).toBeUndefined();
+    expect(projectState(access, "svc", said)).toEqual({});
+    expect(Object.prototype).not.toHaveProperty("email");
+    expect(Object.prototype).not.toHaveProperty("email_verified");
+    expect(identityFromClaims({ sub: "auth0|nobody" })).toEqual({ sub: "auth0|nobody" });
+  });
+
+  it("projects nothing a value only inherits", () => {
+    // Even had a path been let through on its way in, projecting it reads own
+    // properties only and builds what it returns without a prototype.
+    const access = readFacadeAccess(facade("rows.length", "meta.toString"));
+    const projected = projectState(access, "svc", { rows: [1, 2], meta: {} });
+    expect(projected).toEqual({ rows: { length: 2 } });
+    expect(Object.getPrototypeOf(projected)).toBeNull();
+  });
+
+  it("is refused where a board is taken in, kept for its owner or not", async () => {
+    expect(refusedFacadePaths(facade("rows"))).toEqual([]);
+    const hidden = facade("__proto__.email");
+    (hidden.panels[0] as Record<string, unknown>).visibleTo = "owner";
+    expect(refusedFacadePaths(hidden)).toEqual(["__proto__.email"]);
+
+    const host = await startCoordinator(new BoardCoordinator(), 0, { people: PEOPLE });
+    cleanups.push(host.stop);
+    const api = request(`http://127.0.0.1:${host.port}`);
+    const { body } = await asOwner(
+      api.post(`/coordinator/users/${encodeURIComponent(OWNER.sub)}/boards`),
+    )
+      .send({ ...BOARD, facade: hidden })
+      .expect(400);
+    expect(body.error).toContain("__proto__.email");
+    expect(host.coordinator.getBoards(OWNER.sub)).toEqual([]);
+    expect(Object.prototype).not.toHaveProperty("email");
   });
 });

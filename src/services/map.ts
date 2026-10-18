@@ -470,6 +470,8 @@ function deepCopy<T>(value: T): T {
   }
 }
 
+const MACHINERY = new Set(["__proto__", "constructor", "prototype"]);
+
 function mergeAtPath<T extends Record<string, unknown>>(
   destination: T,
   value: unknown,
@@ -477,6 +479,11 @@ function mergeAtPath<T extends Record<string, unknown>>(
 ): T {
   const target = destination;
   const segments = path.split(".");
+  // A segment like `__proto__` leads out of the value into what every object
+  // in the process inherits; such a key sets nothing.
+  if (segments.some((segment) => MACHINERY.has(segment))) {
+    return target;
+  }
 
   segments.reduce<Record<string, unknown>>((branch, segment, index) => {
     const isLast = index === segments.length - 1;
