@@ -40,6 +40,7 @@ import {
   runtimeHolding,
 } from "./facadeAccess";
 import { DEFAULT_MEMBER_LIMITS, MemberLimits } from "./members";
+import { frameLimitFrom } from "./frameLimits";
 
 /**
  * What a browser attached to a board is to it.
@@ -712,8 +713,8 @@ export class BoardSession {
 
     ws.on("message", (raw, isBinary) => {
       const bytes = frameBytes(raw);
-      const limit = this.limits.maxFrameBytes;
-      if (limit && bytes.length > limit) {
+      const limit = frameLimitFrom(this.limits.maxFrameBytes);
+      if (bytes.length > limit) {
         this.logStore?.append(this.userId, this.boardName, {
           runId: "",
           ts: new Date().toISOString(),

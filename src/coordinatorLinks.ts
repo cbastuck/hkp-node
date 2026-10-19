@@ -23,6 +23,7 @@ import {
 } from "./coordinator/binaryFrame";
 import { SecretEntry } from "./secrets";
 import { ProcessContext } from "./types";
+import { frameLimitFrom, socketCeiling } from "./coordinator/frameLimits";
 
 /**
  * This runtime server's connections to the coordinators its runtimes belong to.
@@ -177,6 +178,12 @@ export type CoordinatorLinksOptions = {
    * never reconnect.
    */
   heartbeatMs?: number;
+  /**
+   * The largest value a coordinator passes on — the one this server's
+   * coordinator, if it has one, is told (`HKP_COORDINATOR_MAX_FRAME_BYTES`).
+   * Unset is the default; see coordinator/frameLimits.ts.
+   */
+  maxFrameBytes?: number;
 };
 
 /** The coordinator's `/join` endpoint for a coordinator's base address. */
@@ -249,9 +256,10 @@ class Link {
       socket = new WebSocket(joinUrlFor(this.record.coordinatorUrl), {
         // A header rather than the URL, which is what ends up in logs.
         headers: { Authorization: `Bearer ${this.record.ticket}` },
-        // No ceiling of the library's own: exceeding one closes the link,
-        // and the board would lose its runtime over one large value.
-        maxPayload: 0,
+        // Above the coordinator's frame limit, which drops an oversized value
+        // without closing anything; past this the library closes the link.
+        // See coordinator/frameLimits.ts.
+        maxPayload: socketCeiling(this.options.maxFrameBytes),
       });
     } catch (err) {
       this.settleFirst({
@@ -535,6 +543,7 @@ export class CoordinatorLinks {
       maxReconnectDelayMs: options.maxReconnectDelayMs ?? 30_000,
       introduceTimeoutMs: options.introduceTimeoutMs ?? 10_000,
       heartbeatMs: options.heartbeatMs ?? 30_000,
+      maxFrameBytes: frameLimitFrom(options.maxFrameBytes),
     };
   }
 

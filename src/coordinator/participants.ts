@@ -21,6 +21,7 @@ import {
 } from "./binaryFrame";
 import { contextFromLink } from "../runtime";
 import { ProcessContext } from "../types";
+import { frameLimitFrom } from "./frameLimits";
 
 /**
  * Tickets, and the runtime servers that connected with one.
@@ -476,7 +477,7 @@ export class ParticipantRegistry {
 
     socket.on("message", (raw, isBinary) => {
       const bytes = frameBytes(raw);
-      const limit = this.options.maxFrameBytes;
+      const limit = frameLimitFrom(this.options.maxFrameBytes);
       // Asked of a participant, not of a connection still saying what it is:
       // a hello carries a registry, and a limit meant for values must not be
       // what keeps a runtime server from joining.

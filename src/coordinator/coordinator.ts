@@ -4,6 +4,7 @@ import { BoardStore, createMemoryBoardStore } from "./boardStore";
 import { LogStore } from "./logStore";
 import { Caller, LogEntry, LogLevel } from "../types";
 import { ParticipantRegistry } from "./participants";
+import { frameLimitFrom } from "./frameLimits";
 import { isRemoteRuntime } from "./types";
 import {
   BoardMember,
@@ -45,6 +46,13 @@ export class BoardCoordinator {
    */
   readonly participants: ParticipantRegistry;
 
+  private readonly limits: { maxFrameBytes: number } & MemberLimits;
+
+  /** The largest value this coordinator passes on; see frameLimits.ts. */
+  get maxFrameBytes(): number {
+    return this.limits.maxFrameBytes;
+  }
+
   constructor(
     private readonly store: BoardStore = createMemoryBoardStore(),
     /** Where boards' log entries are kept; absent means none are collected. */
@@ -52,14 +60,15 @@ export class BoardCoordinator {
     participants?: ParticipantRegistry,
     /**
      * What this coordinator's operator allows. `maxFrameBytes` bounds a single
-     * value passed between runtimes; unset means no limit.
+     * value passed between runtimes; unset is the default (frameLimits.ts).
      */
-    private readonly limits: { maxFrameBytes?: number } & MemberLimits = {},
+    limits: { maxFrameBytes?: number } & MemberLimits = {},
   ) {
+    this.limits = { ...limits, maxFrameBytes: frameLimitFrom(limits.maxFrameBytes) };
     this.participants =
       participants ??
       new ParticipantRegistry({
-        maxFrameBytes: limits.maxFrameBytes,
+        maxFrameBytes: this.limits.maxFrameBytes,
         // A board that exists has to remember the ticket that now counts, or
         // a restart would bring back the one it replaced.
         onTicketsChanged: (userId, boardName) => {

@@ -27,7 +27,7 @@
  */
 import { randomUUID } from "node:crypto";
 
-import { eval as evaluateAst, parse } from "expression-eval";
+import { evaluate as evaluateAst, parse } from "../expressionEval";
 
 export type CompiledExpression = (params: unknown) => unknown;
 

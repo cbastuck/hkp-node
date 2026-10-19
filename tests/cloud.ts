@@ -173,6 +173,9 @@ export async function startCoordinator(
       attemptDelayMs: 10,
       ...admission,
     }),
+    // As a deployed server does (index.ts): the bridge's socket ceiling sits
+    // above this coordinator's frame limit.
+    coordinator.maxFrameBytes,
   );
   attachCoordinatorJoin(host, coordinator);
   const started = await new Promise<{ port: number }>((resolve, reject) => {
@@ -489,7 +492,18 @@ export async function openBridge(
 ): Promise<BrowserEnd> {
   const url = new URL(`ws://127.0.0.1:${host.port}/coordinator/bridge`);
   if (token) {
-    url.searchParams.set("access_token", token);
+    // As a browser does: the token buys a ticket, and the ticket opens the
+    // socket, so the token never appears in an address (wsTickets.ts).
+    const minted = await fetch(`http://127.0.0.1:${host.port}/ws-tickets`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (minted.ok) {
+      url.searchParams.set("ticket", ((await minted.json()) as { ticket: string }).ticket);
+    } else {
+      // Refused for the token: the upgrade is then refused for the same reason.
+      url.searchParams.set("ticket", "refused");
+    }
   }
   const socket = new WebSocket(url);
   const end = browserEnd(socket);

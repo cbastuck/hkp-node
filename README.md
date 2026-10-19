@@ -90,7 +90,7 @@ All options are passed as environment variables.
 | `HKP_MAX_ASSET_REQUEST_BODY_BYTES` | `33554432` | Largest body of a request that carries asset descriptors — creating a runtime, pushing assets, deploying a board (32 MB) — accepted only from an authenticated caller. It bounds how much inline content one runtime, or one deployed board, may be handed at once, counted as it travels (base64, JSON-escaped). Left unset it is never less than one asset at the inline limit needs. |
 | `HKP_MAX_REQUEST_BODY_BYTES` | `26214400`  | Largest request body accepted on a service endpoint (25 MB). Oversized requests get `413`. Set `0` to disable — unwise, since these endpoints take no token.                             |
 | `HKP_COORDINATOR_LINKS_FILE` | `~/.hkp/node-<instance>/coordinator-links.json` | Where this server keeps the tickets it connects to coordinators with, so a deployed board's runtimes are re-established after a restart. Set to the empty string to keep them in memory only. Written `0600`: a ticket is a bearer credential for one runtime of one board. |
-| `HKP_COORDINATOR_MAX_FRAME_BYTES` | —      | Coordinator only. The largest single frame a runtime server or an attached browser may send that is passed on — in practice, the largest value one runtime may hand the next. Unset means no limit. A larger frame is dropped and recorded in the board's log as `frame-dropped`; the connection stays up. |
+| `HKP_COORDINATOR_MAX_FRAME_BYTES` | 64 MiB | The largest single frame a runtime server or an attached browser may send that a coordinator passes on — in practice, the largest value one runtime may hand the next. A larger frame is dropped and recorded in the board's log as `frame-dropped`; the connection stays up. Never off: unset or `0` is the default. Also what this server's own links to a coordinator accept, so set it alike on every server of a deployment |
 | `HKP_COORDINATOR_MAX_MEMBERS` | `200`     | Coordinator only. How many people one deployed board may be shared with. |
 | `HKP_COORDINATOR_MAX_MEMBER_BRIDGES` | `4` | Coordinator only. How many browsers one member may have attached to one board at once. |
 | `HKP_COORDINATOR_MAX_MEMBER_PROCESS_PER_MINUTE` | `120` | Coordinator only. How many times a minute one member may ask a shared board to do something. |
@@ -126,8 +126,11 @@ says only which pages may send one and read the answer.
 
 The server **fails closed** on a public bind: it refuses to start unless `AUTH0_DOMAIN` and
 `AUTH0_AUDIENCE` are set. Every HTTP route and WebSocket upgrade then requires a valid Auth0
-bearer token. Because browsers can't set headers on a WebSocket handshake, the token is passed
-as an `?access_token=` query parameter on the WS URL.
+bearer token: RS256, issued by `https://<AUTH0_DOMAIN>/`, for one of the audiences, with an
+expiry and a subject. Because browsers can't set headers on a WebSocket handshake, a browser
+first trades its token for a single-use ticket (`POST /ws-tickets`, token in the header) and
+opens the socket with `?ticket=`, keeping the token out of the addresses proxies and access logs
+record. `?access_token=` is still accepted from older clients.
 
 **Multi-tenancy.** Runtimes are namespaced by the authenticated user, taken from the token's
 `sub` claim — the same identifier the coordinator uses as its `userId`. Every route resolves
@@ -400,7 +403,7 @@ page in `docs/content/services/` is the detail; this is the roster.
 
 ### WebSocket
 
-Connect to `ws://<host>:<port>/<runtimeId>?access_token=<jwt>` to receive live notifications and results for a runtime. The upgrade is authenticated (token + Origin) exactly like the HTTP routes. The connection is tied to the runtime's lifecycle — when the last client disconnects, the runtime is destroyed.
+Connect to `ws://<host>:<port>/<runtimeId>?ticket=<ticket>` — a ticket from `POST /ws-tickets`, good for one socket for 30 seconds — to receive live notifications and results for a runtime. The upgrade is authenticated (ticket or token, and Origin) exactly like the HTTP routes; a client that can set headers may send `Authorization: Bearer` instead. The connection is tied to the runtime's lifecycle — when the last client disconnects, the runtime is destroyed.
 
 ---
 

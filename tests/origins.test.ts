@@ -4,6 +4,7 @@ import {
   admitsWithoutCredential,
   allowsOrigin,
   allowsOriginWithoutCredential,
+  isForwarded,
   isKnownHost,
   isLoopbackOrigin,
   parseAllowedOrigins,
@@ -118,6 +119,21 @@ describe("origins", () => {
     expect(admits(allowed, undefined, "same-origin")).toBe(true);
     // An allowed page is allowed however the browser classifies the request.
     expect(admits(allowed, "http://localhost:5173", "cross-site")).toBe(true);
+  });
+
+  it("a request a proxy passed on is not let in for where it comes from", () => {
+    const allowed = parseAllowedOrigins("");
+    const proxied = { host: "127.0.0.1:8080", forwarded: true };
+    expect(admitsWithoutCredential(proxied, allowed, [])).toBe(false);
+    expect(
+      admitsWithoutCredential({ ...proxied, origin: "saucer://embedded" }, allowed, []),
+    ).toBe(false);
+
+    expect(isForwarded({ "x-forwarded-for": "203.0.113.9" })).toBe(true);
+    expect(isForwarded({ forwarded: "for=203.0.113.9" })).toBe(true);
+    expect(isForwarded({ "x-real-ip": "203.0.113.9" })).toBe(true);
+    expect(isForwarded({ "x-forwarded-for": "  " })).toBe(false);
+    expect(isForwarded({})).toBe(false);
   });
 
   it("a server is addressed by an address, localhost, or a name it was given", () => {

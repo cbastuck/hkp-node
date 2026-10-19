@@ -5,6 +5,7 @@ import { WebSocketServer } from "ws";
 
 import { BoardCoordinator } from "./coordinator";
 import { JOIN_PATH } from "./participantProtocol";
+import { socketCeiling } from "./frameLimits";
 
 /**
  * Where runtime servers connect in.
@@ -32,10 +33,14 @@ export function attachCoordinatorJoin(
   coordinator: BoardCoordinator,
   basePath = "/coordinator",
 ): void {
-  // No ceiling of the library's own: exceeding one closes the connection,
-  // which a board would read as its runtime going away. What a coordinator's
-  // operator allows is decided per frame; see ParticipantRegistry.
-  const wss = new WebSocketServer({ noServer: true, maxPayload: 0 });
+  // What a coordinator's operator allows is decided per frame, and an
+  // oversized value is dropped without closing anything (ParticipantRegistry).
+  // The library's own ceiling sits above that, so it refuses only what the
+  // frame limit would have dropped anyway; see frameLimits.ts.
+  const wss = new WebSocketServer({
+    noServer: true,
+    maxPayload: socketCeiling(coordinator.maxFrameBytes),
+  });
 
   host.addUpgradeRoute(`${basePath}${JOIN_PATH}`, (request, socket, head) => {
     const header = request.headers.authorization;
