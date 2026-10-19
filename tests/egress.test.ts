@@ -75,6 +75,8 @@ describe("what counts as the public internet", () => {
       "fc00::1",
       "fd00:ec2::254",
       "ff02::1",
+      "::127.0.0.1",
+      "64:ff9b:1::a9fe:a9fe",
     ]) {
       expect(isPublicAddress(address), address).toBe(false);
     }
