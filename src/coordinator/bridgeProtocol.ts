@@ -92,8 +92,18 @@ export type BridgeMessage =
    * notification is for whoever is watching and may be dropped when nobody is,
    * while an entry is written whether or not anyone is attached. What arrives
    * here is a copy of what was already stored, not the storage path.
+   *
+   * `caller` says who began the run as the owner knows them — the name their
+   * board's list gives, and whether they are the owner or a member — which
+   * the entry itself does not: it names a `sub`, so that the stored log
+   * collects no addresses. Absent when the run had no person behind it, or
+   * the person is not one this board has seen attached.
    */
-  | { type: "log"; entry: LogEntry }
+  | {
+      type: "log";
+      entry: LogEntry;
+      caller?: { name?: string; role: "owner" | "member" };
+    }
   /** One service reported new state. `seq` continues the snapshot's sequence. */
   | {
       type: "serviceState";

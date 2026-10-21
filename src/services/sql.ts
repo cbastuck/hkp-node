@@ -296,6 +296,9 @@ export class SqlService implements HostedService {
       }
       const result = this.execute(db, input);
       this.lastError = "";
+      // What the statement did, for the board's log: how many rows, never
+      // which — the parameters are the caller's data, and the log keeps none.
+      this.host?.log("info", `sql.${this.mode}`, summaryOf(this.mode, result));
       // Reported either way: what the statement did is this service's own news,
       // and a panel showing it does not depend on the board choosing to pass it
       // on. Only what travels to the next service is `emit`'s to decide.
@@ -392,6 +395,17 @@ export class SqlService implements HostedService {
     notify({ error });
     return null;
   }
+}
+
+/** A statement's outcome as counts only. */
+function summaryOf(mode: SqlMode, result: JsonRecord): JsonRecord {
+  if (mode === "run") {
+    return { changes: result.changes };
+  }
+  if (mode === "query") {
+    return { count: result.count };
+  }
+  return {};
 }
 
 function reason(err: unknown): string {

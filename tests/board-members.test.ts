@@ -748,6 +748,9 @@ describe("what a member is sent", () => {
     const entry = owner.all("log")[0].entry as LogEntry;
     expect(entry.caller).toBe(ANNA.sub);
     expect(JSON.stringify(owner.all("log"))).not.toContain(ANNA.email);
+    // Beside it, for the owner's live view, who that is to this board: the
+    // name their list gives her — still never her address, and not stored.
+    expect(owner.all("log")[0].caller).toEqual({ name: "Anna", role: "member" });
   });
 });
 

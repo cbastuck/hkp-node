@@ -3,11 +3,14 @@ import path from "node:path";
 
 import { describe, expect, it } from "vitest";
 
-import { readFacadeAccess } from "../src/coordinator/facadeAccess";
+import {
+  projectNotification,
+  readFacadeAccess,
+} from "../src/coordinator/facadeAccess";
 import { HostedRuntime } from "../src/runtime";
 import { createMemoryDatabaseStore } from "../src/services/database";
 import { SqlService } from "../src/services/sql";
-import { Caller, ServiceConfiguration } from "../src/types";
+import { Caller, LogEntry, ServiceConfiguration } from "../src/types";
 
 /**
  * The court-booking board's own statements, run by more than one person.
@@ -42,7 +45,9 @@ type Cell = {
   state: string;
   label: string;
   prompt: string;
+  day: string;
   dayOffset: number;
+  notice: string;
 };
 
 /** The board's runtime on one in-memory database, as its coordinator runs it. */
@@ -224,6 +229,105 @@ describe("the court-booking board, shared", () => {
     expect(day.every((c) => c.state === "blocked")).toBe(true);
     expect((await act(ANNA, {})).find((c) => c.column === 1 && c.hour === 10)?.state)
       .toBe("free");
+  });
+});
+
+describe("what a member is sent", () => {
+  it("keeps the day a list when the facade also reads into it", async () => {
+    // The calendar reads `rows`, the line above it `rows.0.day` and the
+    // notice `rows.0.notice`: a member's copy must still be the rows, or
+    // their calendar draws nothing.
+    const { act } = club();
+    const rows = await act(ANNA, book(1, 10));
+    const access = readFacadeAccess(board.facade);
+
+    const given = projectNotification(access, "day-grid", { rows, count: rows.length }) as {
+      rows: Cell[];
+    };
+
+    expect(Array.isArray(given.rows)).toBe(true);
+    expect(given.rows).toEqual(rows);
+    expect(given).not.toHaveProperty("count");
+  });
+});
+
+describe("what the board's log keeps of a booking", () => {
+  it("says what each statement did, who began it, and nothing of what was sent", async () => {
+    const databases = createMemoryDatabaseStore();
+    const runtime = new HostedRuntime(
+      {
+        id: "club",
+        name: "Club",
+        boardName: "Court Booking",
+        logging: true,
+        services: board.services.club,
+      },
+      (config) => new SqlService(config, databases),
+      undefined,
+      "auth0|owner",
+    );
+    const entries: LogEntry[] = [];
+    runtime.registerLogTarget((entry) => entries.push(entry));
+
+    await runtime.processAt("give-back", book(2, 18, { dayOffset: 1 }), () => {}, {
+      runId: "run-ana",
+      actor: { kind: "person", ...ANNA, expiresAt: Date.now() + 60_000 },
+    });
+
+    const said = entries.filter((e) => e.event.startsWith("sql."));
+    expect(said.map((e) => [e.serviceUuid, e.event, e.data])).toEqual([
+      ["give-back", "sql.run", { changes: 0 }],
+      ["take-hour", "sql.run", { changes: 1 }],
+      ["day-grid", "sql.query", { count: 45 }],
+    ]);
+    expect(said.every((e) => e.caller === ANNA.sub && e.runId === "run-ana")).toBe(true);
+    // Counts, never the parameters: no court, no hour, no address.
+    expect(JSON.stringify(said)).not.toContain(ANNA.email);
+    expect(JSON.stringify(said)).not.toContain("18");
+  });
+});
+
+describe("telling the person who tapped", () => {
+  it("lets exactly one of two people take the same hour, and tells the other", async () => {
+    const { act, cell } = club();
+
+    // Both saw the hour free and tapped at the same moment.
+    const [annas, bens] = await Promise.all([
+      act(ANNA, book(2, 18)),
+      act(BEN, book(2, 18)),
+    ]);
+
+    const winner = cell(annas, 2, 18).state === "mine" ? annas : bens;
+    const loser = winner === annas ? bens : annas;
+    expect(cell(winner, 2, 18).state).toBe("mine");
+    expect(cell(loser, 2, 18).state).toBe("taken");
+    expect(winner[0].notice).toBe("");
+    expect(loser[0].notice).toBe("Court 2 at 18:00 was just taken by someone else.");
+    // The same answer on every row, so a notice can read it from the first.
+    expect(new Set(loser.map((c) => c.notice)).size).toBe(1);
+  });
+
+  it("says why a second hour the same day was not booked", async () => {
+    const { act } = club();
+    const today = await act(ANNA, book(1, 10));
+
+    const second = await act(ANNA, book(2, 12));
+
+    expect(second[0].notice).toBe(`You already hold an hour on ${today[0].day}.`);
+  });
+
+  it("stays quiet unless a take did not land", async () => {
+    const { act } = club();
+
+    expect((await act(ANNA, book(1, 10)))[0].notice).toBe("");
+    expect((await act(ANNA, { dayOffset: 1 }))[0].notice).toBe("");
+    expect((await act(ANNA, { state: "mine", court: 1, hour: 10 }))[0].notice).toBe("");
+  });
+
+  it("is what the facade raises as a notice", () => {
+    const notices = (board.facade as { notices: { source: { serviceUuid: string; path: string } }[] })
+      .notices.map((n) => n.source);
+    expect(notices).toContainEqual({ serviceUuid: "day-grid", path: "rows.0.notice" });
   });
 });
 

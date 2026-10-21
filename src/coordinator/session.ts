@@ -434,7 +434,14 @@ export class BoardSession {
         this.logStore?.append(this.userId, this.boardName, event.entry);
         // The board's log is its owner's: an entry names services, runs and
         // callers a member has no business seeing.
-        this.toOwners({ type: "log", entry: event.entry });
+        const caller = event.entry.caller
+          ? this.knownCallers.get(event.entry.caller)
+          : undefined;
+        this.toOwners({
+          type: "log",
+          entry: event.entry,
+          ...(caller ? { caller } : {}),
+        });
       }
       return;
     }
@@ -727,6 +734,7 @@ export class BoardSession {
       }
       const { name: _previous, ...rest } = bridge.caller;
       bridge.caller = name ? { ...rest, name } : rest;
+      this.rememberCaller(bridge.caller.sub, name, bridge.role);
       this.send(bridge.ws, this.snapshotFor(bridge));
     }
   }
@@ -763,6 +771,9 @@ export class BoardSession {
       seq: 0,
     };
     this.bridges.add(bridge);
+    if (attach.caller) {
+      this.rememberCaller(attach.caller.sub, attach.caller.name, attach.role);
+    }
 
     ws.on("message", (raw, isBinary) => {
       const bytes = frameBytes(raw);
@@ -1041,6 +1052,26 @@ export class BoardSession {
   }
 
   /** Sends a message to every browser the board's owner has attached. */
+  /**
+   * Who a `sub` in this board's log is, as the board's list calls them, for
+   * the owner's live view of it. Learnt from the bridges people attach with,
+   * and kept after they leave, so a run is still named once its caller has
+   * closed the board. Held only while the session lives, and never written
+   * to the log.
+   */
+  private readonly knownCallers = new Map<
+    string,
+    { name?: string; role: "owner" | "member" }
+  >();
+
+  private rememberCaller(
+    sub: string,
+    name: string | undefined,
+    role: "owner" | "member",
+  ): void {
+    this.knownCallers.set(sub, { ...(name ? { name } : {}), role });
+  }
+
   private toOwners(message: BridgeMessage): void {
     const payload = JSON.stringify(message);
     for (const bridge of this.bridges) {
