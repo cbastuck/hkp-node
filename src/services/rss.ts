@@ -41,6 +41,7 @@ import {
 } from "../types";
 import { FeedItem, parseFeed } from "./rss-parse";
 import { MOUNT_FIELD, parseMountRef } from "../coordinator/mount";
+import { failureReason } from "../egress";
 
 export const rssDescriptor: ServiceRegistryEntry = {
   serviceId: "rss",
@@ -342,7 +343,7 @@ export class RssService implements HostedService {
         })),
       };
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+      const message = failureReason(err);
       return {
         feed,
         articles: [],

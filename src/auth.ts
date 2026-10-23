@@ -72,6 +72,12 @@ export type AuthConfig =
       domain: string;
       audience: string | string[];
       allowedEmails?: string[];
+      /**
+       * Where the issuer's signing keys are published. Unset is Auth0's
+       * `https://<domain>/.well-known/jwks.json`; tests point it at keys they
+       * hold. The issuer a token must name stays `https://<domain>/` either way.
+       */
+      jwksUri?: string;
     }
   | { mode: "none" };
 
@@ -185,6 +191,7 @@ export function identityFromClaims(claims: {
 function createJwtVerifier(
   domain: string,
   audience: string | string[],
+  jwksUri = `https://${domain}/.well-known/jwks.json`,
 ): (token: string) => Promise<AuthenticatedUser | null> {
   // An empty `audience` makes jwt.verify skip the check altogether, which would
   // accept a token minted for any application in the tenant. Refusing to build a
@@ -201,7 +208,7 @@ function createJwtVerifier(
   const expected = audiences as [string, ...string[]];
 
   const client = jwksClient({
-    jwksUri: `https://${domain}/.well-known/jwks.json`,
+    jwksUri,
     cache: true,
     rateLimit: true,
   });
@@ -221,13 +228,33 @@ function createJwtVerifier(
 
   return (token: string) =>
     new Promise<AuthenticatedUser | null>((resolve) => {
-      jwt.verify(token, getSigningKey, { audience: expected }, (err, decoded) => {
-        if (err || !decoded || typeof decoded === "string") {
-          resolve(null);
-          return;
-        }
-        resolve(identityFromClaims(decoded));
-      });
+      // The same checks in every runtime (hkp-python's auth.py, hkp-rt's
+      // http/auth.cpp, the website's auth.php): RS256 only, the issuer the
+      // keys came from, one of the accepted audiences, and an expiry that must
+      // be there — jsonwebtoken checks one only when it is present — within a
+      // minute of clock skew. The subject is asked by identityFromClaims.
+      jwt.verify(
+        token,
+        getSigningKey,
+        {
+          audience: expected,
+          issuer: `https://${domain}/`,
+          algorithms: ["RS256"],
+          clockTolerance: 60,
+        },
+        (err, decoded) => {
+          if (
+            err ||
+            !decoded ||
+            typeof decoded === "string" ||
+            typeof ownClaim(decoded, "exp") !== "number"
+          ) {
+            resolve(null);
+            return;
+          }
+          resolve(identityFromClaims(decoded));
+        },
+      );
     });
 }
 
@@ -249,7 +276,7 @@ export function createAuthenticator(
     };
   }
 
-  const verify = createJwtVerifier(config.domain, config.audience);
+  const verify = createJwtVerifier(config.domain, config.audience, config.jwksUri);
 
   const identifyToken = async (
     token: string | undefined | null,

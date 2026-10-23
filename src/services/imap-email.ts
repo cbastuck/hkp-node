@@ -12,6 +12,7 @@
 import { ImapFlow, MailboxObject } from "imapflow";
 import { simpleParser } from "mailparser";
 import { referencedSecrets, resolveCredential } from "../secrets";
+import { egressPolicy, failureReason, reachableAddress } from "../egress";
 import {
   HostedService,
   JsonRecord,
@@ -279,8 +280,33 @@ export class ImapEmailService implements HostedService {
       return;
     }
 
+    // The address the egress guard checked, with the name kept for TLS: what
+    // this socket opens to is what was judged, not a second lookup of it. An
+    // open server dials the name, as it always did, without waiting on it.
+    let dial: { host: string; servername?: string } = { host: this.state.host };
+    if (egressPolicy().mode !== "open") {
+      try {
+        dial = await reachableAddress(this.state.host);
+      } catch (err) {
+        if (generation !== this.generation) {
+          return;
+        }
+        this.state.enabled = false;
+        this.state.running = false;
+        this.state.status = "disconnected";
+        this.state.error = failureReason(err);
+        this._notifyState();
+        return;
+      }
+      // Asked again while this one waited: that attempt is the one to make.
+      if (generation !== this.generation || !this.state.enabled) {
+        return;
+      }
+    }
+
     const client = new ImapFlow({
-      host: this.state.host,
+      host: dial.host,
+      ...(dial.servername ? { servername: dial.servername } : {}),
       port: this.state.port,
       secure: this.state.tls,
       auth: {

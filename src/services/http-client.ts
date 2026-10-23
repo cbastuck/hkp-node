@@ -53,6 +53,7 @@ import {
 } from "../types";
 import { MOUNT_FIELD, parseMountRef } from "../coordinator/mount";
 import { fetchWithCredentials } from "../credentialedFetch";
+import { failureReason } from "../egress";
 
 export const httpClientDescriptor: ServiceRegistryEntry = {
   serviceId: "http-client",
@@ -408,7 +409,7 @@ export class HttpClientService implements HostedService {
       });
       await this.push(result, notify, context);
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+      const message = failureReason(err);
       // Status 0: there was no response to have one, so the status of the
       // request before this stops standing as if it were this one's.
       notify({

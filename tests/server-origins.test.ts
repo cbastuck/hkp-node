@@ -312,6 +312,20 @@ describe("a page against a server without auth", () => {
     expect(await rt.upgrade()).toBe("open");
   });
 
+  it("a request a proxy on this machine passed on is refused", async () => {
+    // nginx or Caddy in front of the server: every caller arrives from
+    // loopback, and says where it really came from in a header.
+    const rt = await listening({ auth: { mode: "none" } });
+    const forwarded = { "X-Forwarded-For": "203.0.113.9" };
+
+    expect(
+      (await rt.send("POST", "/runtimes", { ...rt.json, ...forwarded }, RUNTIME)).status,
+    ).toBe(403);
+    expect((await rt.send("GET", "/runtimes", { Forwarded: "for=203.0.113.9" })).status).toBe(403);
+    expect(await rt.upgrade({ "X-Real-IP": "203.0.113.9" })).toBe("rejected");
+    expect(await rt.runtimeCount()).toBe(0);
+  });
+
   it("a mount is reached by anyone, as it is meant to be", async () => {
     const rt = await listening({ auth: { mode: "none" } });
     const created = await rt.send(
