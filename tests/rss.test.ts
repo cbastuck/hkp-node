@@ -3,9 +3,12 @@ import { AddressInfo } from "node:net";
 
 import { afterEach, describe, expect, it } from "vitest";
 
+import { HostedRuntime } from "../src/runtime";
+import { MonitorService } from "../src/services/monitor";
 import { Article, RssService } from "../src/services/rss";
+import { TimerService } from "../src/services/timer";
 import { parseFeed } from "../src/services/rss-parse";
-import { RuntimeHost } from "../src/types";
+import { HostedService, RuntimeHost } from "../src/types";
 import { SecretVault } from "../src/secrets";
 
 const RSS_2 = `<?xml version="1.0"?>
@@ -337,5 +340,62 @@ describe("RssService and a feed named by reference", () => {
     const round = notified.at(-1) as any;
     expect(round.items).toEqual([]);
     expect(round.errors[0].error).toMatch(/Waiting for/);
+  });
+});
+
+/**
+ * What a board hears of a round: each notification once.
+ *
+ * The articles leave the service after its call has returned, through
+ * `processFrom` — and the runtime already hands everything raised there to its
+ * notification targets. Forwarding it through the original call's `notify` as
+ * well delivered it a second time, which the flow inspector showed as the same
+ * output twice.
+ */
+describe("RssService in a runtime", () => {
+  it("is reported once per round, and so is what comes after it", async () => {
+    const server = await feedServer(() => ({ body: RSS_2 }));
+    const runtime = new HostedRuntime(
+      {
+        id: "rt",
+        name: "Rt",
+        services: [
+          { serviceId: "timer", uuid: "tick", state: { periodic: false } },
+          { serviceId: "rss", uuid: "feed", state: { feeds: [`${server.url}/rss`] } },
+          { serviceId: "monitor", uuid: "seen", state: {} },
+        ],
+      },
+      (config) =>
+        config.serviceId === "timer"
+          ? (new TimerService(config) as unknown as HostedService)
+          : config.serviceId === "rss"
+            ? new RssService(config)
+            : new MonitorService(config),
+    );
+    const heard: Array<{ instanceId?: string; state?: string }> = [];
+    runtime.registerNotificationTarget((n) => {
+      const internal = (n.payload as any)?.__internal;
+      if (internal) {
+        heard.push({ instanceId: n.instanceId, state: internal.state });
+      }
+    });
+
+    // What the panel's Trigger Oneshot sends.
+    runtime.getService("tick")!.configure({ periodic: false, start: true, oneShotDelay: 0 });
+    const deadline = Date.now() + 2000;
+    while (!heard.some((n) => n.instanceId === "seen" && n.state === "call-process-finished")) {
+      if (Date.now() > deadline) {
+        throw new Error(`the round never reached the monitor: ${JSON.stringify(heard)}`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const count = (instanceId: string, state: string) =>
+      heard.filter((n) => n.instanceId === instanceId && n.state === state).length;
+    // Once for the call that started the fetch, once for the articles it pushed.
+    expect(count("feed", "call-process-finished")).toBe(2);
+    expect(count("seen", "call-process")).toBe(1);
+    expect(count("seen", "call-process-finished")).toBe(1);
   });
 });

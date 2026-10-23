@@ -544,7 +544,9 @@ export class HttpClientService implements HostedService {
     const output = await this.host.processFrom(
       this.uuid,
       result,
-      (n: RuntimeNotification) => notify(n.payload, n.instanceId),
+      // No-op: the runtime already fans these out to its notification
+      // targets. Re-notifying through `notify` would deliver every one twice.
+      (_n: RuntimeNotification) => {},
       context,
     );
     // A downstream service returning null means "stop" — honour it rather than
