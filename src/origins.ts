@@ -13,6 +13,13 @@
  * A caller that is not a browser sends none of these, and is let in as before:
  * another process on this machine is not what this guards against.
  *
+ * A request a proxy passed on is never let in this way. A reverse proxy on the
+ * same host — nginx, Caddy — makes every request arrive from this machine at a
+ * name the server knows, so where it comes from says nothing any more. One
+ * that says so (`Forwarded`, `X-Forwarded-For`, `X-Real-IP`) is refused; one
+ * that says nothing cannot be told apart, which is why a loopback bind is a
+ * boundary only while nothing forwards to it.
+ *
  * The same rule, row for row, is in hkp-rt (`lib/include/origins.h`) and
  * hkp-python (`hkp/origins.py`).
  */
@@ -155,7 +162,19 @@ export type RequestSource = {
   origin?: string;
   secFetchSite?: string;
   host?: string;
+  /** A proxy says it passed the request on; see `isForwarded`. */
+  forwarded?: boolean;
 };
+
+/** Whether a request carries a header a proxy adds when it passes one on. */
+export function isForwarded(
+  headers: Record<string, string | string[] | undefined>,
+): boolean {
+  return ["forwarded", "x-forwarded-for", "x-real-ip"].some((name) => {
+    const value = headers[name];
+    return (Array.isArray(value) ? value.join(",") : (value ?? "")).trim() !== "";
+  });
+}
 
 /**
  * Whether a request that carries no credential may be let in on the strength
@@ -166,6 +185,9 @@ export function admitsWithoutCredential(
   allowed: AllowedOrigins,
   ownNames: string[],
 ): boolean {
+  if (source.forwarded) {
+    return false;
+  }
   if (source.origin?.trim()) {
     if (!allowsOriginWithoutCredential(source.origin, allowed)) {
       return false;

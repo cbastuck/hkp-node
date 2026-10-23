@@ -17,6 +17,7 @@ import { createFileBoardStore } from "./coordinator/fileBoardStore";
 import { createFileLogStore } from "./coordinator/logStore";
 import { AuthConfig, isLoopbackHost } from "./auth";
 import { parseAllowedOrigins } from "./origins";
+import { readEgressPolicy, setEgressPolicy } from "./egress";
 import {
   InstanceError,
   acquireInstanceLock,
@@ -146,10 +147,28 @@ async function main() {
   const allowedOrigins = parseAllowedOrigins(process.env.ALLOWED_ORIGINS);
   const coordinatorEnabled = process.env.COORDINATOR_ENABLED === "true";
   const authConfig = resolveServerAuthConfig(host);
+  // Before anything can dial out: a hosted server reaches only public
+  // addresses on a board's behalf (egress.ts).
+  const egress = readEgressPolicy(process.env);
+  await setEgressPolicy(egress);
+  if (egress.mode === "public") {
+    console.log(
+      `[hkp-node] HKP_EGRESS=public: boards reach public addresses only` +
+        (egress.allow.length
+          ? `, and ${egress.allow.length} allowed address${egress.allow.length === 1 ? "" : "es"} or range${egress.allow.length === 1 ? "" : "s"}`
+          : ""),
+    );
+  }
   const storeDir = process.env.HKP_STORE_DIR ?? path.join(instanceDir, "store");
 
   const server = createRuntimeServer({
     auth: authConfig,
+    // The largest value a coordinator passes on, which this server's links to
+    // coordinators accept; see coordinator/frameLimits.ts.
+    coordinatorLinkOptions: {
+      maxFrameBytes:
+        readInteger(process.env.HKP_COORDINATOR_MAX_FRAME_BYTES, 0) || undefined,
+    },
     allowedOrigins,
     externalHost,
     externalSecure,
@@ -223,6 +242,8 @@ async function main() {
             logDir ? createFileLogStore(logDir) : undefined,
             undefined,
             {
+              // Unset is the default in coordinator/frameLimits.ts; there is
+              // no "no limit".
               maxFrameBytes:
                 readInteger(process.env.HKP_COORDINATOR_MAX_FRAME_BYTES, 0) ||
                 undefined,
@@ -272,6 +293,7 @@ async function main() {
     // A browser attaching to a board: its owner, or somebody on its list.
     server.setBridgeUpgradeHandler(
       createBridgeHandler(coordinator, { authMode: authConfig.mode }),
+      coordinator.maxFrameBytes,
     );
     console.log("hkp-node coordinator enabled at /coordinator");
   }

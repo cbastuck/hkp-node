@@ -34,6 +34,7 @@ import nodemailer, { TransportOptions, Transporter } from "nodemailer";
 
 import { normalizeMessageId, normalizeReferences } from "./imap-email";
 import { resolveCredential } from "../secrets";
+import { EgressRefused, reachableAddress } from "../egress";
 import {
   HostedService,
   JsonRecord,
@@ -277,11 +278,14 @@ export class SmtpEmailService implements HostedService {
     }
 
     try {
+      // The address the egress guard checked, with the name kept for TLS.
+      const dial = await reachableAddress(this._state.host);
       const transporter = this.createTransport({
-        host: this._state.host,
+        host: dial.host,
         port: this._state.port,
         secure: this._state.tls,
         auth: { user: this._state.username, pass: password },
+        ...(dial.servername ? { tls: { servername: dial.servername } } : {}),
       });
 
       const info = await transporter.sendMail({
@@ -317,7 +321,7 @@ export class SmtpEmailService implements HostedService {
       notify({ ...sent, error: "" });
       return sent;
     } catch (err) {
-      return this.fail(notify, String(err));
+      return this.fail(notify, err instanceof EgressRefused ? err.message : String(err));
     }
   }
 
