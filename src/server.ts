@@ -1697,8 +1697,8 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
       return;
     }
 
-    // Authenticate every upgrade with the same rules as HTTP routes. Browsers
-    // can't set headers on a WS handshake, so the token rides in ?access_token=.
+    // Authenticate every upgrade with the same rules as HTTP routes; who is
+    // asking is read from the ticket or token below.
     // The Origin check blocks cross-site WebSocket hijacking from a page a local
     // user happens to visit — and without auth, where nothing else stands in
     // the way, it is the whole rule a request is let in by.
