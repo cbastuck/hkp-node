@@ -39,26 +39,26 @@ afterEach(() => {
 });
 
 function hostSpy() {
-  const pushed: unknown[] = [];
   const host: RuntimeHost = {
-    processFrom: async (_uuid, data) => {
-      pushed.push(data);
-      return data;
-    },
+    processFrom: async (_uuid, data) => data,
     notify: () => {},
     currentContext: () => null,
     secrets: () => new SecretVault(),
     log: () => {},
     forwardLog: () => {},
-    logSettings: () => ({ logging: false, logData: false, logLevel: "info" as const }),
+    logSettings: () => ({
+      logging: false,
+      logData: false,
+      logLevel: "info" as const,
+    }),
     scope: () => ({ owner: "tester", boardName: "Board" }),
     emitResult: () => {},
   };
-  return { host, pushed };
+  return { host };
 }
 
 function serviceWith(state: Record<string, unknown>) {
-  const { host, pushed } = hostSpy();
+  const { host } = hostSpy();
   const service = new DocumentExtractService({
     uuid: "extract-1",
     serviceId: "document-extract",
@@ -66,11 +66,26 @@ function serviceWith(state: Record<string, unknown>) {
   } as any);
   service.setHost(host);
   const notifications: unknown[] = [];
+  const notify = (payload: unknown) => notifications.push(payload);
+  const answers: unknown[] = [];
   return {
     service,
-    pushed,
+    answers,
     notifications,
-    notify: (payload: unknown) => notifications.push(payload),
+    notify,
+    /**
+     * Calls the service the way the runtime does: what it answers — now, or
+     * once the text has been read — is what the pipeline goes on with.
+     */
+    process: (input: unknown) => {
+      const answer = service.process(input, notify);
+      void Promise.resolve(answer).then((value) => {
+        if (value !== null && value !== undefined) {
+          answers.push(value);
+        }
+      });
+      return answer;
+    },
   };
 }
 
@@ -90,9 +105,9 @@ async function quietPass(
   t: ReturnType<typeof serviceWith>,
   input: unknown,
 ): Promise<void> {
-  t.service.process(input, t.notify);
+  t.process(input);
   await new Promise((resolve) => setTimeout(resolve, 30));
-  expect(t.pushed).toEqual([]);
+  expect(t.answers).toEqual([]);
 }
 
 function errorText(notifications: unknown[]): string {
@@ -106,17 +121,17 @@ describe("document-extract input", () => {
   it("reads what http-client brought back", async () => {
     // {meta, binary} is the shape http-client and http-server-subservices
     // produce, so a fetched document pipes straight in.
-    const asked = stubXberg({ content: "the text", mimeType: "application/pdf" });
+    const asked = stubXberg({
+      content: "the text",
+      mimeType: "application/pdf",
+    });
     const t = serviceWith({});
 
-    t.service.process(
-      {
-        meta: { contentType: "application/pdf", filename: "offer.pdf" },
-        binary: new Uint8Array([1, 2, 3]),
-      },
-      t.notify,
-    );
-    await settled(t.pushed);
+    t.process({
+      meta: { contentType: "application/pdf", filename: "offer.pdf" },
+      binary: new Uint8Array([1, 2, 3]),
+    });
+    await settled(t.answers);
 
     expect(asked[0].input.kind).toBe("bytes");
     expect(asked[0].input.mimeType).toBe("application/pdf");
@@ -128,11 +143,8 @@ describe("document-extract input", () => {
     const asked = stubXberg({ content: "x" });
     const t = serviceWith({});
 
-    t.service.process(
-      new Uint8Array([0x25, 0x50, 0x44, 0x46, 0x2d, 0x31]),
-      t.notify,
-    );
-    await settled(t.pushed);
+    t.process(new Uint8Array([0x25, 0x50, 0x44, 0x46, 0x2d, 0x31]));
+    await settled(t.answers);
 
     expect(asked[0].input.mimeType).toBe("application/pdf");
   });
@@ -140,20 +152,20 @@ describe("document-extract input", () => {
   it("refuses input that carries no document", async () => {
     const t = serviceWith({});
 
-    expect(t.service.process({ unrelated: true }, t.notify)).toBeNull();
+    expect(t.process({ unrelated: true })).toBeNull();
     expect(errorText(t.notifications)).toContain("bytes");
   });
 
   it("says an empty document is empty rather than extracting nothing", async () => {
     const t = serviceWith({});
 
-    t.service.process(
-      { meta: { contentType: "application/pdf" }, binary: new Uint8Array() },
-      t.notify,
-    );
+    t.process({
+      meta: { contentType: "application/pdf" },
+      binary: new Uint8Array(),
+    });
 
     expect(errorText(t.notifications)).toContain("empty");
-    expect(t.pushed).toEqual([]);
+    expect(t.answers).toEqual([]);
   });
 });
 
@@ -164,8 +176,8 @@ describe("document-extract OCR", () => {
     const asked = stubXberg({ content: "read from the scan" });
     const t = serviceWith({});
 
-    t.service.process(new Uint8Array([1, 2, 3]), t.notify);
-    await settled(t.pushed);
+    t.process(new Uint8Array([1, 2, 3]));
+    await settled(t.answers);
 
     expect(asked[0].config.disableOcr).toBeUndefined();
     expect(asked[0].config.ocr).toMatchObject({ enabled: true });
@@ -177,8 +189,8 @@ describe("document-extract OCR", () => {
     const asked = stubXberg({ content: "text layer" });
     const t = serviceWith({ ocr: "off" });
 
-    t.service.process(new Uint8Array([1, 2, 3]), t.notify);
-    await settled(t.pushed);
+    t.process(new Uint8Array([1, 2, 3]));
+    await settled(t.answers);
 
     expect(asked[0].config.disableOcr).toBe(true);
   });
@@ -189,8 +201,8 @@ describe("document-extract OCR", () => {
     const asked = stubXberg({ content: "read properly this time" });
     const t = serviceWith({ ocr: "force" });
 
-    t.service.process(new Uint8Array([1, 2, 3]), t.notify);
-    await settled(t.pushed);
+    t.process(new Uint8Array([1, 2, 3]));
+    await settled(t.answers);
 
     expect(asked[0].config.forceOcr).toBe(true);
     expect(asked[0].config.disableOcr).toBeUndefined();
@@ -202,8 +214,8 @@ describe("document-extract OCR", () => {
     const asked = stubXberg({ content: "text layer" });
     const t = serviceWith({ ocr: false });
 
-    t.service.process(new Uint8Array([1, 2, 3]), t.notify);
-    await settled(t.pushed);
+    t.process(new Uint8Array([1, 2, 3]));
+    await settled(t.answers);
 
     expect(asked[0].config.disableOcr).toBe(true);
   });
@@ -215,8 +227,8 @@ describe("document-extract OCR", () => {
       ocrLanguage: "deu, eng",
     });
 
-    t.service.process(new Uint8Array([1, 2, 3]), t.notify);
-    await settled(t.pushed);
+    t.process(new Uint8Array([1, 2, 3]));
+    await settled(t.answers);
 
     expect(asked[0].config.ocr).toMatchObject({
       enabled: true,
@@ -231,8 +243,8 @@ describe("document-extract OCR", () => {
     const asked = stubXberg({ content: "text" });
     const t = serviceWith({});
 
-    t.service.process(new Uint8Array([1, 2, 3]), t.notify);
-    await settled(t.pushed);
+    t.process(new Uint8Array([1, 2, 3]));
+    await settled(t.answers);
 
     expect(asked[0].config.ocr.backend).toBeUndefined();
     expect(asked[0].config.ocr.language).toBeUndefined();
@@ -250,8 +262,8 @@ describe("document-extract yield", () => {
     });
     const t = serviceWith({});
 
-    t.service.process(new Uint8Array([1, 2, 3]), t.notify);
-    const result = await settled(t.pushed);
+    t.process(new Uint8Array([1, 2, 3]));
+    const result = await settled(t.answers);
 
     expect(result.pages).toBe(12);
     expect(result.charsPerPage).toBeLessThan(10);
@@ -266,8 +278,8 @@ describe("document-extract yield", () => {
     });
     const t = serviceWith({});
 
-    t.service.process(new Uint8Array([1, 2, 3]), t.notify);
-    const result = await settled(t.pushed);
+    t.process(new Uint8Array([1, 2, 3]));
+    const result = await settled(t.answers);
 
     expect(result.charsPerPage).toBe(2000);
     expect(result.sparse).toBe(false);
@@ -283,8 +295,8 @@ describe("document-extract yield", () => {
     });
     const t = serviceWith({});
 
-    t.service.process(new Uint8Array([1, 2, 3]), t.notify);
-    const result = await settled(t.pushed);
+    t.process(new Uint8Array([1, 2, 3]));
+    const result = await settled(t.answers);
 
     expect(result.charsPerPage).toBe(250);
     // Dense enough by character count, and still sparse.
@@ -298,8 +310,8 @@ describe("document-extract yield", () => {
     stubXberg({ content: "x".repeat(500), counts: { pages: 0 } });
     const t = serviceWith({});
 
-    t.service.process(new Uint8Array([1, 2, 3]), t.notify);
-    const result = await settled(t.pushed);
+    t.process(new Uint8Array([1, 2, 3]));
+    const result = await settled(t.answers);
 
     expect(result.charsPerPage).toBe(500);
     expect(result.sparse).toBe(false);
@@ -309,8 +321,8 @@ describe("document-extract yield", () => {
     stubXberg({ content: "x".repeat(300), counts: { pages: 1 } });
     const t = serviceWith({ minCharsPerPage: 1000 });
 
-    t.service.process(new Uint8Array([1, 2, 3]), t.notify);
-    const result = await settled(t.pushed);
+    t.process(new Uint8Array([1, 2, 3]));
+    const result = await settled(t.answers);
 
     expect(result.sparse).toBe(true);
   });
@@ -323,8 +335,8 @@ describe("document-extract output", () => {
     stubXberg({ content: "x".repeat(5000) });
     const t = serviceWith({ maxChars: 100 });
 
-    t.service.process(new Uint8Array([1, 2, 3]), t.notify);
-    const result = await settled(t.pushed);
+    t.process(new Uint8Array([1, 2, 3]));
+    const result = await settled(t.answers);
 
     expect(result.text).toHaveLength(100);
     expect(result.chars).toBe(5000);
@@ -339,8 +351,8 @@ describe("document-extract output", () => {
     });
     const t = serviceWith({});
 
-    t.service.process(new Uint8Array([1, 2, 3]), t.notify);
-    const result = await settled(t.pushed);
+    t.process(new Uint8Array([1, 2, 3]));
+    const result = await settled(t.answers);
 
     expect(result.metadata).toBeUndefined();
     expect(result.tables).toBeUndefined();
@@ -354,8 +366,8 @@ describe("document-extract output", () => {
     });
     const t = serviceWith({ metadata: true, tables: true });
 
-    t.service.process(new Uint8Array([1, 2, 3]), t.notify);
-    const result = await settled(t.pushed);
+    t.process(new Uint8Array([1, 2, 3]));
+    const result = await settled(t.answers);
 
     expect(result.metadata).toEqual({ author: "someone" });
     expect(result.tables).toHaveLength(1);
@@ -365,8 +377,8 @@ describe("document-extract output", () => {
     stubXberg({ content: "text", extractionMethod: "ocr" });
     const t = serviceWith({});
 
-    t.service.process(new Uint8Array([1, 2, 3]), t.notify);
-    const result = await settled(t.pushed);
+    t.process(new Uint8Array([1, 2, 3]));
+    const result = await settled(t.answers);
 
     expect(result.method).toBe("ocr");
   });
@@ -398,11 +410,11 @@ describe("document-extract builtin backend", () => {
   it("reads text without any dependency at all", async () => {
     const t = serviceWith({ backend: "builtin" });
 
-    t.service.process(
-      { meta: { contentType: "text/plain; charset=utf-8" }, body: "hello" },
-      t.notify,
-    );
-    const result = await settled(t.pushed);
+    t.process({
+      meta: { contentType: "text/plain; charset=utf-8" },
+      body: "hello",
+    });
+    const result = await settled(t.answers);
 
     expect(result.text).toBe("hello");
     expect(result.backend).toBe("builtin");
@@ -411,18 +423,15 @@ describe("document-extract builtin backend", () => {
   it("takes the text out of a web page", async () => {
     const t = serviceWith({ backend: "builtin" });
 
-    t.service.process(
-      {
-        meta: { contentType: "text/html" },
-        body:
-          "<html><head><style>p{color:red}</style></head>" +
-          "<body><h1>Adlon</h1><p>25 rooms &amp; breakfast</p>" +
-          "<script>track()</script></body></html>",
-        binary: undefined,
-      },
-      t.notify,
-    );
-    const result = await settled(t.pushed);
+    t.process({
+      meta: { contentType: "text/html" },
+      body:
+        "<html><head><style>p{color:red}</style></head>" +
+        "<body><h1>Adlon</h1><p>25 rooms &amp; breakfast</p>" +
+        "<script>track()</script></body></html>",
+      binary: undefined,
+    });
+    const result = await settled(t.answers);
 
     expect(result.text).toContain("Adlon");
     expect(result.text).toContain("25 rooms & breakfast");

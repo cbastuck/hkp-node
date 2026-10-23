@@ -60,13 +60,10 @@ async function startEndpoint(
 
 /** Captures what the service pushes through the rest of the pipeline. */
 function hostSpy() {
-  const pushed: unknown[] = [];
+  const answers: unknown[] = [];
   const emitted: unknown[] = [];
   const host: RuntimeHost = {
-    processFrom: async (_uuid, data, _onNotification) => {
-      pushed.push(data);
-      return data;
-    },
+    processFrom: async (_uuid, data, _onNotification) => data,
     notify: () => {},
     currentContext: () => null,
     secrets: () => new SecretVault(),
@@ -82,19 +79,38 @@ function hostSpy() {
       emitted.push(output);
     },
   };
-  return { host, pushed, emitted };
+  return { host, answers, emitted };
 }
 
-/** Resolves once the service has pushed a result, or throws on timeout. */
-async function nextPush(pushed: unknown[]): Promise<any> {
+/**
+ * Calls the service the way the runtime does: what it answers — now, or once
+ * the response arrives — is what the pipeline goes on with, kept in `answers`.
+ */
+function call(
+  service: HttpClientService,
+  answers: unknown[],
+  input: unknown,
+  notify: (payload: any) => void = () => {},
+): unknown {
+  const answer = service.process(input, notify);
+  void Promise.resolve(answer).then((value) => {
+    if (value !== null && value !== undefined) {
+      answers.push(value);
+    }
+  });
+  return answer;
+}
+
+/** Resolves once the service has answered with a result, or throws on timeout. */
+async function nextAnswer(answers: unknown[]): Promise<any> {
   const deadline = Date.now() + 2000;
-  while (pushed.length === 0) {
+  while (answers.length === 0) {
     if (Date.now() > deadline) {
-      throw new Error("service pushed no result");
+      throw new Error("service answered no result");
     }
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
-  return pushed[0];
+  return answers[0];
 }
 
 const endpoints: Endpoint[] = [];
@@ -119,7 +135,7 @@ describe("http-client target", () => {
       contentType: "application/json",
       body: JSON.stringify({ ok: true }),
     }));
-    const { host, pushed, emitted } = hostSpy();
+    const { host, emitted } = hostSpy();
 
     const service = new HttpClientService({
       uuid: "client-1",
@@ -128,20 +144,18 @@ describe("http-client target", () => {
     } as any);
     service.setHost(host);
 
-    // The pipeline is synchronous, so the response cannot be returned from
-    // process — it does not exist yet. It arrives through processFrom instead.
-    expect(service.process(undefined, () => {})).toBeNull();
-
-    const result = await nextPush(pushed);
+    // The response is the answer: the runtime awaits it and goes on with it,
+    // which is what lets a Join or an Iterator read it back.
+    const result: any = await service.process(undefined, () => {});
     expect(target.received[0].path).toBe("/hello");
     expect(result.meta.status).toBe(200);
     expect(result.body).toEqual({ ok: true });
-    // Nothing downstream stopped, so the runtime's result is emitted onward.
-    expect(emitted).toHaveLength(1);
+    // Going on is the runtime's business now, not the service's.
+    expect(emitted).toHaveLength(0);
   });
 
   it("waits rather than calling anything while a reference is unresolved", async () => {
-    const { host, pushed } = hostSpy();
+    const { host, answers } = hostSpy();
     const notifications: any[] = [];
 
     const service = new HttpClientService({
@@ -155,7 +169,7 @@ describe("http-client target", () => {
     // there is nothing to call — a normal state while a board comes up.
     expect(service.process(undefined, (n) => notifications.push(n))).toBeNull();
     await new Promise((resolve) => setTimeout(resolve, 50));
-    expect(pushed).toEqual([]);
+    expect(answers).toEqual([]);
     expect(notifications[0].error).toContain("hkp-mount://other/peer-1");
   });
 
@@ -164,7 +178,7 @@ describe("http-client target", () => {
       contentType: "text/plain",
       body: "live",
     }));
-    const { host, pushed } = hostSpy();
+    const { host, answers } = hostSpy();
 
     const service = new HttpClientService({
       uuid: "client-1",
@@ -172,21 +186,21 @@ describe("http-client target", () => {
       state: { __hkpMount: "hkp-mount://other/peer-1" },
     } as any);
     service.setHost(host);
-    service.process(undefined, () => {});
+    call(service, answers, undefined, () => {});
 
     // This is what a coordinator does once the owner publishes its address.
     const state = service.configure({ __hkpMount: target.url });
     expect(state.__hkpMount).toBe(target.url);
 
-    service.process(undefined, () => {});
-    expect((await nextPush(pushed)).body).toBe("live");
+    call(service, answers, undefined, () => {});
+    expect((await nextAnswer(answers)).body).toBe("live");
   });
 
   it("waits while a reference sits in the url it was given", async () => {
     // The field a person writes is the one the service already calls its
     // target. A reference there names a service whose address nobody has
     // published, so there is nothing to call.
-    const { host, pushed } = hostSpy();
+    const { host, answers } = hostSpy();
     const notifications: any[] = [];
 
     const service = new HttpClientService({
@@ -198,7 +212,7 @@ describe("http-client target", () => {
 
     expect(service.process(undefined, (n) => notifications.push(n))).toBeNull();
     await new Promise((resolve) => setTimeout(resolve, 50));
-    expect(pushed).toEqual([]);
+    expect(answers).toEqual([]);
     expect(notifications[0].error).toContain("hkp-mount://other/peer-1");
   });
 
@@ -210,7 +224,7 @@ describe("http-client target", () => {
       contentType: "text/plain",
       body: "live",
     }));
-    const { host, pushed } = hostSpy();
+    const { host, answers } = hostSpy();
 
     const service = new HttpClientService({
       uuid: "client-1",
@@ -223,13 +237,13 @@ describe("http-client target", () => {
     expect(state.url).toBe("hkp-mount://other/peer-1");
     expect(state.__hkpMount).toBe(target.url);
 
-    service.process(undefined, () => {});
-    expect((await nextPush(pushed)).body).toBe("live");
+    call(service, answers, undefined, () => {});
+    expect((await nextAnswer(answers)).body).toBe("live");
   });
 
   it("appends the configured parameters, encoded", async () => {
     const target = await endpoint(() => ({ body: "ok" }));
-    const { host, pushed } = hostSpy();
+    const { host, answers } = hostSpy();
 
     const service = new HttpClientService({
       uuid: "client-1",
@@ -242,15 +256,15 @@ describe("http-client target", () => {
       },
     } as any);
     service.setHost(host);
-    service.process(undefined, () => {});
-    await nextPush(pushed);
+    call(service, answers, undefined, () => {});
+    await nextAnswer(answers);
 
     expect(target.received[0].path).toBe("/search?q=a+b%26c&page=2&draft=true");
   });
 
   it("keeps the parameters the target already carries", async () => {
     const target = await endpoint(() => ({ body: "ok" }));
-    const { host, pushed } = hostSpy();
+    const { host, answers } = hostSpy();
 
     const service = new HttpClientService({
       uuid: "client-1",
@@ -261,15 +275,15 @@ describe("http-client target", () => {
       },
     } as any);
     service.setHost(host);
-    service.process(undefined, () => {});
-    await nextPush(pushed);
+    call(service, answers, undefined, () => {});
+    await nextAnswer(answers);
 
     expect(target.received[0].path).toBe("/search?q=written&page=2");
   });
 
   it("joins the path to the address without doubling the slash", async () => {
     const target = await endpoint(() => ({ body: "ok" }));
-    const { host, pushed } = hostSpy();
+    const { host, answers } = hostSpy();
 
     const service = new HttpClientService({
       uuid: "client-1",
@@ -277,8 +291,8 @@ describe("http-client target", () => {
       state: { __hkpMount: `${target.url}/`, path: "/x" },
     } as any);
     service.setHost(host);
-    service.process(undefined, () => {});
-    await nextPush(pushed);
+    call(service, answers, undefined, () => {});
+    await nextAnswer(answers);
 
     expect(target.received[0].path).toBe("/x");
   });
@@ -294,7 +308,7 @@ describe("http-client target", () => {
 describe("http-client and a request that says where it is going", () => {
   it("takes the mount sub-path from the input's meta", async () => {
     const target = await endpoint(() => ({ body: "{}" }));
-    const { host, pushed } = hostSpy();
+    const { host, answers } = hostSpy();
 
     const service = new HttpClientService({
       uuid: "client-1",
@@ -303,14 +317,16 @@ describe("http-client and a request that says where it is going", () => {
     } as any);
     service.setHost(host);
 
-    service.process(
+    call(
+      service,
+      answers,
       {
         meta: { path: "/episodes/one.mp3", contentType: "audio/mpeg" },
         binary: new Uint8Array([1, 2, 3]),
       },
       () => {},
     );
-    await nextPush(pushed);
+    await nextAnswer(answers);
 
     expect(target.received[0].path).toBe("/episodes/one.mp3");
     expect(target.received[0].method).toBe("PUT");
@@ -320,7 +336,7 @@ describe("http-client and a request that says where it is going", () => {
 
   it("takes the method too, and leaves what the input did not say", async () => {
     const target = await endpoint(() => ({ body: "{}" }));
-    const { host, pushed } = hostSpy();
+    const { host, answers } = hostSpy();
 
     const service = new HttpClientService({
       uuid: "client-1",
@@ -329,12 +345,62 @@ describe("http-client and a request that says where it is going", () => {
     } as any);
     service.setHost(host);
 
-    service.process({ meta: { method: "delete" }, body: {} }, () => {});
-    await nextPush(pushed);
+    call(service, answers, { meta: { method: "delete" }, body: {} }, () => {});
+    await nextAnswer(answers);
 
     expect(target.received[0].method).toBe("DELETE");
     // Unsaid, so still the configured one.
     expect(target.received[0].path).toBe("/configured");
+  });
+
+  it("calls the url the input names in place of the configured one", async () => {
+    const configured = await endpoint(() => ({ body: "{}" }));
+    const named = await endpoint(() => ({ body: "{}" }));
+    const { host, answers } = hostSpy();
+
+    const service = new HttpClientService({
+      uuid: "client-1",
+      serviceId: "http-client",
+      state: { url: `${configured.url}/configured`, query: { lang: "en" } },
+    } as any);
+    service.setHost(host);
+
+    call(
+      service,
+      answers,
+      { meta: { url: `${named.url}/articles/one` } },
+      () => {},
+    );
+    await nextAnswer(answers);
+
+    expect(configured.received).toHaveLength(0);
+    expect(named.received[0].path).toBe("/articles/one?lang=en");
+  });
+
+  it("keeps calling a resolved mount, whatever url the input names", async () => {
+    // A url in the input stands in for the url field, and a mount wins over
+    // that field: a board naming a service means that service.
+    const mount = await endpoint(() => ({ body: "{}" }));
+    const named = await endpoint(() => ({ body: "{}" }));
+    const { host, answers } = hostSpy();
+
+    const service = new HttpClientService({
+      uuid: "client-1",
+      serviceId: "http-client",
+      state: { __hkpMount: mount.url, path: "/configured" },
+    } as any);
+    service.setHost(host);
+
+    call(
+      service,
+      answers,
+      { meta: { url: `${named.url}/elsewhere` } },
+      () => {},
+    );
+    await nextAnswer(answers);
+
+    expect(named.received).toHaveLength(0);
+    expect(mount.received[0].path).toBe("/configured");
   });
 });
 
@@ -343,15 +409,15 @@ describe("http-client request body", () => {
     const target = await endpoint(() => ({ body: "ok" }));
 
     const send = async (input: unknown) => {
-      const { host, pushed } = hostSpy();
+      const { host, answers } = hostSpy();
       const service = new HttpClientService({
         uuid: "client-1",
         serviceId: "http-client",
         state: { __hkpMount: target.url, method: "post" },
       } as any);
       service.setHost(host);
-      service.process(input, () => {});
-      await nextPush(pushed);
+      call(service, answers, input, () => {});
+      await nextAnswer(answers);
     };
 
     await send("plain text");
@@ -367,7 +433,7 @@ describe("http-client request body", () => {
     // {meta, body} is what http-server-subservices produces, so a request taken
     // in on one runtime can be sent on from another without reshaping it.
     const target = await endpoint(() => ({ body: "ok" }));
-    const { host, pushed } = hostSpy();
+    const { host, answers } = hostSpy();
 
     const service = new HttpClientService({
       uuid: "client-1",
@@ -375,11 +441,13 @@ describe("http-client request body", () => {
       state: { __hkpMount: target.url, method: "post" },
     } as any);
     service.setHost(host);
-    service.process(
+    call(
+      service,
+      answers,
       { meta: { contentType: "application/json" }, body: { forwarded: true } },
       () => {},
     );
-    await nextPush(pushed);
+    await nextAnswer(answers);
 
     expect(target.received[0].contentType).toBe("application/json");
     expect(JSON.parse(target.received[0].body.toString())).toEqual({
@@ -389,7 +457,7 @@ describe("http-client request body", () => {
 
   it("sends no body on GET", async () => {
     const target = await endpoint(() => ({ body: "ok" }));
-    const { host, pushed } = hostSpy();
+    const { host, answers } = hostSpy();
 
     const service = new HttpClientService({
       uuid: "client-1",
@@ -397,8 +465,8 @@ describe("http-client request body", () => {
       state: { __hkpMount: target.url },
     } as any);
     service.setHost(host);
-    service.process({ ignored: true }, () => {});
-    await nextPush(pushed);
+    call(service, answers, { ignored: true }, () => {});
+    await nextAnswer(answers);
 
     expect(target.received[0].body.byteLength).toBe(0);
   });
@@ -415,23 +483,22 @@ describe("http-client response", () => {
           },
     );
 
-    const call = async (path: string) => {
-      const { host, pushed } = hostSpy();
+    const fetchPath = async (path: string): Promise<any> => {
+      const { host } = hostSpy();
       const service = new HttpClientService({
         uuid: "client-1",
         serviceId: "http-client",
         state: { __hkpMount: target.url, path },
       } as any);
       service.setHost(host);
-      service.process(undefined, () => {});
-      return nextPush(pushed);
+      return service.process(undefined, () => {});
     };
 
-    const json = await call("/json");
+    const json = await fetchPath("/json");
     expect(json.body).toEqual({ n: 1 });
     expect(json.binary).toBeUndefined();
 
-    const bytes = await call("/blob");
+    const bytes = await fetchPath("/blob");
     expect(bytes.body).toBeUndefined();
     expect([...bytes.binary]).toEqual([1, 2, 3]);
   });
@@ -441,7 +508,7 @@ describe("http-client response", () => {
       contentType: "text/plain",
       body: "ok",
     }));
-    const { host, pushed } = hostSpy();
+    const { host, answers } = hostSpy();
 
     const service = new HttpClientService({
       uuid: "client-1",
@@ -449,16 +516,16 @@ describe("http-client response", () => {
       state: { url: target.url },
     } as any);
     service.setHost(host);
-    service.process(undefined, () => {});
+    call(service, answers, undefined, () => {});
 
-    const result = await nextPush(pushed);
+    const result = await nextAnswer(answers);
     expect(result.meta.headers["content-type"]).toBe("text/plain");
   });
 
   it("passes a failure status on as a result rather than an error", async () => {
     // The request completed; what the server said is the pipeline's business.
     const target = await endpoint(() => ({ status: 404, body: "nope" }));
-    const { host, pushed } = hostSpy();
+    const { host, answers } = hostSpy();
 
     const service = new HttpClientService({
       uuid: "client-1",
@@ -466,13 +533,13 @@ describe("http-client response", () => {
       state: { __hkpMount: target.url },
     } as any);
     service.setHost(host);
-    service.process(undefined, () => {});
+    call(service, answers, undefined, () => {});
 
-    expect((await nextPush(pushed)).meta.status).toBe(404);
+    expect((await nextAnswer(answers)).meta.status).toBe(404);
   });
 
-  it("pushes nothing when the request itself fails", async () => {
-    const { host, pushed } = hostSpy();
+  it("answers nothing when the request itself fails", async () => {
+    const { host, answers } = hostSpy();
     const notifications: any[] = [];
 
     const service = new HttpClientService({
@@ -482,11 +549,11 @@ describe("http-client response", () => {
       state: { __hkpMount: "http://127.0.0.1:1/", timeoutMs: 500 },
     } as any);
     service.setHost(host);
-    service.process(undefined, (n) => notifications.push(n));
+    call(service, answers, undefined, (n) => notifications.push(n));
     await new Promise((resolve) => setTimeout(resolve, 200));
 
     // No fabricated result travels down the pipeline.
-    expect(pushed).toEqual([]);
+    expect(answers).toEqual([]);
     expect(notifications.some((n) => n.error)).toBe(true);
   });
 });
@@ -494,7 +561,7 @@ describe("http-client response", () => {
 describe("http-client and the shared http-client contract", () => {
   it("calls the url the shared UI configures when no mount is set", async () => {
     const target = await endpoint(() => ({ body: "ok" }));
-    const { host, pushed } = hostSpy();
+    const { host, answers } = hostSpy();
 
     const service = new HttpClientService({
       uuid: "client-1",
@@ -502,8 +569,8 @@ describe("http-client and the shared http-client contract", () => {
       state: { url: `${target.url}/plain` },
     } as any);
     service.setHost(host);
-    service.process(undefined, () => {});
-    await nextPush(pushed);
+    call(service, answers, undefined, () => {});
+    await nextAnswer(answers);
 
     expect(target.received[0].path).toBe("/plain");
   });
@@ -513,7 +580,7 @@ describe("http-client and the shared http-client contract", () => {
     // own path, so appending a second one would call somewhere the board did
     // not write.
     const target = await endpoint(() => ({ body: "ok" }));
-    const { host, pushed } = hostSpy();
+    const { host, answers } = hostSpy();
 
     const service = new HttpClientService({
       uuid: "client-1",
@@ -521,8 +588,8 @@ describe("http-client and the shared http-client contract", () => {
       state: { url: `${target.url}/written`, path: "/ignored" },
     } as any);
     service.setHost(host);
-    service.process(undefined, () => {});
-    await nextPush(pushed);
+    call(service, answers, undefined, () => {});
+    await nextAnswer(answers);
 
     expect(target.received[0].path).toBe("/written");
   });
@@ -532,7 +599,7 @@ describe("http-client and the shared http-client contract", () => {
     // knowable when the board is written.
     const mounted = await endpoint(() => ({ body: "mounted" }));
     const typed = await endpoint(() => ({ body: "typed" }));
-    const { host, pushed } = hostSpy();
+    const { host, answers } = hostSpy();
 
     const service = new HttpClientService({
       uuid: "client-1",
@@ -540,8 +607,8 @@ describe("http-client and the shared http-client contract", () => {
       state: { url: typed.url, __hkpMount: mounted.url },
     } as any);
     service.setHost(host);
-    service.process(undefined, () => {});
-    await nextPush(pushed);
+    call(service, answers, undefined, () => {});
+    await nextAnswer(answers);
 
     expect(mounted.received).toHaveLength(1);
     expect(typed.received).toEqual([]);
@@ -550,7 +617,7 @@ describe("http-client and the shared http-client contract", () => {
   it("waits on an unresolved mount instead of falling back to url", async () => {
     // Falling back would silently call something the board did not ask for.
     const typed = await endpoint(() => ({ body: "typed" }));
-    const { host, pushed } = hostSpy();
+    const { host, answers } = hostSpy();
 
     const service = new HttpClientService({
       uuid: "client-1",
@@ -558,16 +625,16 @@ describe("http-client and the shared http-client contract", () => {
       state: { url: typed.url, __hkpMount: "hkp-mount://other/svc" },
     } as any);
     service.setHost(host);
-    service.process(undefined, () => {});
+    call(service, answers, undefined, () => {});
     await new Promise((resolve) => setTimeout(resolve, 50));
 
     expect(typed.received).toEqual([]);
-    expect(pushed).toEqual([]);
+    expect(answers).toEqual([]);
   });
 
   it("sends the configured body when the pipeline provides none", async () => {
     const target = await endpoint(() => ({ body: "ok" }));
-    const { host, pushed } = hostSpy();
+    const { host, answers } = hostSpy();
 
     const service = new HttpClientService({
       uuid: "client-1",
@@ -575,15 +642,15 @@ describe("http-client and the shared http-client contract", () => {
       state: { url: target.url, method: "post", body: "from state" },
     } as any);
     service.setHost(host);
-    service.process(undefined, () => {});
-    await nextPush(pushed);
+    call(service, answers, undefined, () => {});
+    await nextAnswer(answers);
 
     expect(target.received[0].body.toString()).toBe("from state");
   });
 
   it("sends the configured user agent", async () => {
     const target = await endpoint(() => ({ body: "ok" }));
-    const { host, pushed } = hostSpy();
+    const { host, answers } = hostSpy();
 
     const service = new HttpClientService({
       uuid: "client-1",
@@ -591,8 +658,8 @@ describe("http-client and the shared http-client contract", () => {
       state: { url: target.url, userAgent: "hkp-test/1.0" },
     } as any);
     service.setHost(host);
-    service.process(undefined, () => {});
-    await nextPush(pushed);
+    call(service, answers, undefined, () => {});
+    await nextAnswer(answers);
 
     expect(target.received[0].userAgent).toBe("hkp-test/1.0");
   });
@@ -601,7 +668,7 @@ describe("http-client and the shared http-client contract", () => {
 describe("http-client notifications", () => {
   it("names the method and says there is no error on a request that worked", async () => {
     const target = await endpoint(() => ({ body: "ok" }));
-    const { host, pushed } = hostSpy();
+    const { host, answers } = hostSpy();
     const notifications: any[] = [];
 
     const service = new HttpClientService({
@@ -610,8 +677,8 @@ describe("http-client notifications", () => {
       state: { url: target.url, method: "post" },
     } as any);
     service.setHost(host);
-    service.process("payload", (payload) => notifications.push(payload));
-    await nextPush(pushed);
+    call(service, answers, "payload", (payload) => notifications.push(payload));
+    await nextAnswer(answers);
 
     // A panel showing one of these has to be able to read the whole outcome off
     // it: which request this was, and that nothing went wrong with it — an

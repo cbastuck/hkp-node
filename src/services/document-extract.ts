@@ -8,8 +8,7 @@
  *             ocrLanguage, tables, metadata, maxChars, minCharsPerPage,
  *             minTextCoverage
  * IO: in=bytes to read ({meta, binary} | Uint8Array | {meta, body} | String)
- *     out=null immediately; the text is pushed through the rest of the
- *     pipeline when extraction finishes, shaped
+ *     out=the text once extraction finishes, shaped
  *     { text, chars, pages, charsPerPage, sparse, method, format, backend,
  *       durationMs, textCoverage?, confidence?, metadata?, tables? }
  *
@@ -48,9 +47,7 @@
 import {
   HostedService,
   JsonRecord,
-  ProcessContext,
   RuntimeHost,
-  RuntimeNotification,
   ServiceConfiguration,
   ServiceRegistryEntry,
 } from "../types";
@@ -317,11 +314,12 @@ export class DocumentExtractService implements HostedService {
   }
 
   /**
-   * Starts the extraction and stops the synchronous push.
+   * Answers with the text, once it has been read.
    *
-   * Reading a document takes long enough to matter and the runtime calls
-   * services one after another without awaiting, so the text cannot be returned
-   * from here — the rest of the pipeline is called with it once it exists.
+   * Reading a document takes long enough to matter; the runtime awaits what a
+   * service answers, so the text is returned rather than pushed down the
+   * pipeline by hand — which is what lets a Join hold an extraction as a
+   * detour and come back with it beside what it already had.
    */
   process(input: unknown, notify: Notify): unknown {
     if (input === null || input === undefined) {
@@ -339,12 +337,7 @@ export class DocumentExtractService implements HostedService {
       return this.fail(notify, "nothing to read: the document is empty");
     }
 
-    void this.extract(
-      source,
-      notify,
-      this.host?.currentContext() ?? undefined,
-    );
-    return null;
+    return this.extract(source, notify);
   }
 
   destroy(): void {
@@ -356,8 +349,7 @@ export class DocumentExtractService implements HostedService {
   private async extract(
     source: Source,
     notify: Notify,
-    context?: ProcessContext,
-  ): Promise<void> {
+  ): Promise<JsonRecord | null> {
     this.setStatus(notify, "extracting");
     const started = Date.now();
 
@@ -368,16 +360,16 @@ export class DocumentExtractService implements HostedService {
           : await this.extractXberg(source);
       if (!result) {
         // Already reported; nothing is passed on.
-        return;
+        return null;
       }
 
       const output = this.shape(result, source, started);
       this.setStatus(notify, "idle");
       notify(output);
-      await this.push(output, notify, context);
+      return output;
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      this.fail(notify, `extraction failed: ${message}`);
+      return this.fail(notify, `extraction failed: ${message}`);
     }
   }
 
@@ -562,27 +554,6 @@ export class DocumentExtractService implements HostedService {
       };
     }
     return null;
-  }
-
-  private async push(
-    result: JsonRecord,
-    notify: Notify,
-    context?: ProcessContext,
-  ): Promise<void> {
-    if (!this.host) {
-      return;
-    }
-    const output = await this.host.processFrom(
-      this.uuid,
-      result,
-      // No-op: the runtime already fans these out to its notification
-      // targets. Re-notifying through `notify` would deliver every one twice.
-      (_n: RuntimeNotification) => {},
-      context,
-    );
-    if (output !== null && output !== undefined) {
-      this.host.emitResult(output);
-    }
   }
 
   private setStatus(notify: Notify, status: string): void {
