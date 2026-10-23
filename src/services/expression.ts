@@ -27,9 +27,16 @@
  */
 import { randomUUID } from "node:crypto";
 
-import { evaluate as evaluateAst, parse } from "../expressionEval";
+import { OnMissing, evaluate as evaluateAst, parse } from "../expressionEval";
 
-export type CompiledExpression = (params: unknown) => unknown;
+/**
+ * A compiled term. `onMissing` hears about every read that found nothing
+ * (expressionEval.ts); `parseError` says why a source that did not parse
+ * will throw, so a caller can report it before the term ever runs.
+ */
+export type CompiledExpression = ((params: unknown, onMissing?: OnMissing) => unknown) & {
+  parseError?: string;
+};
 
 const MONTHS = [
   "January",
@@ -377,7 +384,8 @@ export function withoutUrls(value: unknown): string {
 /**
  * Compiles an expression source into a callable. Non-string sources are
  * constants and are returned as-is; a source that does not parse throws when
- * called, so the caller decides how a broken term is reported.
+ * called and carries `parseError`, so the caller decides how a broken term is
+ * reported.
  *
  * Parsing happens once, evaluation once per pass — the same split the old
  * `new Function` had, so a template still costs one compile and not one per
@@ -393,12 +401,17 @@ export function compileExpression(source: unknown): CompiledExpression {
     ast = parse(source);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    return () => {
-      throw new Error(`invalid expression '${source}': ${message}`);
-    };
+    const parseError = `invalid expression '${source}': ${message}`;
+    return Object.assign(
+      () => {
+        throw new Error(parseError);
+      },
+      { parseError },
+    );
   }
 
   // `params` names the input, and the helpers sit beside it — the same scope
   // the browser builds, so the same term resolves the same names.
-  return (params: unknown) => evaluateAst(ast, { params, ...globalScope });
+  return (params: unknown, onMissing?: OnMissing) =>
+    evaluateAst(ast, { params, ...globalScope }, onMissing);
 }

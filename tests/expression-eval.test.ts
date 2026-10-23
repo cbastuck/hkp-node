@@ -80,6 +80,38 @@ describe("an expression", () => {
 
   it("refuses to call what is not a function", () => {
     expect(() => run("x()", { x: 1 })).toThrow(TypeError);
-    expect(() => run("missing()")).toThrow(TypeError);
+    expect(() => run("missing()")).toThrow(/missing is not a function/);
+  });
+
+  it("reads a member of nothing as nothing, as hkp-rt and hkp-python do", () => {
+    const scope = { params: { a: { b: 1 }, none: null } };
+    expect(run("params.x", scope)).toBeUndefined();
+    expect(run("params.x.y.z", scope)).toBeUndefined();
+    expect(run("params.none.y", scope)).toBeUndefined();
+    expect(run("params.x.y", {})).toBeUndefined();
+    expect(run("params.x.y || 'fallback'", scope)).toBe("fallback");
+    expect(run("params.a.b", scope)).toBe(1);
+    // A member of nothing is still refused by name.
+    expect(() => run("params.x.constructor", scope)).toThrow(/disallowed/);
+  });
+
+  it("reports the reads that found nothing, once per chain", () => {
+    const scope = { params: { a: { b: 1 }, list: [1], none: null } };
+    const reads = (source: string, s: Record<string, unknown> = scope) => {
+      const missing: string[] = [];
+      evaluate(parse(source), s, (path) => missing.push(path));
+      return missing;
+    };
+    expect(reads("params.a.b")).toEqual([]);
+    expect(reads("params.titel")).toEqual(["params.titel"]);
+    expect(reads("params.x.y.z")).toEqual(["params.x"]);
+    expect(reads("params.a.c")).toEqual(["params.a.c"]);
+    expect(reads("params.list[3]")).toEqual(["params.list[3]"]);
+    expect(reads("params['x y']")).toEqual(['params["x y"]']);
+    expect(reads("params.id || params.link")).toEqual(["params.id", "params.link"]);
+    // Present, if empty, is not missing.
+    expect(reads("params.none")).toEqual([]);
+    // No input at all: the first read of it is what is missing.
+    expect(reads("params.title", { params: undefined })).toEqual(["params.title"]);
   });
 });

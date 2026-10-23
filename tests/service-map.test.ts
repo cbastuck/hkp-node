@@ -123,10 +123,85 @@ describe("MapService — flat templates", () => {
     expect(map.process([1, 2, 3], noopNotify)).toEqual({ count: 3 });
   });
 
-  it("returns the input unchanged when an expression fails", () => {
-    const map = createMap({ template: { "x=": "params.missing.deep" } });
+});
 
-    expect(map.process({ value: 1 }, noopNotify)).toEqual({ value: 1 });
+/**
+ * What a pass says about itself — the same in every runtime (browser Map.ts,
+ * hkp-python map_service.py, hkp-rt map.h).
+ */
+describe("MapService — missing reads, warnings and errors", () => {
+  function reported(host: RecordingHost) {
+    return host.notifications.map((n) => n.payload);
+  }
+
+  it("maps a read that found nothing to null, and warns", () => {
+    const map = createMap({ template: { "title=": "params.titel", "x=": "params.missing.deep" } });
+    const host = createHost();
+    map.setHost(host);
+
+    expect(map.process({ title: "Hello" }, noopNotify)).toEqual({ title: null, x: null });
+    expect(reported(host)).toEqual([
+      { warnings: ["title: params.titel not found", "x: params.missing not found"] },
+    ]);
+  });
+
+  it("does not warn about a read that a fallback covered, or a value that is null", () => {
+    const map = createMap({
+      template: { "slug=": "params.id || params.link", "none=": "params.none" },
+    });
+    const host = createHost();
+    map.setHost(host);
+
+    expect(map.process({ link: "l", none: null }, noopNotify)).toEqual({ slug: "l", none: null });
+    expect(reported(host)).toEqual([]);
+  });
+
+  it("builds the template without input", () => {
+    const map = createMap({ template: { "text=": "'Today is ' + string(1 + 1)" } });
+
+    expect(map.process(undefined, noopNotify)).toEqual({ text: "Today is 2" });
+  });
+
+  it("stops the flow on a failing term, says why, and clears it once it works", () => {
+    const map = createMap({ template: { "x=": "params.n.toFixed(1)" } });
+    const host = createHost();
+    map.setHost(host);
+
+    expect(map.process({}, noopNotify)).toBeNull();
+    expect(map.process({ n: 2 }, noopNotify)).toEqual({ x: "2.0" });
+    // A failing term is the error alone: what it read is not also a warning.
+    expect(reported(host)).toEqual([
+      { error: "x: params.n.toFixed is not a function" },
+      { error: "" },
+    ]);
+  });
+
+  it("fails an array input when one element fails", () => {
+    const map = createMap({ template: { "x=": "params.n.toFixed(1)" } });
+
+    expect(map.process([{ n: 1 }, {}], noopNotify)).toBeNull();
+  });
+
+  it("says a term does not parse as soon as it is configured", () => {
+    const map = createMap();
+    const host = createHost();
+    map.setHost(host);
+
+    map.configure({ template: { "x=": "nope(" } });
+
+    expect(reported(host)[1]).toEqual({
+      error: expect.stringMatching(/^x: invalid expression 'nope\('/),
+    });
+    expect(map.process({}, noopNotify)).toBeNull();
+  });
+
+  it("names a term in a structured template by where it sits", () => {
+    const map = createMap({ template: { items: [{ "title=": "params.titel" }] } });
+    const host = createHost();
+    map.setHost(host);
+
+    expect(map.process({}, noopNotify)).toEqual({ items: [{ title: null }] });
+    expect(reported(host)).toEqual([{ warnings: ["items.0.title: params.titel not found"] }]);
   });
 });
 
