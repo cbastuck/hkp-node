@@ -103,8 +103,8 @@ describe("what an expression can still do", () => {
 
 describe("a Map template that tries to escape", () => {
   it("maps nothing rather than running anything", () => {
-    // Map treats a failing template as a reason to pass the input along
-    // unchanged, so the board degrades to identity instead of to a shell.
+    // Map treats a failing template as a reason to stop the flow and say why,
+    // so the board stops there instead of reaching a shell.
     const service = new MapService({
       uuid: "m",
       serviceId: "map",
@@ -118,7 +118,7 @@ describe("a Map template that tries to escape", () => {
     } as never);
 
     const input = { subject: "Anfrage" };
-    expect(service.process(input, () => {})).toEqual(input);
+    expect(service.process(input, () => {})).toBeNull();
   });
 });
 
