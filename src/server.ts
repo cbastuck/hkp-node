@@ -11,6 +11,7 @@ import { MapService, mapDescriptor } from "./services/map";
 import { MonitorService, monitorDescriptor } from "./services/monitor";
 import { SubService, subServiceDescriptor } from "./services/sub-service";
 import { IteratorService, iteratorDescriptor } from "./services/iterator";
+import { GatherService, gatherDescriptor } from "./services/gather";
 import { TracksService, tracksDescriptor } from "./services/tracks";
 import {
   CommunicationDispatcherService,
@@ -439,6 +440,14 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
         descriptor: iteratorDescriptor,
         create: (config, createService) =>
           new IteratorService(config, createService),
+      },
+    ],
+    [
+      gatherDescriptor.serviceId,
+      {
+        descriptor: gatherDescriptor,
+        create: (config, createService) =>
+          new GatherService(config, createService),
       },
     ],
     [

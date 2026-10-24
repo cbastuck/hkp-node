@@ -159,3 +159,19 @@ describe("text on its way to a voice", () => {
     expect(evaluate("withoutUrls(params.n)", { n: 48 })).toBe("48");
   });
 });
+
+describe("joining what was collected", () => {
+  it("makes one text of an array, nothing between its elements by default", () => {
+    expect(evaluate("join(params.items)", { items: ["ab", "cd", "ef"] })).toBe("abcdef");
+    expect(evaluate("join(params.items, ', ')", { items: ["a", 1, true] })).toBe("a, 1, true");
+  });
+
+  it("treats an empty element as nothing, as Array.join does", () => {
+    expect(evaluate("join(params.items, '-')", { items: ["a", null, "b"] })).toBe("a--b");
+  });
+
+  it("answers with text whatever it is given", () => {
+    expect(evaluate("join(params.missing)", {})).toBe("");
+    expect(evaluate("join(params.s)", { s: "whole" })).toBe("whole");
+  });
+});
