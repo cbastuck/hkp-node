@@ -24,6 +24,7 @@ import { ADDRESS_SEPARATOR, descend, splitAddress } from "./address";
 import { SecretVault } from "./secrets";
 import { AssetDescriptor, AssetStore, AssetStoreOptions } from "./assets";
 import { ANONYMOUS_SUB, AuthenticatedUser } from "./auth";
+import { reportedValue } from "./callReport";
 import { MountHandle, MountHandlers } from "./mounts";
 
 /** Severity order, so a runtime can drop anything below what it records. */
@@ -663,7 +664,12 @@ export class HostedRuntime implements RuntimeHost {
     this.emitNotification(
       {
         instanceId: startAfterUuid,
-        payload: { __internal: { state: "call-process-finished", data: input } },
+        payload: {
+          __internal: {
+            state: "call-process-finished",
+            data: reportedValue(input),
+          },
+        },
       },
       onNotification,
     );
@@ -1058,7 +1064,7 @@ export class HostedRuntime implements RuntimeHost {
           payload: {
             __internal: {
               state: "call-process",
-              data: result,
+              data: reportedValue(result),
             },
           },
         },
@@ -1108,7 +1114,7 @@ export class HostedRuntime implements RuntimeHost {
           payload: {
             __internal: {
               state: "call-process-finished",
-              data: result,
+              data: reportedValue(result),
             },
           },
         },
