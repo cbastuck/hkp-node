@@ -125,8 +125,10 @@ function member(
   );
   const nothing = object === undefined || object === null;
   const value = nothing ? undefined : object[key];
-  // A read past a link that already came up empty was reported with it.
-  const pastMissing = nothing && node.object.type === "MemberExpression";
+  // A read past a link that came up empty was reported with it; one past a
+  // link that is there but null is reported itself.
+  const pastMissing =
+    object === undefined && node.object.type === "MemberExpression";
   if (value === undefined && onMissing && !pastMissing) {
     onMissing(pathOf(node));
   }

@@ -22,16 +22,21 @@
  * run. What a term may reach is bounded there rather than here — see
  * `expression.ts`.
  *
- * What a pass says about itself is notified, never kept in the state a board
- * saves — the same in every runtime:
+ * What a pass says about itself is notified when it changes, and is part of
+ * the state while there is something to say, so a panel opened later shows it;
+ * configuring it does nothing. The same in every runtime:
  *
  * - `error`: a term that does not parse — said when the template is
  *   configured — or that fails to evaluate. A failing pass stops the flow
- *   (null), since a mapping that could not be made has nothing to pass on.
- *   With an array input, one failing element fails the pass.
+ *   (null), since a mapping that could not be made has nothing to pass on,
+ *   and is logged, since nobody may be watching. With an array input, one
+ *   failing element fails the pass.
  * - `warnings`: a term whose value is empty because what it read was not
  *   there — `title: params.titel not found`. The flow goes on: an absent field
  *   is often legitimate, and a typo is only visible this way.
+ *
+ * A lone "=" is the value of its term, whatever the mode; a null one has
+ * nothing to pass on.
  *
  * A `hkp-mount://` value anywhere in what a template produces becomes the
  * address it names. That is what lets a board *mention* an endpoint it cannot
@@ -195,6 +200,10 @@ export class MapService implements HostedService {
       template: deepCopy(this.state.template),
       sensingMode: this.state.sensingMode,
       [MOUNT_FIELD]: this.mount,
+      ...(this.reported.error ? { error: this.reported.error } : {}),
+      ...(this.reported.warnings.length
+        ? { warnings: [...this.reported.warnings] }
+        : {}),
     };
   }
 
@@ -233,6 +242,7 @@ export class MapService implements HostedService {
         throw error;
       }
       this.report(error.message, [...warnings]);
+      this.host?.log("error", "service.failed", { message: error.message });
       return null;
     }
   }
@@ -262,16 +272,16 @@ export class MapService implements HostedService {
 
   private mapper(input: unknown, warnings: Set<string>): unknown {
     if (this.structuredTemplate) {
-      return this.mergeWithInput(
-        this.evaluateNode(this.structuredTemplate, input, warnings, ""),
-        input,
-      );
+      const mapped = this.evaluateNode(this.structuredTemplate, input, warnings, "");
+      return isLoneTerm(this.structuredTemplate)
+        ? mapped
+        : this.mergeWithInput(mapped, input);
     }
 
     const termKeys = Object.keys(this.terms);
     // A lone "=" key maps to a scalar rather than to an object.
     if (termKeys.length === 1 && termKeys[0] === "") {
-      return this.evaluateTerm(this.terms[""], input, warnings, "=");
+      return keyed(this.evaluateTerm(this.terms[""], input, warnings, pathIn("", "")));
     }
 
     const inputRecord = isJsonRecord(input) ? input : {};
@@ -283,7 +293,7 @@ export class MapService implements HostedService {
           : { ...deepCopy(this.properties), ...inputRecord };
 
     return termKeys.reduce<Record<string, unknown>>((acc, key) => {
-      const value = keyed(this.evaluateTerm(this.terms[key], input, warnings, key));
+      const value = keyed(this.evaluateTerm(this.terms[key], input, warnings, pathIn("", key)));
 
       if (key.includes(".")) {
         return mergeAtPath(acc, value, key);
@@ -363,23 +373,18 @@ export class MapService implements HostedService {
     }
 
     if (node.type === "expression") {
-      return this.evaluateTerm(node.expression, params, warnings, label || "=");
+      return this.evaluateTerm(node.expression, params, warnings, label);
     }
 
     if (node.type === "array") {
       return node.items.map((item, index) =>
-        this.evaluateNode(item, params, warnings, pathIn(label, String(index))),
+        keyed(this.evaluateNode(item, params, warnings, pathIn(label, String(index)))),
       );
     }
 
     const entries = node.entries;
-    if (
-      entries.length === 1 &&
-      entries[0].dynamic &&
-      entries[0].key === "" &&
-      entries[0].node.type === "expression"
-    ) {
-      return this.evaluateNode(entries[0].node, params, warnings, label);
+    if (isLoneTerm(node)) {
+      return keyed(this.evaluateNode(entries[0].node, params, warnings, pathIn(label, "")));
     }
 
     const out: Record<string, unknown> = {};
@@ -427,7 +432,7 @@ export class MapService implements HostedService {
 
     this.notify({ template: deepCopy(this.state.template) });
     const broken = Object.entries(this.terms).find(([, term]) => term.parseError);
-    this.report(broken ? `${broken[0] || "="}: ${broken[1].parseError}` : "", []);
+    this.report(broken ? `${pathIn("", broken[0])}: ${broken[1].parseError}` : "", []);
   }
 
   private updateSensingMode(isActive: boolean): void {
@@ -457,8 +462,26 @@ export class MapService implements HostedService {
   }
 }
 
-/** Where a term sits in a structured template: `items.0.title`. */
+/** An object of a lone "=" key, which stands for its term's value. */
+function isLoneTerm(node: TemplateNode): boolean {
+  return (
+    node.type === "object" &&
+    node.entries.length === 1 &&
+    node.entries[0].dynamic &&
+    node.entries[0].key === ""
+  );
+}
+
+/**
+ * Where a term sits in a template: `items.0.title`. A lone "=" adds nothing to
+ * the path, since it stands for the value it sits in; at the top it is named
+ * "=". The one rule both configuring and a pass name a term by, so the same
+ * failure is said in the same words.
+ */
 function pathIn(label: string, key: string): string {
+  if (!key) {
+    return label || "=";
+  }
   return label ? `${label}.${key}` : key;
 }
 
@@ -474,7 +497,7 @@ function keyed(value: unknown): unknown {
 function firstParseError(node: TemplateNode, label: string): string {
   if (node.type === "expression") {
     return node.expression.parseError
-      ? `${label || "="}: ${node.expression.parseError}`
+      ? `${label}: ${node.expression.parseError}`
       : "";
   }
   if (node.type === "array") {

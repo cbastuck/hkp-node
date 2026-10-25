@@ -12,6 +12,7 @@ const noopNotify = () => {};
 
 type RecordingHost = RuntimeHost & {
   notifications: Array<{ instanceId: string; payload: unknown }>;
+  logs: Array<{ level: string; event: string; data: unknown }>;
   processed: unknown[];
   results: unknown[];
 };
@@ -19,6 +20,7 @@ type RecordingHost = RuntimeHost & {
 function createHost(): RecordingHost {
   const host: RecordingHost = {
     notifications: [],
+    logs: [],
     processed: [],
     results: [],
     async processFrom(
@@ -33,7 +35,9 @@ function createHost(): RecordingHost {
       return null;
     },
     secrets: () => new SecretVault(),
-    log() {},
+    log(level, event, data) {
+      host.logs.push({ level, event, data });
+    },
     forwardLog() {},
     logSettings() {
       return { logging: false, logData: false, logLevel: "info" as const };
@@ -202,6 +206,80 @@ describe("MapService — missing reads, warnings and errors", () => {
 
     expect(map.process({}, noopNotify)).toEqual({ items: [{ title: null }] });
     expect(reported(host)).toEqual([{ warnings: ["items.0.title: params.titel not found"] }]);
+  });
+
+  it("warns about a read through a field that is there but null", () => {
+    const map = createMap({ template: { "name=": "params.author.name" } });
+    const host = createHost();
+    map.setHost(host);
+
+    expect(map.process({ author: null }, noopNotify)).toEqual({ name: null });
+    expect(reported(host)).toEqual([{ warnings: ["name: params.author.name not found"] }]);
+  });
+
+  it("logs a failing pass, since nobody may be watching", () => {
+    const map = createMap({ template: { "x=": "params.n.toFixed(1)" } });
+    const host = createHost();
+    map.setHost(host);
+
+    map.process({}, noopNotify);
+    map.process({}, noopNotify);
+    expect(host.logs).toEqual([
+      { level: "error", event: "service.failed", data: { message: "x: params.n.toFixed is not a function" } },
+      { level: "error", event: "service.failed", data: { message: "x: params.n.toFixed is not a function" } },
+    ]);
+  });
+
+  it("keeps what it says in its state while it says something", () => {
+    const map = createMap({ template: { "x=": "params.n.toFixed(1)" } });
+    map.setHost(createHost());
+
+    map.process({}, noopNotify);
+    expect(map.getState().error).toBe("x: params.n.toFixed is not a function");
+
+    map.configure({ template: { "x=": "params.missing" } });
+    map.process({}, noopNotify);
+    expect(map.getState()).not.toHaveProperty("error");
+    expect(map.getState().warnings).toEqual(["x: params.missing not found"]);
+
+    map.process({ missing: 1 }, noopNotify);
+    expect(map.getState()).not.toHaveProperty("warnings");
+  });
+
+  it("names a failing term the same when configured and on a pass", () => {
+    for (const [template, name] of [
+      [{ "=": "bad(", "x=": "1" }, "="],
+      [{ items: { "=": "bad(" }, other: [1] }, "items"],
+    ] as const) {
+      const map = createMap();
+      const host = createHost();
+      map.setHost(host);
+      map.configure({ template });
+      map.process({}, noopNotify);
+
+      const errors = reported(host).filter(
+        (payload) => typeof payload === "object" && payload !== null && "error" in payload,
+      );
+      expect(errors).toEqual([
+        { error: expect.stringMatching(new RegExp(`^${name}: invalid expression 'bad\\('`)) },
+      ]);
+    }
+  });
+});
+
+describe("MapService — lone '='", () => {
+  it("is null when its read found nothing, so the flow stops", () => {
+    const map = createMap({ template: { "=": "params.missing" } });
+
+    expect(map.process({}, noopNotify)).toBeNull();
+  });
+
+  it("is its value whatever the mode", () => {
+    for (const mode of ["add", "overwrite"]) {
+      const map = createMap({ mode, template: { "=": { a: 1 } } });
+
+      expect(map.process({ b: 2 }, noopNotify)).toEqual({ a: 1 });
+    }
   });
 });
 
