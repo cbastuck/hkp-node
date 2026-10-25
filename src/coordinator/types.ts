@@ -82,6 +82,8 @@ export type BoardSessionInfo = {
    *  runtime server is not connected, one that could not be built. Empty when
    *  running cleanly. */
   errors: string[];
+  /** Capture mode, as this session holds it; never part of `config`. */
+  capture: boolean;
 };
 
 export function isRemoteRuntime(rt: CloudRuntimeDescriptor): boolean {

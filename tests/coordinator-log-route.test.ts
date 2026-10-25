@@ -6,6 +6,7 @@ import express from "express";
 import request from "supertest";
 import { afterEach, describe, expect, it } from "vitest";
 
+import { Authenticator } from "../src/auth";
 import { BoardCoordinator } from "../src/coordinator/coordinator";
 import { createFileLogStore } from "../src/coordinator/logStore";
 import { createCoordinatorRouter } from "../src/coordinator/router";
@@ -42,7 +43,7 @@ function entry(over: Partial<LogEntry> = {}): LogEntry {
  * the route only needs the board to exist, and what it reads comes from the
  * store rather than from anything running.
  */
-async function setup() {
+async function setup(options: { authenticator?: Authenticator } = {}) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "hkp-log-route-"));
   roots.push(root);
   const logStore = createFileLogStore(root);
@@ -59,11 +60,48 @@ async function setup() {
   // The real server mounts this router on an app that already parses JSON
   // (createRuntimeServer does it before the coordinator router is added).
   app.use(express.json());
-  // Auth is off in tests, which makes requireSelf compare `sub` against the
-  // username in the path — so a mismatch is still rejected here.
-  app.use(createCoordinatorRouter({ coordinator }).router);
+  // Without an authenticator auth is off, and requireSelf takes the username
+  // in the path as the caller — so it can never see a mismatch. A test about
+  // who may call a route passes one (`tokenIsSub`).
+  app.use(
+    createCoordinatorRouter({
+      coordinator,
+      ...(options.authenticator
+        ? {
+            // Never contacted: the authenticator does the verifying.
+            auth: { mode: "jwt" as const, domain: "auth.invalid", audience: "test" },
+            authenticator: options.authenticator,
+          }
+        : {}),
+    }).router,
+  );
 
   return { app, logStore, root };
+}
+
+/**
+ * The bearer token is the caller's `sub`: verification stood in for, so that
+ * requireSelf has a caller to hold against the path.
+ */
+function tokenIsSub(): Authenticator {
+  const identify = async (token: string | undefined | null) =>
+    token ? { sub: token } : null;
+  return {
+    identifyToken: identify,
+    authorizeOwner: identify,
+    middleware: async (req, res, next) => {
+      const header = req.headers.authorization;
+      const user = await identify(
+        header?.startsWith("Bearer ") ? header.slice(7) : undefined,
+      );
+      if (!user) {
+        res.sendStatus(401);
+        return;
+      }
+      req.authenticatedUser = user;
+      next();
+    },
+  };
 }
 
 describe("entries from a browser runtime", () => {
@@ -234,11 +272,128 @@ describe("the board log route", () => {
     expect(res.body.entries).toEqual([]);
   });
 
+  it("is not read by a caller other than the owner", async () => {
+    // The token check the test above cannot reach: the owner's path, somebody
+    // else's token.
+    const { app, logStore } = await setup({ authenticator: tokenIsSub() });
+    logStore.append("user-1", "board-1", entry({ event: "private" }));
+    await logStore.close();
+
+    await request(app)
+      .get("/users/user-1/boards/board-1/runs")
+      .set("Authorization", "Bearer user-2")
+      .expect(403);
+    const res = await request(app)
+      .get("/users/user-1/boards/board-1/runs")
+      .set("Authorization", "Bearer user-1")
+      .expect(200);
+    expect(res.body.entries).toHaveLength(1);
+  });
+
   it("reports a board it does not have rather than an empty log", async () => {
     // An empty answer for a board that does not exist would read as "this board
     // logged nothing", which is a different fact.
     const { app } = await setup();
 
     await request(app).get("/users/user-1/boards/absent/runs").expect(404);
+  });
+});
+
+describe("the Capture mode switch", () => {
+  it("is held by the running board and written into nothing", async () => {
+    // Capture mode is a builder's switch: the values inside a run leave the
+    // runtimes only while it is on, so nothing that saves or restores the
+    // board may keep it.
+    const { app } = await setup();
+    const coordinator = coordinators[coordinators.length - 1];
+    const session = coordinator.getBoard("user-1", "board-1")!;
+    const before = JSON.stringify(session.config);
+
+    await request(app)
+      .post("/users/user-1/boards/board-1/capture")
+      .send({ enabled: true })
+      .expect(200, { capture: true, unreachable: [] });
+    expect(coordinator.getBoards("user-1")[0].capture).toBe(true);
+    expect(JSON.stringify(session.config)).toBe(before);
+
+    await request(app)
+      .post("/users/user-1/boards/board-1/capture")
+      .send({ enabled: false })
+      .expect(200, { capture: false, unreachable: [] });
+    expect(coordinator.getBoards("user-1")[0].capture).toBe(false);
+  });
+
+  it("ends when the owner's last bridge to the board closes", async () => {
+    const { app } = await setup();
+    const coordinator = coordinators[coordinators.length - 1];
+    const session = coordinator.getBoard("user-1", "board-1")!;
+    const closers: Array<() => void> = [];
+    const bridge = () =>
+      ({
+        readyState: 1,
+        send: () => {},
+        on: (event: string, handler: () => void) => {
+          if (event === "close") closers.push(handler);
+        },
+        removeAllListeners: () => {},
+        close: () => {},
+      }) as unknown as Parameters<typeof session.registerBrowserSocket>[0];
+    session.registerBrowserSocket(bridge(), []);
+    session.registerBrowserSocket(bridge(), []);
+
+    await request(app)
+      .post("/users/user-1/boards/board-1/capture")
+      .send({ enabled: true })
+      .expect(200);
+
+    // One tab of two closing leaves the owner looking.
+    closers[0]();
+    expect(session.capturesCalls()).toBe(true);
+    closers[1]();
+    expect(session.capturesCalls()).toBe(false);
+  });
+
+  it("starts off", async () => {
+    await setup();
+    const coordinator = coordinators[coordinators.length - 1];
+    expect(coordinator.getBoards("user-1")[0].capture).toBe(false);
+  });
+
+  it("is the owner's alone", async () => {
+    // Another caller naming the owner's board: the path is right, the token is
+    // not theirs. requireSelf is all that stands between them and the switch.
+    const { app } = await setup({ authenticator: tokenIsSub() });
+    const coordinator = coordinators[coordinators.length - 1];
+
+    await request(app)
+      .post("/users/user-1/boards/board-1/capture")
+      .set("Authorization", "Bearer user-2")
+      .send({ enabled: true })
+      .expect(403);
+    await request(app)
+      .post("/users/user-1/boards/board-1/capture")
+      .send({ enabled: true })
+      .expect(401);
+    expect(coordinator.getBoards("user-1")[0].capture).toBe(false);
+
+    // And the owner, through the same check, is let through.
+    await request(app)
+      .post("/users/user-1/boards/board-1/capture")
+      .set("Authorization", "Bearer user-1")
+      .send({ enabled: true })
+      .expect(200);
+    expect(coordinator.getBoards("user-1")[0].capture).toBe(true);
+  });
+
+  it("moves only on a plain yes or no, and only for a board it has", async () => {
+    const { app } = await setup();
+    await request(app)
+      .post("/users/user-1/boards/board-1/capture")
+      .send({ enabled: "true" })
+      .expect(400);
+    await request(app)
+      .post("/users/user-1/boards/absent/capture")
+      .send({ enabled: true })
+      .expect(404);
   });
 });

@@ -123,6 +123,12 @@ export class BoardSession {
   // Runtimes this session built at some point. One whose participant dropped
   // and came back with the runtime still running is picked up, not rebuilt.
   private readonly built = new Set<string>();
+  // Capture mode: whether this board's runtimes send their call reports with
+  // the values in them. The owner's, switched while attached, and held here
+  // only — never in the config, never persisted — so a restart or a redeploy
+  // turns it off. What passes inside a run is private unless someone building
+  // the board asked to see it (plans/TODO-CAPTURE-MODE.md).
+  private capture = false;
   // Every browser currently viewing this board has its own bridge. Multiple
   // clients (e.g. Readymade + a browser tab) can watch the same board at once;
   // runtime output is fanned out to all of them.
@@ -324,6 +330,16 @@ export class BoardSession {
           );
         }
         this.built.add(id);
+        // Rebuilt while the board is captured: it starts without Capture mode,
+        // as every runtime does, so it is told again. Not part of what it is
+        // built from, which a board document could otherwise switch on.
+        if (this.capture) {
+          await participant
+            .request({ op: "setState", state: { capture: true } })
+            .catch(() => {
+              // It runs without; its frames show activity but no values.
+            });
+        }
         if (result?.missingSecrets?.length) {
           // Built, and unable to do its job: say what is missing and where,
           // rather than leave it to surface as a failed login hours later.
@@ -541,6 +557,43 @@ export class BoardSession {
       }),
     );
     return unreachable;
+  }
+
+  /**
+   * Turn Capture mode on or off for this board's runtimes, while they run.
+   *
+   * Applied the way logging is (`setLogging`), and unlike logging never written
+   * into the config: Capture mode is a builder's switch, not a property of the
+   * board, so nothing that saves or restores the board can carry it. Returns
+   * the runtimes it could not reach.
+   */
+  async setCapture(enabled: boolean): Promise<string[]> {
+    this.capture = enabled;
+    const unreachable: string[] = [];
+    await Promise.all(
+      this.required().map(async ({ id }) => {
+        if (!this.built.has(id)) {
+          return;
+        }
+        const participant = this.live.has(id)
+          ? this.participants.get(id)
+          : undefined;
+        if (!participant) {
+          unreachable.push(id);
+          return;
+        }
+        try {
+          await participant.request({ op: "setState", state: { capture: enabled } });
+        } catch {
+          unreachable.push(id);
+        }
+      }),
+    );
+    return unreachable;
+  }
+
+  capturesCalls(): boolean {
+    return this.capture;
   }
 
   /**
@@ -831,6 +884,16 @@ export class BoardSession {
 
     ws.on("close", () => {
       this.bridges.delete(bridge);
+      // Capture mode lasts while its owner is looking: the last of their
+      // bridges closing ends it, so a tab closed with it on does not leave the
+      // board sending what passes inside its runs to a coordinator nobody
+      // reads from.
+      if (
+        this.capture &&
+        ![...this.bridges].some((open) => open.role === "owner")
+      ) {
+        void this.setCapture(false);
+      }
       // Only abandon in-flight browser results once nobody remains who could
       // answer them; another of the owner's bridges may still reply.
       if (this.hostingBridges().length === 0) {

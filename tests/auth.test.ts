@@ -364,12 +364,25 @@ describe("hkp-node multi-tenancy", () => {
       .delete("/runtimes/alice-rt/services/m1")
       .set("Authorization", `Bearer ${BOB}`)
       .expect(404);
+    // Capture mode sends the values inside Alice's runs to whoever listens on
+    // her runtime; Bob switching it on would be reading them.
+    await request(baseUrl)
+      .patch("/runtimes/alice-rt/state")
+      .set("Authorization", `Bearer ${BOB}`)
+      .send({ capture: true, logging: true })
+      .expect(404);
 
     // Alice's runtime and its service survived all of that.
     await request(baseUrl)
       .get("/runtimes/alice-rt/services/m1")
       .set("Authorization", `Bearer ${ALICE}`)
       .expect(200);
+    const { body: state } = await request(baseUrl)
+      .patch("/runtimes/alice-rt/state")
+      .set("Authorization", `Bearer ${ALICE}`)
+      .send({})
+      .expect(200);
+    expect(state).toMatchObject({ capture: false, logging: false });
   });
 
   it("keeps DELETE /runtimes inside the caller's namespace", async () => {

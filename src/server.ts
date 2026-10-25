@@ -102,6 +102,7 @@ import {
   TenantRuntimes,
 } from "./runtime";
 import { MountRegistry } from "./mounts";
+import { outgoingPayload } from "./callReport";
 import { MessagePurpose, decodeYasMessage, encodeYasBinary } from "./yas";
 import {
   AllowedOrigins,
@@ -719,7 +720,9 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
             ? allowsOriginWithoutCredential(origin, allowedOrigins)
             : allowsOrigin(origin, allowedOrigins),
         ),
-      methods: ["GET", "POST", "DELETE", "OPTIONS"],
+      // PATCH: the page switching Capture mode on a runtime while it runs
+      // (`PATCH /runtimes/:id/state`), which nothing else sends from a browser.
+      methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
       allowedHeaders: ["Content-Type", "Authorization"],
     }),
   );
@@ -954,7 +957,9 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
         coordinatorLinks.emit(linked, {
           type: "notification",
           serviceUuid: notification.instanceId,
-          payload: notification.payload,
+          // A coordinator always listens: what it is sent of a call is what
+          // Capture mode allows, as for any other listener.
+          payload: outgoingPayload(notification.payload, runtime.capturesCalls()),
           context: contextToWire(notification.context),
         });
       });
@@ -974,7 +979,10 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
     }
     const socketKey = tenantKey(owner, runtime.id);
     runtime.registerNotificationTarget((notification) => {
-      sendJsonNotification(socketKey, notification);
+      sendJsonNotification(socketKey, {
+        ...notification,
+        payload: outgoingPayload(notification.payload, runtime.capturesCalls()),
+      });
     });
     runtime.registerLogTarget((entry) => {
       sendJsonLog(socketKey, entry);
@@ -1122,10 +1130,16 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
     if (typeof state.logData === "boolean") {
       runtime.setLogData(state.logData);
     }
+    if (typeof state.capture === "boolean") {
+      runtime.setCapture(state.capture);
+    }
     return {
       logging: runtime.getLogging(),
       logData: runtime.getLogData(),
       logLevel: runtime.getLogLevel(),
+      // Answered, never configured: nothing that saves a runtime's
+      // configuration can keep it.
+      capture: runtime.capturesCalls(),
     };
   }
 

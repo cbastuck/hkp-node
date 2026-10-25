@@ -19,6 +19,13 @@
  * Measuring stops once the limit is passed, so a value of a hundred megabytes
  * costs no more to judge than one of five. A size counted only that far is said
  * to be not `exact`.
+ *
+ * **And only while the board is captured.** What passes between the services
+ * of a run is private; only what a board outputs is public. So a report
+ * carries its value only in Capture mode — switched on by someone building the
+ * board, never saved — and otherwise says only that the call happened and,
+ * when it ended, whether it passed nothing on (`stopped`). See
+ * `outgoingPayload`, and `plans/TODO-CAPTURE-MODE.md`.
  */
 
 /** The most a report carries of one value: 5 MiB. */
@@ -47,6 +54,34 @@ export function isTooLarge(value: unknown): value is TooLarge {
     !Array.isArray(value) &&
     Object.prototype.hasOwnProperty.call(value, "__hkpTooLarge")
   );
+}
+
+/**
+ * A notification's payload as it may leave for anyone listening: a call
+ * report carrying its value only while `capture` is on, and then no more of it
+ * than `reportedValue` allows; every other payload as it is.
+ */
+export function outgoingPayload(payload: unknown, capture: boolean): unknown {
+  if (!payload || typeof payload !== "object") {
+    return payload;
+  }
+  const internal = (payload as { __internal?: unknown }).__internal;
+  if (!internal || typeof internal !== "object") {
+    return payload;
+  }
+  const { data, ...report } = internal as Record<string, unknown>;
+  if (report.state !== "call-process" && report.state !== "call-process-finished") {
+    return payload;
+  }
+  const carried = capture
+    ? "data" in internal
+      ? { ...report, data: reportedValue(data) }
+      : report
+    : report.state === "call-process-finished" &&
+        (data === null || data === undefined)
+      ? { ...report, stopped: true }
+      : report;
+  return { ...payload, __internal: carried };
 }
 
 /** `value` as a report may carry it: itself, or its description. */
