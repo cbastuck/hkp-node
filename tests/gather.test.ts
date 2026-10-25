@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 
-import { GatherService, isPart } from "../src/services/gather";
+import {
+  GatherService,
+  isPart,
+  MAX_GROUP_LENGTH,
+  MAX_REFUSED,
+} from "../src/services/gather";
 import { MapService } from "../src/services/map";
 import {
   HostedService,
@@ -198,6 +203,50 @@ describe("a group that does not complete", () => {
   });
 });
 
+describe("how many groups are held at once", () => {
+  it("refuses a new group past maxGroups, keeping the ones already arriving", async () => {
+    const t = gather({ maxGroups: 2 });
+
+    await t.run(part("a", 0, 2, "a0"));
+    await t.run(part("b", 0, 2, "b0"));
+    expect(await t.run(part("c", 0, 2, "c0"))).toBeNull();
+
+    expect(t.service.getState().pending).toBe(2);
+    expect(t.service.getState().error).toMatch(/c refused: 2 groups are already incomplete/);
+    expect(t.logged.map((entry) => entry.event)).toEqual(["gather.refused"]);
+    // The groups it kept still complete.
+    expect(await t.run(part("a", 1, 2, "a1"))).toEqual(["a0", "a1"]);
+    // And the refused one stays refused, rather than starting late without
+    // the part that went with the refusal.
+    expect(await t.run(part("c", 1, 2, "c1"))).toBeNull();
+    expect(t.service.getState().pending).toBe(1);
+  });
+
+  it("takes a new group once one has completed or been let go", async () => {
+    const t = gather({ maxGroups: 1, timeoutMs: 10 });
+
+    await t.run(part("old", 0, 2, "a"));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await t.run(part("new", 0, 2, "b"));
+
+    expect(t.service.getState().pending).toBe(1);
+    expect(await t.run(part("new", 1, 2, "c"))).toEqual(["b", "c"]);
+  });
+
+  it("forgets the oldest refusals rather than keeping every one", async () => {
+    const t = gather({ maxGroups: 1 });
+    await t.run(part("held", 0, 2, "x"));
+
+    for (let i = 0; i <= MAX_REFUSED; i++) {
+      await t.run(part(`flood-${i}`, 0, 2, "x"));
+    }
+    const refused = (t.service as unknown as { refused: Map<string, number> }).refused;
+    expect(refused.size).toBe(MAX_REFUSED);
+    expect(refused.has("flood-0")).toBe(false);
+    expect(refused.has(`flood-${MAX_REFUSED}`)).toBe(true);
+  });
+});
+
 describe("what counts as a part", () => {
   it("is an item and where it sits", () => {
     expect(isPart(part("g", 0, 1, null))).toBe(true);
@@ -206,6 +255,9 @@ describe("what counts as a part", () => {
     expect(isPart(part("g", 1, 1, "x"))).toBe(false);
     expect(isPart(part("g", 0.5, 2, "x"))).toBe(false);
     expect(isPart([part("g", 0, 1, "x")])).toBe(false);
+    // A group is held for as long as its parts are, so its name is bounded.
+    expect(isPart(part("g".repeat(MAX_GROUP_LENGTH), 0, 1, "x"))).toBe(true);
+    expect(isPart(part("g".repeat(MAX_GROUP_LENGTH + 1), 0, 1, "x"))).toBe(false);
   });
 
   it("is held without allocating for the total it claims", async () => {
@@ -220,10 +272,11 @@ describe("what counts as a part", () => {
 
 describe("configuration", () => {
   it("is read from the board as well as set later", () => {
-    const t = gather({ maxBytes: 1000, timeoutMs: 5000 });
+    const t = gather({ maxBytes: 1000, maxGroups: 4, timeoutMs: 5000 });
 
-    expect(t.service.getState()).toMatchObject({ maxBytes: 1000, timeoutMs: 5000 });
-    t.service.configure({ maxBytes: 2000 });
-    expect(t.service.getState()).toMatchObject({ maxBytes: 2000, timeoutMs: 5000 });
+    expect(t.service.getState()).toMatchObject({ maxBytes: 1000, maxGroups: 4, timeoutMs: 5000 });
+    t.service.configure({ maxBytes: 2000, maxGroups: 0 });
+    // Fewer than one group would refuse everything; it is not taken.
+    expect(t.service.getState()).toMatchObject({ maxBytes: 2000, maxGroups: 4, timeoutMs: 5000 });
   });
 });
