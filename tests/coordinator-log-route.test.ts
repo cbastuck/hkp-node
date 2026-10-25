@@ -242,3 +242,88 @@ describe("the board log route", () => {
     await request(app).get("/users/user-1/boards/absent/runs").expect(404);
   });
 });
+
+describe("the Capture mode switch", () => {
+  it("is held by the running board and written into nothing", async () => {
+    // Capture mode is a builder's switch: the values inside a run leave the
+    // runtimes only while it is on, so nothing that saves or restores the
+    // board may keep it.
+    const { app } = await setup();
+    const coordinator = coordinators[coordinators.length - 1];
+    const session = coordinator.getBoard("user-1", "board-1")!;
+    const before = JSON.stringify(session.config);
+
+    await request(app)
+      .post("/users/user-1/boards/board-1/capture")
+      .send({ enabled: true })
+      .expect(200, { capture: true, unreachable: [] });
+    expect(coordinator.getBoards("user-1")[0].capture).toBe(true);
+    expect(JSON.stringify(session.config)).toBe(before);
+
+    await request(app)
+      .post("/users/user-1/boards/board-1/capture")
+      .send({ enabled: false })
+      .expect(200, { capture: false, unreachable: [] });
+    expect(coordinator.getBoards("user-1")[0].capture).toBe(false);
+  });
+
+  it("ends when the owner's last bridge to the board closes", async () => {
+    const { app } = await setup();
+    const coordinator = coordinators[coordinators.length - 1];
+    const session = coordinator.getBoard("user-1", "board-1")!;
+    const closers: Array<() => void> = [];
+    const bridge = () =>
+      ({
+        readyState: 1,
+        send: () => {},
+        on: (event: string, handler: () => void) => {
+          if (event === "close") closers.push(handler);
+        },
+        removeAllListeners: () => {},
+        close: () => {},
+      }) as unknown as Parameters<typeof session.registerBrowserSocket>[0];
+    session.registerBrowserSocket(bridge(), []);
+    session.registerBrowserSocket(bridge(), []);
+
+    await request(app)
+      .post("/users/user-1/boards/board-1/capture")
+      .send({ enabled: true })
+      .expect(200);
+
+    // One tab of two closing leaves the owner looking.
+    closers[0]();
+    expect(session.capturesCalls()).toBe(true);
+    closers[1]();
+    expect(session.capturesCalls()).toBe(false);
+  });
+
+  it("starts off", async () => {
+    await setup();
+    const coordinator = coordinators[coordinators.length - 1];
+    expect(coordinator.getBoards("user-1")[0].capture).toBe(false);
+  });
+
+  it("is the owner's alone", async () => {
+    // A board is found under the user its path names, and requireSelf holds
+    // that name to the caller's token; another user's path never reaches it.
+    const { app } = await setup();
+    const coordinator = coordinators[coordinators.length - 1];
+    await request(app)
+      .post("/users/someone-else/boards/board-1/capture")
+      .send({ enabled: true })
+      .expect(404);
+    expect(coordinator.getBoards("user-1")[0].capture).toBe(false);
+  });
+
+  it("moves only on a plain yes or no, and only for a board it has", async () => {
+    const { app } = await setup();
+    await request(app)
+      .post("/users/user-1/boards/board-1/capture")
+      .send({ enabled: "true" })
+      .expect(400);
+    await request(app)
+      .post("/users/user-1/boards/absent/capture")
+      .send({ enabled: true })
+      .expect(404);
+  });
+});

@@ -390,6 +390,23 @@ export class BoardCoordinator {
     return { unreachable };
   }
 
+  /**
+   * Turn Capture mode on or off for a board — and, unlike logging, remember
+   * nothing: it lasts as long as this session does. Returns the runtimes that
+   * did not take it.
+   */
+  async setBoardCapture(
+    userId: string,
+    boardName: string,
+    enabled: boolean,
+  ): Promise<{ unreachable: string[] } | null> {
+    const session = this.getBoard(userId, boardName);
+    if (!session) {
+      return null;
+    }
+    return { unreachable: await session.setCapture(enabled) };
+  }
+
   /** How many boards this coordinator holds, across every user. */
   getBoardCount(): number {
     let total = 0;
@@ -415,6 +432,7 @@ export class BoardCoordinator {
       createdAt: s.createdAt,
       config: s.config,
       errors: s.getErrors(),
+      capture: s.capturesCalls(),
     }));
   }
 

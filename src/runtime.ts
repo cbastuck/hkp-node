@@ -24,7 +24,6 @@ import { ADDRESS_SEPARATOR, descend, splitAddress } from "./address";
 import { SecretVault } from "./secrets";
 import { AssetDescriptor, AssetStore, AssetStoreOptions } from "./assets";
 import { ANONYMOUS_SUB, AuthenticatedUser } from "./auth";
-import { reportedValue } from "./callReport";
 import { MountHandle, MountHandlers } from "./mounts";
 
 /** Severity order, so a runtime can drop anything below what it records. */
@@ -341,6 +340,7 @@ export class HostedRuntime implements RuntimeHost {
   private readonly logTargets = new Set<(entry: LogEntry) => void>();
   /** See RuntimeConfiguration.logData. A board-wide override, not the gate. */
   private logData = true;
+  private capture = false;
   /** Whether anything is recorded at all; see RuntimeConfiguration.logging. */
   private logging = false;
   /** The least severe level recorded; see RuntimeConfiguration.logLevel. */
@@ -664,12 +664,7 @@ export class HostedRuntime implements RuntimeHost {
     this.emitNotification(
       {
         instanceId: startAfterUuid,
-        payload: {
-          __internal: {
-            state: "call-process-finished",
-            data: reportedValue(input),
-          },
-        },
+        payload: { __internal: { state: "call-process-finished", data: input } },
       },
       onNotification,
     );
@@ -822,6 +817,21 @@ export class HostedRuntime implements RuntimeHost {
 
   setLogData(enabled: boolean): void {
     this.logData = enabled;
+  }
+
+  /**
+   * Capture mode: whether this runtime's call reports leave it with their
+   * values. Switched while the board runs and never part of its configuration,
+   * so a runtime always starts without it. Read where a report leaves the
+   * server (`outgoingPayload`), so a pipeline nested at any depth — whose
+   * reports reach the server only through this runtime — follows it too.
+   */
+  setCapture(enabled: boolean): void {
+    this.capture = enabled;
+  }
+
+  capturesCalls(): boolean {
+    return this.capture;
   }
 
   getLogData(): boolean {
@@ -1064,7 +1074,7 @@ export class HostedRuntime implements RuntimeHost {
           payload: {
             __internal: {
               state: "call-process",
-              data: reportedValue(result),
+              data: result,
             },
           },
         },
@@ -1114,7 +1124,7 @@ export class HostedRuntime implements RuntimeHost {
           payload: {
             __internal: {
               state: "call-process-finished",
-              data: reportedValue(result),
+              data: result,
             },
           },
         },

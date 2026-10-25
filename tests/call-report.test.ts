@@ -4,10 +4,9 @@ import {
   CALL_REPORT_LIMIT,
   PREVIEW_LENGTH,
   isTooLarge,
+  outgoingPayload,
   reportedValue,
 } from "../src/callReport";
-import { HostedRuntime } from "../src/runtime";
-import { HostedService, RuntimeNotification, ServiceConfiguration } from "../src/types";
 
 /**
  * A call report carries the value only up to a limit; above it, a description.
@@ -100,50 +99,42 @@ describe("a description", () => {
   });
 });
 
-describe("the reports a runtime sends", () => {
-  /** Answers with a text of `length` characters, whatever it is given. */
-  const producing = (length: number) => (config: ServiceConfiguration): HostedService => ({
-    serviceId: config.serviceId,
-    serviceName: "Producer",
-    uuid: config.uuid,
-    configure: () => ({}),
-    getState: () => ({}),
-    process: () => "z".repeat(length),
+describe("what leaves for a listener", () => {
+  const report = (state: string, data?: unknown) => ({
+    __internal: { state, ...(data !== undefined ? { data } : {}), call: 7 },
   });
 
-  it("describe a value above the limit, while the run carries all of it", async () => {
-    const runtime = new HostedRuntime(
-      { id: "rt", name: "Rt", services: [{ serviceId: "producer", uuid: "p" }] },
-      producing(CALL_REPORT_LIMIT + 1),
-    );
-    const reports: RuntimeNotification[] = [];
-
-    const result = await runtime.processAt("p", "in", (n) => reports.push(n));
-
-    expect(result).toHaveLength(CALL_REPORT_LIMIT + 1);
-    const finished = reports
-      .map((n) => (n.payload as any)?.__internal)
-      .find((internal) => internal?.state === "call-process-finished");
-    expect(finished.data.__hkpTooLarge).toMatchObject({
-      type: "string",
-      bytes: CALL_REPORT_LIMIT + 1,
-      // Past the limit in characters already: not counted in bytes.
-      exact: false,
+  it("is only that a call happened, without Capture mode", () => {
+    expect(outgoingPayload(report("call-process", { secret: 1 }), false)).toEqual({
+      __internal: { state: "call-process", call: 7 },
+    });
+    expect(outgoingPayload(report("call-process-finished", { secret: 1 }), false)).toEqual({
+      __internal: { state: "call-process-finished", call: 7 },
     });
   });
 
-  it("carry a value at the limit as it is", async () => {
-    const runtime = new HostedRuntime(
-      { id: "rt", name: "Rt", services: [{ serviceId: "producer", uuid: "p" }] },
-      producing(CALL_REPORT_LIMIT),
+  it("says when a call passed nothing on, without Capture mode", () => {
+    expect(
+      outgoingPayload({ __internal: { state: "call-process-finished", data: null } }, false),
+    ).toEqual({ __internal: { state: "call-process-finished", stopped: true } });
+    expect(
+      outgoingPayload({ __internal: { state: "call-process-finished" } }, false),
+    ).toEqual({ __internal: { state: "call-process-finished", stopped: true } });
+  });
+
+  it("is the value, bounded, with Capture mode", () => {
+    expect(outgoingPayload(report("call-process", { a: 1 }), true)).toEqual(
+      report("call-process", { a: 1 }),
     );
-    const reports: RuntimeNotification[] = [];
+    const big = "z".repeat(CALL_REPORT_LIMIT + 1);
+    const carried = outgoingPayload(report("call-process-finished", big), true) as any;
+    expect(carried.__internal.data.__hkpTooLarge).toMatchObject({ type: "string" });
+  });
 
-    await runtime.processAt("p", "in", (n) => reports.push(n));
-
-    const finished = reports
-      .map((n) => (n.payload as any)?.__internal)
-      .find((internal) => internal?.state === "call-process-finished");
-    expect(finished.data).toHaveLength(CALL_REPORT_LIMIT);
+  it("is any other notification as it is", () => {
+    const own = { level: 0.5 };
+    expect(outgoingPayload(own, false)).toBe(own);
+    const other = { __internal: { state: "something-else", data: 1 } };
+    expect(outgoingPayload(other, false)).toBe(other);
   });
 });

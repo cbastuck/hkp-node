@@ -23,7 +23,13 @@ afterEach(async () => {
   }
 });
 
-type Notification = { instanceId: string; state: string; data: unknown };
+type Notification = {
+  instanceId: string;
+  state: string;
+  data: unknown;
+  hasData: boolean;
+  stopped?: boolean;
+};
 
 /** Collect __internal flow notifications until `done` is satisfied. */
 function collectFlow(
@@ -58,6 +64,8 @@ function collectFlow(
         instanceId: message.instanceId,
         state: payload.__internal.state,
         data: payload.__internal.data,
+        hasData: "data" in payload.__internal,
+        stopped: payload.__internal.stopped,
       });
       if (done(seen)) {
         clearTimeout(timer);
@@ -104,6 +112,11 @@ describe("flow notifications for self-emitting services", () => {
         ],
       })
       .expect(200);
+    // The values are what Capture mode is for.
+    await request(server.httpServer)
+      .patch("/runtimes/rt-1/state")
+      .send({ capture: true })
+      .expect(200, { logging: false, logData: true, logLevel: "info", capture: true });
 
     const seen = await collectFlow(
       `${baseUrl.replace("http", "ws")}/rt-1`,
@@ -163,4 +176,62 @@ describe("flow notifications for self-emitting services", () => {
     expect(count("timer-1", "call-process-finished")).toBe(1);
     expect(count("mon-1", "call-process")).toBe(1);
   });
+});
+
+describe("what a call report carries out of the server", () => {
+  /** A Timer, a Map making `template` of its tick, and a Monitor. */
+  async function startWith(template: Record<string, string>) {
+    const { server, baseUrl } = await startServer();
+    await request(server.httpServer)
+      .post("/runtimes")
+      .send({
+        id: "rt-1",
+        name: "Node",
+        services: [
+          { serviceId: "timer", uuid: "timer-1", state: { periodic: false } },
+          { serviceId: "map", uuid: "map-1", state: { mode: "replace", template } },
+          { serviceId: "monitor", uuid: "mon-1" },
+        ],
+      })
+      .expect(200);
+    // Awaited: supertest sends a request only once something waits for it.
+    const tick = async () => {
+      await request(server.httpServer)
+        .post("/runtimes/rt-1/services/timer-1")
+        .send({ start: true, immediate: true });
+    };
+    const capture = (on: boolean) =>
+      request(server.httpServer).patch("/runtimes/rt-1/state").send({ capture: on }).expect(200);
+    const untilMonitorDone = (all: Notification[]) =>
+      all.some((n) => n.instanceId === "mon-1" && n.state === "call-process-finished");
+    const flow = () =>
+      collectFlow(`${baseUrl.replace("http", "ws")}/rt-1`, untilMonitorDone, tick, 2000);
+    return { capture, flow };
+  }
+
+  it("is that each call happened, and no value, unless the board is captured", async () => {
+    const { flow } = await startWith({ "secret=": "'inside the run'" });
+
+    const seen = await flow();
+
+    expect(seen.length).toBeGreaterThanOrEqual(4);
+    expect(seen.every((n) => !n.hasData)).toBe(true);
+    expect(JSON.stringify(seen)).not.toContain("inside the run");
+  });
+
+  it("is the value while captured, and nothing again once switched off", async () => {
+    const { capture, flow } = await startWith({ "secret=": "'inside the run'" });
+
+    await capture(true);
+    const captured = await flow();
+    const mapOut = captured.find(
+      (n) => n.instanceId === "map-1" && n.state === "call-process-finished",
+    );
+    expect(mapOut?.data).toEqual({ secret: "inside the run" });
+
+    await capture(false);
+    const released = await flow();
+    expect(released.every((n) => !n.hasData)).toBe(true);
+  });
+
 });

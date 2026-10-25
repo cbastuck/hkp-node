@@ -320,6 +320,30 @@ export function createCoordinatorRouter(
     },
   );
 
+  /**
+   * Whether this board's call reports carry their values (Capture mode).
+   *
+   * The owner's alone — `requireSelf` above — and held by the session only:
+   * nothing persists it, so a restart or a redeploy turns it off.
+   */
+  router.post(
+    "/users/:username/boards/:boardName/capture",
+    async (req: Request, res: Response) => {
+      const { username, boardName } = req.params as Record<string, string>;
+      const enabled = (req.body as { enabled?: unknown } | undefined)?.enabled;
+      if (typeof enabled !== "boolean") {
+        res.sendStatus(400);
+        return;
+      }
+      const result = await coordinator.setBoardCapture(username, boardName, enabled);
+      if (!result) {
+        res.sendStatus(404);
+        return;
+      }
+      res.json({ capture: enabled, unreachable: result.unreachable });
+    },
+  );
+
   router.post(
     "/users/:username/boards/:boardName/stop",
     async (req: Request, res: Response) => {

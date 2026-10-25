@@ -246,6 +246,15 @@ describe("a page against a server without auth", () => {
     expect(preflight.headers["access-control-allow-origin"]).toBe(
       "http://localhost:5173",
     );
+
+    // Capture mode is switched from the page, on a runtime already running.
+    const patch = await rt.send("OPTIONS", "/runtimes/rt-1/state", {
+      Origin: "http://localhost:5173",
+      "Access-Control-Request-Method": "PATCH",
+      "Access-Control-Request-Headers": "content-type",
+    });
+    expect(patch.headers["access-control-allow-origin"]).toBe("http://localhost:5173");
+    expect(patch.headers["access-control-allow-methods"]).toContain("PATCH");
   });
 
   it("the website is a site like any other until the server is told otherwise", async () => {
