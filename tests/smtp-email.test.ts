@@ -1,7 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import type { Transporter } from "nodemailer";
 
 import { SmtpEmailService } from "../src/services/smtp-email";
+import { readEgressPolicy, setEgressPolicy } from "../src/egress";
 import { JsonRecord, RuntimeHost, ServiceConfiguration } from "../src/types";
 
 /**
@@ -263,5 +264,26 @@ describe("the password", () => {
 
     t.service.configure(state);
     expect(t.service.getState().password).toBe("{{secret.smtp}}");
+  });
+});
+
+/**
+ * A mail server on a hosted server's private network is not a board's to
+ * name: the server refuses to dial it, and nothing is sent (src/egress.ts).
+ */
+describe("sending from a hosted server", () => {
+  afterEach(async () => {
+    await setEgressPolicy({ mode: "open" });
+  });
+
+  it("does not dial a private address, and says so", async () => {
+    await setEgressPolicy(readEgressPolicy({ HKP_EGRESS: "public" }));
+    const t = smtp({ ...CREDENTIALS, host: "192.168.1.10", to: "ops@hotel.example" });
+
+    expect(await t.run("all quiet")).toBeNull();
+    expect(t.sent).toEqual([]);
+    expect(t.service.getState().error).toBe(
+      "This server does not reach private addresses (192.168.1.10)",
+    );
   });
 });

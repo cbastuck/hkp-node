@@ -27,7 +27,7 @@
  */
 import { randomUUID } from "node:crypto";
 
-import { eval as evaluateAst, parse } from "expression-eval";
+import { evaluate as evaluateAst, parse } from "../expressionEval";
 
 export type CompiledExpression = (params: unknown) => unknown;
 
@@ -300,6 +300,14 @@ export const globalScope: Record<string, unknown> = {
   parse: (x: string | undefined) =>
     x !== undefined ? JSON.parse(x) : "<parse undefined>",
   concat: (...args: string[]) => args.join(""),
+  // An array's elements as one text, e.g. the parts a gather collected:
+  // join(params.items, ''). An empty element is nothing, as Array.join has it.
+  join: (arr: unknown, separator?: string) =>
+    Array.isArray(arr)
+      ? arr.join(separator ?? "")
+      : arr === null || arr === undefined
+        ? ""
+        : `${arr}`,
   reformatDate: (date: string, inputFormat: string, outputFormat: string) =>
     formatDate(parseDate(date, inputFormat), outputFormat),
   formatNow: (format: string) => formatDate(new Date(), format),

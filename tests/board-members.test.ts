@@ -849,6 +849,39 @@ describe("what a member may send", () => {
     }
   });
 
+  it("names a facade's service exactly, not a way into it", async () => {
+    const { host } = await shared();
+    const anna = await attached(host, ANNA);
+
+    // A nested address, or a near miss of the name, is not the entry point.
+    for (const serviceUuid of ["book/inner", "book/", " book", "BOOK", "node/book"]) {
+      const answer = await anna.ask({
+        type: "processService",
+        requestId: `p-${serviceUuid}`,
+        runtimeId: "node",
+        serviceUuid,
+        payload: {},
+      });
+      expect(answer.error, serviceUuid).toBe("This board does not offer that");
+    }
+  });
+
+  it("reaches the facade's service where the board has it, whatever runtime it names", async () => {
+    const { host } = await shared();
+    const anna = await attached(host, ANNA);
+
+    const answer = await anna.ask({
+      type: "processService",
+      requestId: "p-elsewhere",
+      runtimeId: "some-other-runtime",
+      serviceUuid: "book",
+      payload: {},
+    });
+
+    expect(answer.data).toEqual({ accepted: true });
+    await eventually(() => rowsOf(anna).length > 0, "the answer, from where book is");
+  });
+
   it("is never a configure", async () => {
     const { host, runtime } = await shared();
     const anna = await attached(host, ANNA);

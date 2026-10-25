@@ -50,6 +50,7 @@
  * avoids carrying a credential at all.
  */
 import { resolveCredential } from "../secrets";
+import { refusalIn } from "../egress";
 import {
   HostedService,
   JsonRecord,
@@ -493,6 +494,12 @@ export class TextGenerationService implements HostedService {
       notify(result);
       return result;
     } catch (err) {
+      // Refused here, not unreachable: telling the person to start a server
+      // would be advice about the wrong problem.
+      const refused = refusalIn(err);
+      if (refused) {
+        return this.fail(notify, refused.message);
+      }
       // A connection that never opened, as distinct from anything else that
       // went wrong in here: fetch reports those as a TypeError carrying the
       // socket error as its cause. Claiming a wider set would answer "the

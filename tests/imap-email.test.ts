@@ -119,6 +119,7 @@ import {
   normalizeReferences,
 } from "../src/services/imap-email";
 import { SecretVault } from "../src/secrets";
+import { readEgressPolicy, setEgressPolicy } from "../src/egress";
 
 const CONFIG = {
   host: "imap.example.com",
@@ -409,5 +410,47 @@ describe("imap-email credentials", () => {
     expect(service.getState()).toMatchObject({
       error: "no value stored for absent",
     });
+  });
+});
+
+/**
+ * A mailbox on a hosted server: the board names the host, and the server
+ * decides whether to dial it (src/egress.ts). ImapFlow opens its own socket,
+ * so it is handed the address that was checked rather than the name.
+ */
+describe("imap-email on a hosted server", () => {
+  beforeEach(() => {
+    fake.store.length = 0;
+    fake.clients.length = 0;
+    fake.state.refuseConnections = false;
+  });
+
+  afterEach(async () => {
+    await setEgressPolicy({ mode: "open" });
+  });
+
+  const hosted = (allow = "") =>
+    setEgressPolicy(readEgressPolicy({ HKP_EGRESS: "public", HKP_EGRESS_ALLOW: allow }));
+
+  it("does not dial a private address, and says so", async () => {
+    await hosted();
+    const { service } = makeService({ ...CONFIG, host: "10.0.0.5", connect: true });
+
+    await vi.waitFor(() =>
+      expect(service.getState()).toMatchObject({
+        status: "disconnected",
+        error: "This server does not reach private addresses (10.0.0.5)",
+      }),
+    );
+    expect(fake.clients).toHaveLength(0);
+  });
+
+  it("dials the checked address, and verifies the certificate by name", async () => {
+    await hosted("127.0.0.0/8,::1");
+    makeService({ ...CONFIG, host: "localhost", connect: true });
+
+    await vi.waitFor(() => expect(fake.clients).toHaveLength(1));
+    expect(["127.0.0.1", "::1"]).toContain(latest().options.host);
+    expect(latest().options.servername).toBe("localhost");
   });
 });

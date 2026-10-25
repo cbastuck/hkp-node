@@ -11,6 +11,8 @@ import { MapService, mapDescriptor } from "./services/map";
 import { MonitorService, monitorDescriptor } from "./services/monitor";
 import { SubService, subServiceDescriptor } from "./services/sub-service";
 import { IteratorService, iteratorDescriptor } from "./services/iterator";
+import { GatherService, gatherDescriptor } from "./services/gather";
+import { SpreadService, spreadDescriptor } from "./services/spread";
 import { TracksService, tracksDescriptor } from "./services/tracks";
 import {
   CommunicationDispatcherService,
@@ -113,6 +115,7 @@ import {
 } from "./auth";
 import {
   admitsWithoutCredential,
+  isForwarded,
   allowsOrigin,
   allowsOriginWithoutCredential,
 } from "./origins";
@@ -126,6 +129,8 @@ import {
   ServiceConfiguration,
 } from "./types";
 import { readSecretsPayload, referencedSecrets } from "./secrets";
+import { socketCeiling } from "./coordinator/frameLimits";
+import { TICKET_TTL_MS, TicketHolder, WsTickets } from "./wsTickets";
 import {
   AssetDescriptor,
   DEFAULT_MAX_INLINE_ASSET_BYTES,
@@ -439,6 +444,21 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
       },
     ],
     [
+      gatherDescriptor.serviceId,
+      {
+        descriptor: gatherDescriptor,
+        create: (config, createService) =>
+          new GatherService(config, createService),
+      },
+    ],
+    [
+      spreadDescriptor.serviceId,
+      {
+        descriptor: spreadDescriptor,
+        create: (config, _createService) => new SpreadService(config),
+      },
+    ],
+    [
       tracksDescriptor.serviceId,
       {
         descriptor: tracksDescriptor,
@@ -680,6 +700,7 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
         origin: request.headers.origin,
         secFetchSite: singleHeader(request.headers["sec-fetch-site"]),
         host: request.headers.host,
+        forwarded: isForwarded(request.headers),
       },
       allowedOrigins,
       ownNames,
@@ -1175,6 +1196,32 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
     res.sendStatus(removed ? 200 : 404);
   });
 
+  // What a browser opens a WebSocket with instead of putting its token in the
+  // address; see wsTickets.ts. Self-authenticated, because a coordinator's
+  // bridge is opened by people the allowlist does not name: the ticket keeps
+  // who the caller is and whether they may own, and the upgrade judges that.
+  const wsTickets = new WsTickets();
+  selfAuthenticatedRoutes.add("POST /ws-tickets");
+  expressApp.post("/ws-tickets", (req, res) => {
+    const header = req.headers.authorization;
+    const token = header?.startsWith("Bearer ") ? header.slice(7) : undefined;
+    void Promise.all([
+      authenticator.identifyToken(token),
+      authenticator.authorizeOwner(token),
+    ])
+      .then(([identity, owner]) => {
+        if (!identity) {
+          res.sendStatus(401);
+          return;
+        }
+        res.json({
+          ticket: wsTickets.mint({ identity, owner }),
+          expiresInMs: TICKET_TTL_MS,
+        });
+      })
+      .catch(() => res.sendStatus(401));
+  });
+
   expressApp.get("/runtimes", (req, res) => {
     res.json({
       runtimes: tenantOf(req)
@@ -1622,8 +1669,9 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
     },
   );
 
-  // No ceiling of the library's own; see attachCoordinatorJoin.
-  const bridgeWsServer = new WebSocketServer({ noServer: true, maxPayload: 0 });
+  // Above the coordinator's frame limit, as for attachCoordinatorJoin; the
+  // coordinator says which when it takes the bridge (setBridgeUpgradeHandler).
+  let bridgeWsServer = new WebSocketServer({ noServer: true, maxPayload: socketCeiling() });
   let bridgeUpgradeHandler:
     | ((
         ws: WebSocket,
@@ -1666,8 +1714,8 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
       return;
     }
 
-    // Authenticate every upgrade with the same rules as HTTP routes. Browsers
-    // can't set headers on a WS handshake, so the token rides in ?access_token=.
+    // Authenticate every upgrade with the same rules as HTTP routes; who is
+    // asking is read from the ticket or token below.
     // The Origin check blocks cross-site WebSocket hijacking from a page a local
     // user happens to visit — and without auth, where nothing else stands in
     // the way, it is the whole rule a request is let in by.
@@ -1680,14 +1728,23 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
       return;
     }
 
-    // Browsers can't set headers on a WS handshake, so they pass the token as
-    // ?access_token=. Non-browser clients (the coordinator) use the standard
-    // Authorization header, keeping the token out of URLs/logs.
+    // Who is asking. A browser cannot set a header on a handshake, so it
+    // presents a ticket it was given for its token (wsTickets.ts); a client
+    // that can — the coordinator — sends the token itself. `?access_token=` is
+    // what browsers sent before tickets, and is still taken from one that
+    // does, though it puts the token where logs keep it.
     const authHeader = request.headers.authorization;
     const bearer = authHeader?.startsWith("Bearer ")
       ? authHeader.slice(7)
       : undefined;
     const token = bearer ?? url.searchParams.get("access_token");
+    const ticket = url.searchParams.get("ticket");
+    const caller: Promise<TicketHolder> = ticket
+      ? Promise.resolve(wsTickets.redeem(ticket) ?? { identity: null, owner: null })
+      : Promise.all([
+          authenticator.identifyToken(token),
+          authenticator.authorizeOwner(token),
+        ]).then(([identity, owner]) => ({ identity, owner }));
 
     // A coordinator's bridge authenticates its own callers, like the join
     // endpoint above: a deployed board is attached to by its owner and by the
@@ -1695,11 +1752,8 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
     // allowlist. So the upgrade establishes who is asking and whether they may
     // own; which board they may attach to, and as what, is the handler's.
     if (url.pathname === "/coordinator/bridge") {
-      void Promise.all([
-        authenticator.identifyToken(token),
-        authenticator.authorizeOwner(token),
-      ])
-        .then(([identity, owner]) => {
+      void caller
+        .then(({ identity, owner }) => {
           if (!identity) {
             rejectUpgrade(socket, 401, "Unauthorized");
             return;
@@ -1716,6 +1770,10 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
             return;
           }
           bridgeWsServer.handleUpgrade(request, socket, head, (ws) => {
+            // A frame past the socket ceiling is reported here before the
+            // library closes the socket; the close is what is acted on.
+            // Unlistened, it would end this process.
+            ws.on("error", () => {});
             bridgeUpgradeHandler!(ws, identity, !!owner, socket);
           });
         })
@@ -1725,9 +1783,8 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
       return;
     }
 
-    void authenticator
-      .authorizeOwner(token)
-      .then((user) => {
+    void caller
+      .then(({ owner: user }) => {
         if (!user) {
           rejectUpgrade(socket, 401, "Unauthorized");
           return;
@@ -1744,6 +1801,8 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
         }
 
         webSocketServer.handleUpgrade(request, socket, head, (websocket) => {
+          // As for a bridge: an oversized frame is reported, then closed.
+          websocket.on("error", () => {});
           webSocketServer.emit("connection", websocket, request, {
             owner,
             runtimeId,
@@ -1879,8 +1938,16 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
         mayOwn: boolean,
         transport?: Duplex,
       ) => void,
+      /** The frame limit of the coordinator behind the handler. */
+      maxFrameBytes?: number,
     ) {
       bridgeUpgradeHandler = handler;
+      if (maxFrameBytes !== undefined) {
+        bridgeWsServer = new WebSocketServer({
+          noServer: true,
+          maxPayload: socketCeiling(maxFrameBytes),
+        });
+      }
     },
     async stop() {
       coordinatorLinks.stop();
