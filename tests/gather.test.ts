@@ -207,6 +207,15 @@ describe("what counts as a part", () => {
     expect(isPart(part("g", 0.5, 2, "x"))).toBe(false);
     expect(isPart([part("g", 0, 1, "x")])).toBe(false);
   });
+
+  it("is held without allocating for the total it claims", async () => {
+    // A part names its own total; an array of that length would be refused
+    // outright (RangeError) or allocated before a second part arrived.
+    const t = gather();
+
+    expect(await t.run(part("g", 0, 2 ** 40, "a"))).toBeNull();
+    expect(t.service.getState().pending).toBe(1);
+  });
 });
 
 describe("configuration", () => {

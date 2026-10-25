@@ -94,8 +94,12 @@ export function isPart(value: unknown): value is Part {
 }
 
 type Collecting = {
-  items: unknown[];
-  received: number;
+  /**
+   * By index rather than an array of `total`: a part names its own total, and
+   * an array that size would be allocated — or refused outright — before a
+   * second part had arrived.
+   */
+  items: Map<number, unknown>;
   total: number;
   bytes: number;
   startedAt: number;
@@ -191,8 +195,7 @@ export class GatherService extends SubService {
     let collecting = this.collecting.get(group);
     if (!collecting) {
       collecting = {
-        items: new Array(total),
-        received: 0,
+        items: new Map(),
         total,
         bytes: 0,
         startedAt: now,
@@ -209,7 +212,7 @@ export class GatherService extends SubService {
       );
       return null;
     }
-    if (index in collecting.items) {
+    if (collecting.items.has(index)) {
       // Sent twice; the first one counts.
       return null;
     }
@@ -225,21 +228,20 @@ export class GatherService extends SubService {
       return null;
     }
 
-    collecting.items[index] = item;
-    collecting.received += 1;
+    collecting.items.set(index, item);
     notify({
       group,
-      received: collecting.received,
+      received: collecting.items.size,
       total,
       pending: this.collecting.size,
     });
 
-    if (collecting.received < total) {
+    if (collecting.items.size < total) {
       return null;
     }
 
     this.collecting.delete(group);
-    const items = collecting.items;
+    const items = Array.from({ length: total }, (_, i) => collecting.items.get(i));
     if (!this.pipeline || this.pipeline.listServices().length === 0) {
       return this.stopPropagation ? null : items;
     }
@@ -279,10 +281,10 @@ export class GatherService extends SubService {
     for (const [group, collecting] of this.collecting) {
       if (now - collecting.startedAt > this.timeoutMs) {
         this.collecting.delete(group);
-        this.lastError = `group ${group} timed out with ${collecting.received} of ${collecting.total} parts`;
+        this.lastError = `group ${group} timed out with ${collecting.items.size} of ${collecting.total} parts`;
         this.host?.log("warn", "gather.timed-out", {
           group,
-          received: collecting.received,
+          received: collecting.items.size,
           total: collecting.total,
         });
         notify({ error: this.lastError, pending: this.collecting.size });
