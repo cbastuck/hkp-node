@@ -257,6 +257,19 @@ describe("a page against a server without auth", () => {
     expect(patch.headers["access-control-allow-methods"]).toContain("PATCH");
   });
 
+  it("a page may change a runtime's state, which it does with PATCH", async () => {
+    // Capture mode is switched with PATCH /runtimes/:id/state; a preflight
+    // that leaves PATCH out has the browser refuse it before it is sent.
+    const rt = await listening({ auth: { mode: "none" } });
+
+    const preflight = await rt.send("OPTIONS", "/runtimes/any/state", {
+      Origin: "http://localhost:5173",
+      "Access-Control-Request-Method": "PATCH",
+      "Access-Control-Request-Headers": "content-type",
+    });
+    expect(preflight.headers["access-control-allow-methods"]).toContain("PATCH");
+  });
+
   it("the website is a site like any other until the server is told otherwise", async () => {
     const website = { Origin: "https://readymadeit.com" };
 

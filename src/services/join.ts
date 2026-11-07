@@ -4,7 +4,7 @@
  * Service Name: Join
  * Runtime: hkp-node
  * Modes: overwrite | add
- * Key Config: as, mode, pipeline, bypass
+ * Key Config: as, mode, onFailure (stop | merge), pipeline, bypass
  * IO: in=any -> out=the input and the nested pipeline's result, together
  * Arrays: the input is one value; nesting an `iterator` handles arrays
  * Binary: passed to the nested pipeline untouched
@@ -41,6 +41,17 @@
  * not: a board that files the result would file nothing, under a name that says
  * it filed something.
  *
+ * **Unless it stopped because something in it failed, and the board asked to
+ * hear about it** (`onFailure: "merge"`). A detour can end with nothing for two
+ * reasons: a service chose to stop — a filter, a claim that found nothing to
+ * take — or a service failed, and said why in an `error` notification. The
+ * first is flow and still stops. The second, with `merge`, passes the input on
+ * with `{ error, service }` where the result would have gone, so the services
+ * after the Join can record the failure beside the thing it happened to rather
+ * than the run ending with the reason in a notification nobody kept. Only a
+ * service directly in the detour is heard: one inside a scope of its own
+ * reports to that scope.
+ *
  * A detour that takes its time is still a detour: the runtime awaits every
  * service, so a nested `text-generation` taking a minute is waited for and its
  * answer merged like any other. That is the whole reason the pipeline awaits —
@@ -68,6 +79,11 @@ type JoinMode = "overwrite" | "add";
 
 const MODES: JoinMode[] = ["overwrite", "add"];
 
+/** What a detour that failed does to this pipeline. */
+type FailureMode = "stop" | "merge";
+
+const FAILURE_MODES: FailureMode[] = ["stop", "merge"];
+
 function isRecord(value: unknown): value is JsonRecord {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -80,6 +96,7 @@ export class JoinService extends SubService {
 
   private as = "";
   private mode: JoinMode = "overwrite";
+  private onFailure: FailureMode = "stop";
 
   constructor(config: ServiceConfiguration, createService: ServiceCreator) {
     super(config, createService);
@@ -101,7 +118,12 @@ export class JoinService extends SubService {
   }
 
   getState(): JsonRecord {
-    return { ...super.getState(), as: this.as, mode: this.mode };
+    return {
+      ...super.getState(),
+      as: this.as,
+      mode: this.mode,
+      onFailure: this.onFailure,
+    };
   }
 
   async process(
@@ -116,18 +138,43 @@ export class JoinService extends SubService {
       return input;
     }
 
+    // What this call's detour reported, and only this call's: the callback is
+    // handed to this one run of the pipeline, so two articles in flight at once
+    // never hear each other's failures.
+    let failure: { error: string; service: string } | null = null;
     const result = await this.pipeline.process(
       input,
-      () => {},
+      (notification) => {
+        const error = isRecord(notification.payload)
+          ? notification.payload.error
+          : undefined;
+        if (typeof error !== "string") {
+          return;
+        }
+        if (error) {
+          failure = { error, service: notification.instanceId };
+        } else if (failure?.service === notification.instanceId) {
+          // A service clearing what it said before: it recovered.
+          failure = null;
+        }
+      },
       childRun(this.host?.currentContext() ?? null),
     );
 
     if (result === null || result === undefined) {
+      if (failure && this.onFailure === "merge") {
+        return this.merged(input, failure);
+      }
       // Nothing to merge, so nothing to pass on. Continuing with the input
       // alone would be indistinguishable downstream from a merge that worked.
       return null;
     }
 
+    return this.merged(input, result);
+  }
+
+  /** The input with what came back from the detour beside it. */
+  private merged(input: unknown, result: unknown): unknown {
     if (this.as) {
       return isRecord(input)
         ? { ...input, [this.as]: result }
@@ -153,6 +200,12 @@ export class JoinService extends SubService {
     }
     if (typeof config.mode === "string" && MODES.includes(config.mode as JoinMode)) {
       this.mode = config.mode as JoinMode;
+    }
+    if (
+      typeof config.onFailure === "string" &&
+      FAILURE_MODES.includes(config.onFailure as FailureMode)
+    ) {
+      this.onFailure = config.onFailure as FailureMode;
     }
   }
 }

@@ -168,3 +168,51 @@ describe("the health log's generated history", () => {
     expect(left.count).toBe(generated.count - 3);
   });
 });
+
+describe("deleting every entry", () => {
+  it("empties the log, measurements and journal alike", () => {
+    const { send, errors } = healthLog();
+    send("fake-measurements", generate);
+
+    const left = send("delete-entry", { operation: "delete-all" });
+    expect(errors).toEqual([]);
+    expect(left.count).toBe(0);
+
+    // The starter journal had today's entry: a value recorded today now
+    // finds no journal to join.
+    const today = new Date().toISOString().slice(0, 10);
+    const after = send("add-value", {
+      operation: "add-value",
+      eventId: "mine-1",
+      observedAt: `${today}T08:00:00Z`,
+      kind: "glucose",
+      value: "118",
+      unit: "mg/dL",
+    });
+    expect(after.rows).toHaveLength(1);
+    expect(after.rows[0].journal ?? null).toBeNull();
+  });
+
+  it("leaves the journal alone when only a selection is deleted", () => {
+    const { send, errors } = healthLog();
+    const today = new Date().toISOString().slice(0, 10);
+    const before = send("read-history", {});
+    send("delete-entry", {
+      operation: "delete",
+      eventIds: JSON.stringify(["sample-glucose-4"]),
+    });
+    const after = send("add-value", {
+      operation: "add-value",
+      eventId: "mine-1",
+      observedAt: `${today}T08:00:00Z`,
+      kind: "glucose",
+      value: "118",
+      unit: "mg/dL",
+    });
+
+    expect(errors).toEqual([]);
+    expect(after.count).toBe(before.count);
+    const mine = after.rows.find((row) => row.eventId === "mine-1")!;
+    expect(mine.journal).toBeTruthy();
+  });
+});

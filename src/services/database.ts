@@ -20,6 +20,7 @@
  */
 import { createHash } from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { DatabaseSync, StatementSync } from "node:sqlite";
 
@@ -42,6 +43,8 @@ export type Database = {
     sql: string,
     params?: SqlParams,
   ): { changes: number; lastInsertRowid: number };
+  /** The database as an SQLite file: the bytes any SQLite tool opens. */
+  file(): Uint8Array;
   close(): void;
 };
 
@@ -196,6 +199,7 @@ function wrap(db: DatabaseSync): Database {
         lastInsertRowid: Number(result.lastInsertRowid),
       };
     },
+    file: () => fileOf(db),
     close: () => {
       // Statements hold the database open; dropping them first means close
       // means close.
@@ -203,6 +207,24 @@ function wrap(db: DatabaseSync): Database {
       db.close();
     },
   };
+}
+
+/**
+ * A database's bytes as an SQLite file. `node:sqlite` cannot serialise one, so
+ * SQLite writes a consistent copy (`VACUUM INTO`) to a directory of the
+ * system's temporary space, which is read back and removed at once. A copy
+ * rather than the board's own file: that may be in the middle of a write, and
+ * an in-memory database has no file at all.
+ */
+function fileOf(db: DatabaseSync): Uint8Array {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hkp-sql-export-"));
+  try {
+    const target = path.join(dir, "export.sqlite");
+    db.prepare("VACUUM INTO ?").run(target);
+    return new Uint8Array(fs.readFileSync(target));
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 }
 
 /**
