@@ -115,6 +115,8 @@ export class RssService implements HostedService {
   private timeoutMs = DEFAULT_TIMEOUT_MS;
   private summaryChars = DEFAULT_SUMMARY_CHARS;
   private fetching = false;
+  /** The latest round begun; an earlier one finishing later is dropped. */
+  private round = 0;
   /**
    * The address a feed named by reference resolves to.
    *
@@ -260,12 +262,19 @@ export class RssService implements HostedService {
     context?: ProcessContext,
   ): Promise<void> {
     const feeds = this.feeds;
+    const round = ++this.round;
     this.fetching = true;
     notify({ fetching: true, error: "", sources: feeds.length });
 
     const results = await Promise.all(
       feeds.map((feed) => this.readFeed(feed)),
     );
+    // A newer round began while this one waited — after a feed was added or
+    // removed, say — and its list is the one that holds. Reporting this one
+    // last would bring a removed feed's articles back.
+    if (round !== this.round) {
+      return;
+    }
 
     const articles: Article[] = [];
     const errors: { url: string; error: string }[] = [];
