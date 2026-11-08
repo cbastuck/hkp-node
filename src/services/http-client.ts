@@ -7,9 +7,9 @@
  * Key Config: url, __hkpMount (target), path, query, method, headers, userAgent,
  *             body
  * IO: in=body to send (string | object | bytes | {meta, body|binary}), whose
- *     meta may also say the method and the mount sub-path to call
- *     out=null immediately; the response is pushed through the rest of the
- *     pipeline when it arrives, shaped {meta, body?, binary?}
+ *     meta may also say the method, the mount sub-path or the url to call
+ *     out=the response once it arrives, shaped {meta, body?, binary?}; nothing
+ *     when there was no response
  *
  * The node implementation of the `http-client` concept hkp-rt also provides,
  * sharing its state contract (`url`, `method`, `headers`, `userAgent`, `body`)
@@ -45,9 +45,7 @@
 import {
   HostedService,
   JsonRecord,
-  ProcessContext,
   RuntimeHost,
-  RuntimeNotification,
   ServiceConfiguration,
   ServiceRegistryEntry,
 } from "../types";
@@ -101,15 +99,21 @@ type RequestBody = { body: BodyInit | Uint8Array; contentType?: string } | null;
  * different address per item — an episode written to its own path, a record
  * fetched by its own id — and the alternative is a service per address.
  *
- * So a request envelope may say: `{meta: {method, path}, binary | body}`, the
- * mirror of the response envelope this service already reports and the same
- * shape `http-server-subservices` hands its pipeline. What is unsaid stays as
- * configured, so a board that names neither is unaffected.
+ * So a request envelope may say: `{meta: {method, path, url}, binary | body}`,
+ * the mirror of the response envelope this service already reports and the
+ * same shape `http-server-subservices` hands its pipeline. What is unsaid stays
+ * as configured, so a board that names none of them is unaffected.
  *
  * `path` is a sub-path of a mount, exactly as the configured field is — a typed
- * URL carries its own path and is not rewritten from a distance.
+ * URL carries its own path and is not rewritten from a distance. `url` is what
+ * the configured `url` says, for a board whose addresses arrive as data — an
+ * article fetched by its own link — and like it, gives way to a mount.
  */
-function requestMeta(input: unknown): { path?: string; method?: string } {
+function requestMeta(input: unknown): {
+  path?: string;
+  method?: string;
+  url?: string;
+} {
   if (!input || typeof input !== "object" || Array.isArray(input)) {
     return {};
   }
@@ -122,6 +126,7 @@ function requestMeta(input: unknown): { path?: string; method?: string } {
     ...(typeof meta.method === "string" && meta.method
       ? { method: meta.method }
       : {}),
+    ...(typeof meta.url === "string" && meta.url ? { url: meta.url } : {}),
   };
 }
 
@@ -233,13 +238,12 @@ export class HttpClientService implements HostedService {
   }
 
   /**
-   * Starts the request and stops the synchronous push.
+   * Answers with the response, once there is one.
    *
-   * The runtime calls services one after another without awaiting, so a
-   * response cannot be returned from here — it does not exist yet. Returning
-   * null stops the push, and the rest of the pipeline is called with the
-   * response once it arrives (the inversion-of-control path a cache or a
-   * fetching service takes).
+   * The runtime awaits what a service answers, so the response is returned
+   * rather than pushed down the pipeline by hand — which is what lets a Join
+   * hold a request as a detour and an Iterator count what came back. Nothing
+   * comes back for a request that got no response at all.
    */
   process(
     input: unknown,
@@ -250,12 +254,12 @@ export class HttpClientService implements HostedService {
     }
 
     const request = requestMeta(input);
-    const target = this.targetUrl(request.path);
+    const target = this.targetUrl(request.path, request.url);
     if (!target) {
       // Either nothing is configured, or the mount's owner has not published an
       // address yet. Say so and stop; the next input tries again, by which time
       // the coordinator has usually handed the address over.
-      const pending = [this.mount, this.url].find((value) =>
+      const pending = [this.mount, request.url ?? this.url].find((value) =>
         parseMountRef(value),
       );
       notify({
@@ -266,17 +270,7 @@ export class HttpClientService implements HostedService {
       return null;
     }
 
-    // Captured here, while still inside the call this request belongs to. By
-    // the time the response arrives the pass has long returned, so this is the
-    // only moment at which the run that asked for it can still be named.
-    void this.send(
-      target,
-      input,
-      notify,
-      this.host?.currentContext() ?? undefined,
-      request.method,
-    );
-    return null;
+    return this.send(target, input, notify, request.method);
   }
 
   destroy(): void {
@@ -296,18 +290,20 @@ export class HttpClientService implements HostedService {
    * dial: it names a service whose address nobody has published, and falling
    * back past it would silently call something else. Boards written before the
    * split put the reference in `__hkpMount`; both read the same way.
+   *
+   * A URL the input names stands in for the configured one, and nothing more.
    */
-  private targetUrl(path?: string): string | null {
+  private targetUrl(path?: string, url = this.url): string | null {
     if (this.mount && !parseMountRef(this.mount)) {
       return this.withQuery(this.join(this.mount, path));
     }
     if (this.mount && parseMountRef(this.mount)) {
       return null;
     }
-    if (!this.url || parseMountRef(this.url)) {
+    if (!url || parseMountRef(url)) {
       return null;
     }
-    return this.withQuery(this.url);
+    return this.withQuery(url);
   }
 
   /**
@@ -347,9 +343,8 @@ export class HttpClientService implements HostedService {
     url: string,
     input: unknown,
     notify: (payload: unknown, instanceId?: string) => void,
-    context?: ProcessContext,
     requestMethod?: string,
-  ): Promise<void> {
+  ): Promise<JsonRecord | null> {
     const method = requestMethod ?? this.method;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);
@@ -392,7 +387,7 @@ export class HttpClientService implements HostedService {
           status: 0,
           error: sent.problem,
         });
-        return;
+        return null;
       }
       const { response } = sent;
 
@@ -407,7 +402,7 @@ export class HttpClientService implements HostedService {
         error: "",
         inFlight: this.inFlight - 1,
       });
-      await this.push(result, notify, context);
+      return result;
     } catch (err) {
       const message = failureReason(err);
       // Status 0: there was no response to have one, so the status of the
@@ -421,6 +416,7 @@ export class HttpClientService implements HostedService {
       });
       // A failed request produces no result to pass on: the pipeline behind
       // this service is not called, rather than called with a fabricated one.
+      return null;
     } finally {
       clearTimeout(timer);
       this.inFlight -= 1;
@@ -525,34 +521,5 @@ export class HttpClientService implements HostedService {
     }
 
     return { meta, binary: bytes };
-  }
-
-  /**
-   * Runs the rest of the pipeline with the response, then emits the runtime's
-   * result. A service that produces data outside the push has to emit it
-   * itself; nothing else will, and running the remaining services alone would
-   * leave the chain dead from here on.
-   */
-  private async push(
-    result: JsonRecord,
-    notify: (payload: unknown, instanceId?: string) => void,
-    context?: ProcessContext,
-  ): Promise<void> {
-    if (!this.host) {
-      return;
-    }
-    const output = await this.host.processFrom(
-      this.uuid,
-      result,
-      // No-op: the runtime already fans these out to its notification
-      // targets. Re-notifying through `notify` would deliver every one twice.
-      (_n: RuntimeNotification) => {},
-      context,
-    );
-    // A downstream service returning null means "stop" — honour it rather than
-    // forwarding a dead result to the next runtime.
-    if (output !== null && output !== undefined) {
-      this.host.emitResult(output);
-    }
   }
 }

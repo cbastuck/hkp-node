@@ -76,6 +76,9 @@ export type AuthConfig =
        * Where the issuer's signing keys are published. Unset is Auth0's
        * `https://<domain>/.well-known/jwks.json`; tests point it at keys they
        * hold. The issuer a token must name stays `https://<domain>/` either way.
+       * Verification is the real one, only the keys are the harness's. The
+       * server sets it only from `HKP_TEST_JWKS_URI`, which it takes only from
+       * a checkout and only on loopback (`testJwksUri` in index.ts).
        */
       jwksUri?: string;
     }

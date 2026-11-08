@@ -182,3 +182,116 @@ describe("configuration", () => {
     expect(service.getState()).toMatchObject({ as: "extraction", mode: "add" });
   });
 });
+
+/**
+ * A detour that fails, told apart from one that chose to stop.
+ *
+ * Both end with nothing. Only the failure has a reason, and with `onFailure:
+ * "merge"` that reason is what the rest of the pipeline gets, beside the thing
+ * it happened to — so a board can record it instead of the run just ending.
+ */
+describe("when something in the detour fails", () => {
+  /** Fails for an input carrying `fail`, after a delay it also carries. */
+  function judging(config: ServiceConfiguration): HostedService {
+    return {
+      serviceId: config.serviceId,
+      serviceName: "Judging",
+      uuid: config.uuid,
+      configure: () => ({}),
+      getState: () => ({}),
+      process: async (input: any, notify) => {
+        await new Promise((resolve) => setTimeout(resolve, input?.delay ?? 1));
+        if (input?.fail) {
+          notify({ error: input.fail });
+          return null;
+        }
+        if (input?.skip) {
+          // A filter, or a claim that found nothing: a stop, not a failure.
+          return null;
+        }
+        return { text: `brief of ${input.id}` };
+      },
+    };
+  }
+
+  function judged(state: Record<string, unknown>) {
+    const service = new JoinService(
+      {
+        uuid: "brief",
+        serviceId: "join",
+        state: {
+          pipeline: [{ serviceId: "judging", uuid: "write", state: {} }],
+          ...state,
+        },
+      } as never,
+      judging,
+    );
+    service.setHost(hostFor());
+    return (input: unknown) => service.process(input, () => {});
+  }
+
+  it("passes the input on with the failure where the result would have gone", async () => {
+    const run = judged({ as: "brief", onFailure: "merge" });
+
+    expect(await run({ id: "a", fail: "no value stored for anthropic.key" })).toEqual({
+      id: "a",
+      fail: "no value stored for anthropic.key",
+      brief: { error: "no value stored for anthropic.key", service: "write" },
+    });
+  });
+
+  it("keeps a failure under a name of its own when no name is given", async () => {
+    // Spread like a result, it would be hidden by an `error` the item already
+    // carried in `add` mode, and replace the item's own `service` otherwise.
+    const added = judged({ onFailure: "merge", mode: "add" });
+    expect(await added({ id: "a", fail: "boom", error: "" })).toEqual({
+      id: "a",
+      fail: "boom",
+      error: "",
+      failure: { error: "boom", service: "write" },
+    });
+
+    const overwritten = judged({ onFailure: "merge" });
+    expect(await overwritten({ id: "a", fail: "boom", service: "court-3" })).toEqual({
+      id: "a",
+      fail: "boom",
+      service: "court-3",
+      failure: { error: "boom", service: "write" },
+    });
+  });
+
+  it("still stops on a detour that chose to stop", async () => {
+    const run = judged({ as: "brief", onFailure: "merge" });
+    expect(await run({ id: "a", skip: true })).toBeNull();
+  });
+
+  it("stops on a failure too unless the board asked to hear it", async () => {
+    // The default is what a Join always did, so no board changes meaning.
+    const run = judged({ as: "brief" });
+    expect(await run({ id: "a", fail: "boom" })).toBeNull();
+  });
+
+  it("never hands one run another run's failure", async () => {
+    // Two articles in flight at once through the same Join: the one that fails
+    // finishes first, and the one that succeeds must not be marked failed.
+    const run = judged({ as: "brief", onFailure: "merge" });
+
+    const [ok, failed] = await Promise.all([
+      run({ id: "ok", delay: 20 }),
+      run({ id: "bad", fail: "timeout", delay: 1 }),
+    ]);
+
+    expect(ok).toEqual({ id: "ok", delay: 20, brief: { text: "brief of ok" } });
+    expect((failed as any).brief).toEqual({ error: "timeout", service: "write" });
+  });
+
+  it("says how it handles a failure", () => {
+    const service = new JoinService(
+      { uuid: "j", serviceId: "join", state: { onFailure: "merge", pipeline: [] } } as never,
+      fakeService,
+    );
+    expect(service.getState()).toMatchObject({ onFailure: "merge" });
+    service.configure({ onFailure: "nonsense" });
+    expect(service.getState()).toMatchObject({ onFailure: "merge" });
+  });
+});

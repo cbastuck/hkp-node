@@ -20,15 +20,36 @@ type Recorded = { url: string; headers: http.IncomingHttpHeaders; body: any };
 type Endpoint = {
   url: string;
   received: Recorded[];
+  /** The models asked about through the Models API, in order. */
+  lookups: string[];
   close: () => Promise<void>;
 };
 
-/** Answers like the messages API, and records what it was asked. */
+type ModelsReply = (id: string) => { status?: number; json?: unknown };
+
+/**
+ * Answers like the messages API, and records what it was asked.
+ *
+ * The Models API is answered apart, as the real one serves it on a path of its
+ * own: not found unless a test says otherwise, which leaves the service to its
+ * own table — and keeps `received` the requests that generate something.
+ */
 async function startEndpoint(
   reply: (body: any) => { status?: number; json?: unknown; sse?: string[] },
+  models: ModelsReply = () => ({ status: 404 }),
 ): Promise<Endpoint> {
   const received: Recorded[] = [];
+  const lookups: string[] = [];
   const server = http.createServer((req, res) => {
+    const lookup = req.method === "GET" && req.url?.match(/^\/v1\/models\/(.+)$/);
+    if (lookup) {
+      const id = decodeURIComponent(lookup[1]);
+      lookups.push(id);
+      const answer = models(id);
+      res.writeHead(answer.status ?? 200, { "content-type": "application/json" });
+      res.end(JSON.stringify(answer.json ?? {}));
+      return;
+    }
     const chunks: Buffer[] = [];
     req.on("data", (chunk) => chunks.push(chunk as Buffer));
     req.on("end", () => {
@@ -58,6 +79,7 @@ async function startEndpoint(
   return {
     url: `http://127.0.0.1:${port}`,
     received,
+    lookups,
     close: () => new Promise<void>((resolve) => server.close(() => resolve())),
   };
 }
@@ -72,15 +94,16 @@ afterEach(async () => {
 });
 
 beforeEach(() => {
-  // A key in the developer's own environment would otherwise decide what these
-  // tests are testing.
-  vi.stubEnv("ANTHROPIC_API_KEY", "");
+  // The service reads no key from the environment; one set there must make no
+  // difference to what these tests see.
+  vi.stubEnv("ANTHROPIC_API_KEY", "sk-from-env");
 });
 
 async function endpoint(
   reply: Parameters<typeof startEndpoint>[0],
+  models?: ModelsReply,
 ): Promise<Endpoint> {
-  const created = await startEndpoint(reply);
+  const created = await startEndpoint(reply, models);
   endpoints.push(created);
   return created;
 }
@@ -215,7 +238,7 @@ describe("text-generation request", () => {
     expect(text).toEqual({ type: "text", text: "What is this?" });
   });
 
-  it("sends temperature without top_p, which this API refuses alongside it", async () => {
+  it("sends no sampling parameters, which Claude models refuse", async () => {
     const api = await endpoint(() => ({ json: ANSWER }));
     const t = serviceWith({
       serverUrl: api.url,
@@ -229,20 +252,47 @@ describe("text-generation request", () => {
     await t.service.process("decide", t.notify);
 
     const body = api.received[0].body;
-    expect(body.temperature).toBe(0.3);
-    expect(body.top_k).toBe(20);
+    expect(body.temperature).toBeUndefined();
+    expect(body.top_k).toBeUndefined();
     expect(body.top_p).toBeUndefined();
-    // The board keeps what it configured; only the request leaves it out.
+    // The board keeps what it configured, for the backends that use it; only
+    // the request leaves it out.
+    expect(t.service.getState().temperature).toBe(0.3);
     expect(t.service.getState().topP).toBe(0.95);
   });
 
-  it("leaves sampling alone while the model is reasoning", async () => {
+  it("sends temperature and top_k to the older models that still take them", async () => {
+    const api = await endpoint(() => ({ json: ANSWER }));
+    const t = serviceWith({
+      serverUrl: api.url,
+      apiKey: "sk-test",
+      model: "claude-haiku-4-5",
+      stream: false,
+      temperature: 0.3,
+      topP: 0.95,
+      topK: 20,
+    });
+
+    await t.service.process("decide", t.notify);
+
+    const body = api.received[0].body;
+    expect(body.temperature).toBe(0.3);
+    expect(body.top_k).toBe(20);
+    // Refused beside temperature on these models.
+    expect(body.top_p).toBeUndefined();
+    const meta = t.service.getState().__meta__ as any;
+    expect(meta?.temperature).toBeUndefined();
+    expect(meta?.topP?.data?.note).toContain("top_p");
+  });
+
+  it("gives a model that thinks on a budget the budget", async () => {
     // Sampling is fixed during extended thinking and sending any of the three
     // is rejected outright, so they have to be absent rather than defaulted.
     const api = await endpoint(() => ({ json: ANSWER }));
     const t = serviceWith({
       serverUrl: api.url,
       apiKey: "sk-test",
+      model: "claude-haiku-4-5",
       stream: false,
       thinking: true,
       thinkingBudgetTokens: 2048,
@@ -259,6 +309,174 @@ describe("text-generation request", () => {
     // Reasoning draws on the same budget as the answer, so a ceiling at or
     // below it would leave nothing to answer with.
     expect(body.max_tokens).toBeGreaterThan(2048);
+  });
+});
+
+/**
+ * One board, many Claude models.
+ *
+ * The board says what it wants; each model is told in the words it accepts.
+ * Every case here is a request the API would refuse if it were sent to that
+ * model as it is sent to another.
+ */
+describe("text-generation per Claude model", () => {
+  async function bodyFor(state: Record<string, unknown>, models?: ModelsReply) {
+    const api = await endpoint(() => ({ json: ANSWER }), models);
+    const t = serviceWith({ serverUrl: api.url, apiKey: "sk-test", stream: false, ...state });
+    await t.service.process("brief this", t.notify);
+    return { body: api.received[0].body, api, t };
+  }
+
+  it("asks a current model to think adaptively, never with a budget", async () => {
+    const { body } = await bodyFor({ model: "claude-haiku-5-5", thinking: true, thinkingBudgetTokens: 2048 });
+    expect(body.thinking).toEqual({ type: "adaptive" });
+    // No budget to make room for, so the board's ceiling stands.
+    expect(body.max_tokens).toBe(1024);
+  });
+
+  it("leaves a current model to its default when the board says nothing", async () => {
+    const { body } = await bodyFor({ model: "claude-haiku-5-5" });
+    expect(body.thinking).toBeUndefined();
+    expect(body.output_config).toBeUndefined();
+  });
+
+  it("tells each model not to think in the word it accepts", async () => {
+    expect((await bodyFor({ model: "claude-haiku-5-5", thinking: false })).body.thinking).toEqual({ type: "disabled" });
+    expect((await bodyFor({ model: "claude-sonnet-5-5", thinking: false })).body.thinking).toEqual({ type: "between_tools" });
+    // Opus 5.5 always thinks: the word would be refused, so it is not sent.
+    expect((await bodyFor({ model: "claude-opus-5-5", thinking: false })).body.thinking).toBeUndefined();
+  });
+
+  it("does not say 'do not think' at an effort the model refuses it at", async () => {
+    const { body, t } = await bodyFor({ model: "claude-haiku-5-5", thinking: false, effort: "max" });
+    expect(body.thinking).toBeUndefined();
+    expect(body.output_config).toEqual({ effort: "max" });
+    expect((t.service.getState().__meta__ as any).thinking.data.note).toContain("regardless");
+  });
+
+  it("sends effort only at a level the model takes", async () => {
+    expect((await bodyFor({ model: "claude-opus-5-5", effort: "low" })).body.output_config).toEqual({ effort: "low" });
+    // xhigh arrived after Opus 4.6.
+    const older = await bodyFor({ model: "claude-opus-4-6", effort: "xhigh" });
+    expect(older.body.output_config).toBeUndefined();
+    expect((older.t.service.getState().__meta__ as any).effort.data.note).toContain("xhigh");
+    // A model that takes no effort at all is not sent one.
+    expect((await bodyFor({ model: "claude-haiku-4-5", effort: "low" })).body.output_config).toBeUndefined();
+  });
+
+  it("asks the models that refuse a forced tool for structured outputs instead", async () => {
+    const schema = {
+      type: "object",
+      properties: {
+        guests: { type: "integer", minimum: 1 },
+        hotel: { type: "object", properties: { name: { type: "string", maxLength: 80 } } },
+      },
+    };
+    const { body } = await bodyFor({ model: "claude-opus-5-5", jsonSchema: schema });
+
+    expect(body.tools).toBeUndefined();
+    expect(body.tool_choice).toBeUndefined();
+    expect(body.output_config.format).toEqual({
+      type: "json_schema",
+      schema: {
+        type: "object",
+        properties: {
+          guests: { type: "integer" },
+          hotel: {
+            type: "object",
+            properties: { name: { type: "string" } },
+            additionalProperties: false,
+          },
+        },
+        additionalProperties: false,
+      },
+    });
+  });
+
+  it("reads a structured answer back as the object it is", async () => {
+    const api = await endpoint(() => ({
+      json: {
+        model: "claude-opus-5-5",
+        content: [{ type: "text", text: '{"guests":2}' }],
+        stop_reason: "end_turn",
+        usage: { input_tokens: 10, output_tokens: 5 },
+      },
+    }));
+    const t = serviceWith({
+      serverUrl: api.url,
+      apiKey: "sk-test",
+      model: "claude-opus-5-5",
+      jsonSchema: { type: "object", properties: { guests: { type: "integer" } } },
+    });
+
+    const result: any = await t.service.process("Two guests", t.notify);
+    expect(result.json).toEqual({ guests: 2 });
+  });
+
+  it("keeps the forced tool for a model that takes one", async () => {
+    const { body } = await bodyFor({
+      model: "claude-haiku-5-5",
+      jsonSchema: { type: "object", properties: { guests: { type: "integer" } } },
+    });
+    expect(body.tool_choice).toEqual({ type: "tool", name: "respond" });
+    expect(body.output_config).toBeUndefined();
+  });
+
+  it("believes the Models API over its own table, and asks it once", async () => {
+    // A model the table does not know, which the API says thinks adaptively
+    // and takes effort: it is asked the current way, not the oldest.
+    const caps = {
+      capabilities: {
+        thinking: { supported: true, types: { adaptive: { supported: true }, enabled: { supported: false } } },
+        effort: { supported: true, low: { supported: true }, medium: { supported: true }, high: { supported: true } },
+        structured_outputs: { supported: true },
+      },
+    };
+    const api = await endpoint(() => ({ json: ANSWER }), () => ({ json: caps }));
+    const t = serviceWith({
+      serverUrl: api.url,
+      apiKey: "sk-test",
+      stream: false,
+      model: "claude-future-1",
+      thinking: true,
+      effort: "low",
+    });
+
+    await t.service.process("one", t.notify);
+    await t.service.process("two", t.notify);
+
+    expect(api.received[0].body.thinking).toEqual({ type: "adaptive" });
+    expect(api.received[0].body.output_config).toEqual({ effort: "low" });
+    expect(api.lookups).toEqual(["claude-future-1"]);
+  });
+
+  it("falls back to the oldest form for a model nobody can describe", async () => {
+    const { body } = await bodyFor({ model: "claude-future-2", thinking: true, effort: "low" });
+    expect(body.thinking).toEqual({ type: "enabled", budget_tokens: 1024 });
+    expect(body.output_config).toBeUndefined();
+  });
+
+  it("leaves a local server's request exactly as it was", async () => {
+    const server = await endpoint(() => ({ json: CHAT_ANSWER }));
+    const t = serviceWith({
+      backend: "server",
+      serverUrl: server.url,
+      stream: false,
+      thinking: false,
+      effort: "low",
+      temperature: 0.3,
+    });
+
+    await t.service.process("hello", t.notify);
+
+    const body = server.received[0].body;
+    expect(body.temperature).toBe(0.3);
+    expect(body.top_k).toBe(20);
+    expect(body.chat_template_kwargs).toEqual({ enable_thinking: false });
+    expect(body.output_config).toBeUndefined();
+    expect(body.thinking).toBeUndefined();
+    // Nothing is asked of a server about Claude models.
+    expect(server.lookups).toEqual([]);
   });
 });
 
@@ -400,8 +618,9 @@ describe("text-generation streaming is off under a schema", () => {
     const meta = t.service.getState().__meta__ as any;
 
     expect(meta?.stream).toBeUndefined();
-    // The Claude API's own refusal of temperature-with-top_p still stands.
-    expect(meta?.topP?.data?.note).toContain("top_p");
+    // The Claude API's own refusal of sampling parameters still stands.
+    expect(meta?.temperature?.data?.note).toContain("Not sent");
+    expect(meta?.topP?.data?.note).toContain("Not sent");
   });
 });
 
@@ -488,15 +707,18 @@ describe("text-generation credentials", () => {
     expect(t.service.getState().apiKeyConfigured).toBe(false);
   });
 
-  it("takes the key from the environment when the board carries none", async () => {
-    // What a deployed board does, so the credential never enters the board.
+  it("never takes the key from the environment", async () => {
+    // On a server several people share, the environment's key is the
+    // operator's: every board on it would spend it, and any board could send
+    // it to an address of its choosing. Keys come from secrets only.
     vi.stubEnv("ANTHROPIC_API_KEY", "sk-from-env");
     const api = await endpoint(() => ({ json: ANSWER }));
     const t = serviceWith({ serverUrl: api.url, stream: false });
 
-    await t.service.process("hi", t.notify);
+    expect(await t.service.process("hi", t.notify)).toBeNull();
 
-    expect(api.received[0].headers["x-api-key"]).toBe("sk-from-env");
+    expect(api.received).toHaveLength(0);
+    expect(t.service.getState().apiKeyConfigured).toBe(false);
   });
 
   it("says so rather than calling without one", async () => {
@@ -506,7 +728,7 @@ describe("text-generation credentials", () => {
     expect(t.notifications).toContainEqual({ status: "error" });
     expect(
       t.notifications.some(
-        (n: any) => typeof n?.error === "string" && n.error.includes("ANTHROPIC_API_KEY"),
+        (n: any) => typeof n?.error === "string" && n.error.includes("no API key"),
       ),
     ).toBe(true);
   });
@@ -520,7 +742,7 @@ describe("text-generation credentials", () => {
 
     const state = t.service.getState();
     expect(state.status).toBe("error");
-    expect(String(state.error)).toContain("ANTHROPIC_API_KEY");
+    expect(String(state.error)).toContain("no API key");
   });
 
   it("stops complaining once it works", async () => {
@@ -528,7 +750,7 @@ describe("text-generation credentials", () => {
     const t = serviceWith({ serverUrl: api.url, stream: false });
 
     t.service.process("hi", t.notify);
-    expect(String(t.service.getState().error)).toContain("ANTHROPIC_API_KEY");
+    expect(String(t.service.getState().error)).toContain("no API key");
 
     t.service.configure({ apiKey: "sk-test" });
     await t.service.process("hi", t.notify);
@@ -624,10 +846,7 @@ describe("text-generation server backend", () => {
     });
   });
 
-  it("never sends the hosted API's key to an address a board named", async () => {
-    // The env key exists for the anthropic backend. A board pointing `server`
-    // at any URL it likes would otherwise hand that credential to whatever is
-    // listening there.
+  it("never sends the environment's key to an address a board named", async () => {
     vi.stubEnv("ANTHROPIC_API_KEY", "sk-ant-secret");
     const server = await endpoint(() => ({ json: CHAT_ANSWER }));
     const t = serviceWith({
@@ -871,6 +1090,78 @@ describe("text-generation empty answers", () => {
     // mistake this for a completed job.
     expect(t.pushed).toEqual([]);
     expect(t.service.getState().status).toBe("error");
+  });
+
+  it("says a Claude answer ran out of tokens, which its thinking spends", async () => {
+    // Current Claude models think before answering whether or not a board asks
+    // them to, and a budget sized for the answer alone can go entirely on that.
+    const api = await endpoint(() => ({
+      json: {
+        model: "claude-haiku-5-5",
+        content: [{ type: "thinking", thinking: "" }],
+        stop_reason: "max_tokens",
+        usage: { input_tokens: 4000, output_tokens: 300 },
+      },
+    }));
+    const t = serviceWith({
+      serverUrl: api.url,
+      apiKey: "sk-test",
+      maxTokens: 300,
+      stream: false,
+    });
+
+    const failures: any[] = [];
+    t.service.process("brief this", (payload: any) => {
+      if (typeof payload?.error === "string") {
+        failures.push(payload);
+      }
+    });
+
+    const failure = await settled(failures);
+    expect(failure.error).toContain("used all 300 tokens without answering");
+    expect(failure.error).toContain("thinking counts against them");
+    expect(t.pushed).toEqual([]);
+  });
+
+  it("finds the stop reason in a streamed Claude answer too", async () => {
+    const api = await endpoint(() => ({
+      sse: [
+        JSON.stringify({ type: "message_start", message: { model: "claude-haiku-5-5", usage: { input_tokens: 4000 } } }),
+        JSON.stringify({ type: "message_delta", delta: { stop_reason: "max_tokens" }, usage: { output_tokens: 300 } }),
+        JSON.stringify({ type: "message_stop" }),
+      ],
+    }));
+    const t = serviceWith({ serverUrl: api.url, apiKey: "sk-test", maxTokens: 300, stream: true });
+
+    const failures: any[] = [];
+    t.service.process("brief this", (payload: any) => {
+      if (typeof payload?.error === "string") {
+        failures.push(payload);
+      }
+    });
+
+    expect((await settled(failures)).error).toContain("used all 300 tokens");
+  });
+
+  it("says a Claude answer was declined rather than empty", async () => {
+    const api = await endpoint(() => ({
+      json: {
+        model: "claude-haiku-5-5",
+        content: [],
+        stop_reason: "refusal",
+        usage: { input_tokens: 4000, output_tokens: 0 },
+      },
+    }));
+    const t = serviceWith({ serverUrl: api.url, apiKey: "sk-test", stream: false });
+
+    const failures: any[] = [];
+    t.service.process("brief this", (payload: any) => {
+      if (typeof payload?.error === "string") {
+        failures.push(payload);
+      }
+    });
+
+    expect((await settled(failures)).error).toBe("the model declined to answer this input");
   });
 
   it("reports why an answer stopped when it did produce something", async () => {

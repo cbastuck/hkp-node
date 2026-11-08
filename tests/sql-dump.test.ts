@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -99,7 +100,39 @@ describe("export", () => {
     expect(typeof dump).toBe("string");
     expect(dump.startsWith("PRAGMA foreign_keys=OFF;\nBEGIN TRANSACTION;\n")).toBe(true);
     expect(dump.trimEnd().endsWith("COMMIT;")).toBe(true);
-    expect(notifications).toEqual([{ exported: "tennis", bytes: dump.length }]);
+    expect(notifications).toEqual([
+      { exported: "tennis", format: "sql", bytes: dump.length },
+    ]);
+  });
+
+  it("hands on the database as an SQLite file with format sqlite", () => {
+    const databases = sourceDatabase();
+    const { run, notifications } = sql(
+      { mode: "export", format: "sqlite", database: "tennis" },
+      databases,
+    );
+    const file = run();
+    expect(file).toBeInstanceOf(Uint8Array);
+    expect(Buffer.from(file.slice(0, 15)).toString()).toBe("SQLite format 3");
+    expect(notifications).toEqual([
+      { exported: "tennis", format: "sqlite", bytes: file.length },
+    ]);
+
+    // The same tables, opened as a file of its own.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sql-file-"));
+    try {
+      const target = path.join(dir, "export.sqlite");
+      fs.writeFileSync(target, file);
+      const copy = new DatabaseSync(target);
+      const rows = copy.prepare("SELECT member FROM booking ORDER BY id").all();
+      expect(rows.map((row) => ({ ...row }))).toEqual([
+        { member: "anna" },
+        { member: "ben" },
+      ]);
+      copy.close();
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("needs no statement", () => {

@@ -7,11 +7,10 @@
  * Key Config: backend (anthropic|server), apiKey (write-only), serverUrl
  *             (empty = the backend's own address), model, systemPrompt,
  *             temperature, topP, topK, maxTokens, timeoutSec, stream,
- *             thinking, thinkingBudgetTokens, jsonSchema
+ *             thinking, thinkingBudgetTokens, effort, jsonSchema
  * IO: in=String (the prompt) or JSON ({prompt} | {text} | {messages: [...]}),
  *     optionally carrying images ({meta, binary} | {images: [...]})
- *     out=null immediately; the result is pushed through the rest of the
- *     pipeline when it arrives, shaped
+ *     out=the result once the model has answered, shaped
  *     { text, json?, thinking?, model, durationMs,
  *       usage: { promptTokens, completionTokens } }
  *
@@ -37,20 +36,34 @@
  * implements it (llama.cpp does, by turning the schema into a grammar):
  *
  *   - `jsonSchema` constrains the answer to a shape. Sent as a single forced
- *     tool, which is the API's own mechanism for it, and the parsed object is
- *     emitted as `json` beside the `text`.
+ *     tool, or as structured outputs to the models that refuse a forced tool,
+ *     and the parsed object is emitted as `json` beside the `text`.
  *   - Images in the input become vision parts, so a scan that arrives from
  *     `http-client` or an attachment can be read directly.
- *   - `thinking` turns on extended reasoning, reported in the `thinking` field
- *     the shared output contract already carries.
+ *   - `thinking` and `effort` say how much the model reasons, reported in the
+ *     `thinking` field the shared output contract already carries.
+ *
+ * The Claude models disagree on how each of those is said, so the request is
+ * built from what the model accepts (`claudeModels.ts`): the board states what
+ * it wants and keeps working when its model changes.
  *
  * The API key is write-only in the same way `smtp-email` treats its password:
- * `configure` accepts it, `getState` never gives it back. It also falls back to
- * ANTHROPIC_API_KEY in the runtime's environment, which is how a deployed board
- * avoids carrying a credential at all.
+ * `configure` accepts it, `getState` never gives it back. It is a
+ * `{{secret.…}}` reference, resolved from the vault of whoever runs the board,
+ * and never read from the runtime's environment: on a server several people
+ * share, a key in the environment would be the operator's, spent by everyone.
  */
 import { resolveCredential } from "../secrets";
 import { refusalIn } from "../egress";
+import {
+  ClaudeModel,
+  EFFORTS,
+  Effort,
+  atMost,
+  claudeModel,
+  knownClaudeModel,
+  structuredSchema,
+} from "./claudeModels";
 import {
   HostedService,
   JsonRecord,
@@ -97,6 +110,11 @@ const DEFAULT_THINKING_BUDGET_TOKENS = 1024;
 
 /** Pinned: the API is versioned by header, and an unpinned client breaks. */
 const ANTHROPIC_VERSION = "2023-06-01";
+/** The Claude API's stop reasons that mean the answer did not simply end. */
+const ANTHROPIC_FINISH_REASONS: Record<string, string> = {
+  max_tokens: "length",
+  refusal: "refusal",
+};
 
 /**
  * The tool a schema-constrained answer is asked for through.
@@ -175,6 +193,8 @@ export class TextGenerationService implements HostedService {
   // null = off and unsaid, matching the local backends' three-state field.
   private thinking: boolean | null = null;
   private thinkingBudgetTokens = DEFAULT_THINKING_BUDGET_TOKENS;
+  /** Empty means the model's own default. Claude only. */
+  private effort: Effort | "" = "";
   private jsonSchema: JsonRecord | null = null;
   private status = "idle";
   /**
@@ -219,6 +239,7 @@ export class TextGenerationService implements HostedService {
       stream: this.stream,
       thinking: this.thinking,
       thinkingBudgetTokens: this.thinkingBudgetTokens,
+      effort: this.effort,
       jsonSchema: this.jsonSchema,
       status: this.status,
       error: this.lastError,
@@ -241,13 +262,66 @@ export class TextGenerationService implements HostedService {
       };
     }
     if (this.backend === "anthropic") {
-      meta.topP = {
-        type: "number",
-        data: {
-          note:
-            "Not sent to this backend, which rejects a request carrying both " +
+      // What this model does with the settings, as far as is known without
+      // asking — the last lookup's answer, or the table's.
+      const model = knownClaudeModel(this.base(), this.model);
+
+      // Kept for the `server` backend, which uses them, and for the older
+      // Claude models that still take temperature and top_k.
+      const unsent = (note: string) => ({ type: "number", data: { note } });
+      if (model.sampling) {
+        meta.topP = unsent(
+          "Not sent to this backend, which rejects a request carrying both " +
             "temperature and top_p. Temperature is the one sent.",
+        );
+      } else {
+        const refused = unsent(
+          `Not sent: ${this.model} uses its own sampling and refuses a ` +
+            "request that sets it.",
+        );
+        meta.temperature = refused;
+        meta.topP = refused;
+        meta.topK = refused;
+      }
+
+      const effortNote = !this.effort
+        ? undefined
+        : model.efforts.includes(this.effort)
+          ? undefined
+          : `Not sent: ${this.model} takes no effort level "${this.effort}".`;
+      meta.effort = {
+        type: "enum",
+        data: {
+          options: ["", ...model.efforts],
+          ...(effortNote ? { note: effortNote } : {}),
         },
+      };
+      if (model.thinking === "adaptive") {
+        meta.thinkingBudgetTokens = {
+          type: "number",
+          data: {
+            note:
+              "Not used by this model: it decides how long to think, and " +
+              "effort sets how much. Its thinking counts against maxTokens.",
+          },
+        };
+        if (this.thinking === false && !this.thinkingFor(model)) {
+          meta.thinking = {
+            type: "boolean",
+            data: {
+              note: model.thinkingOff
+                ? `Not sent at effort "${this.effort}": this model thinks at ` +
+                  "that effort regardless."
+                : "Not sent: this model always thinks. Lower effort to have " +
+                  "it think less.",
+            },
+          };
+        }
+      }
+    } else if (this.effort) {
+      meta.effort = {
+        type: "text",
+        data: { note: "Not sent to this backend: effort is a Claude setting." },
       };
     }
     if (Object.keys(meta).length > 0) {
@@ -304,6 +378,12 @@ export class TextGenerationService implements HostedService {
     if (isNumber(config.thinkingBudgetTokens) && config.thinkingBudgetTokens > 0) {
       this.thinkingBudgetTokens = Math.trunc(config.thinkingBudgetTokens);
     }
+    if (
+      config.effort === "" ||
+      (typeof config.effort === "string" && (EFFORTS as readonly string[]).includes(config.effort))
+    ) {
+      this.effort = config.effort as Effort | "";
+    }
     if ("jsonSchema" in config) {
       const value = config.jsonSchema;
       if (value === null || value === "") {
@@ -348,16 +428,9 @@ export class TextGenerationService implements HostedService {
       );
     }
 
-    // The environment's key belongs to the hosted API. A `server` board names
-    // its own address, so falling back there would hand that credential to
-    // whatever is listening — the key is used only if a board set one.
-    const configured =
-      this.backend === "server"
-        ? this.apiKey
-        : this.apiKey || process.env.ANTHROPIC_API_KEY || "";
     const { value: key, problem } = resolveCredential(
       this.host?.secrets?.(),
-      configured,
+      this.apiKey,
       this.endpoint(),
     );
     // A credential that was named and could not be produced is a failure
@@ -371,7 +444,7 @@ export class TextGenerationService implements HostedService {
     if (!key && this.backend === "anthropic") {
       return this.fail(
         notify,
-        "no API key — configure apiKey, or set ANTHROPIC_API_KEY where this runtime runs",
+        "no API key — set apiKey to a secret, such as {{secret.anthropic.key}}",
       );
     }
 
@@ -392,10 +465,12 @@ export class TextGenerationService implements HostedService {
    * a value that existed for no reason.
    */
   private hasKey(): boolean {
-    if (this.apiKey) {
-      return true;
-    }
-    return this.backend !== "server" && !!process.env.ANTHROPIC_API_KEY;
+    return !!this.apiKey;
+  }
+
+  /** The backend's address, before any API path. */
+  private base(): string {
+    return this.serverUrl || DEFAULT_URLS[this.backend] || "";
   }
 
   /**
@@ -408,7 +483,7 @@ export class TextGenerationService implements HostedService {
    * declared correct, because both are what the two kinds of server hand out.
    */
   private endpoint(): string {
-    const base = this.serverUrl || DEFAULT_URLS[this.backend] || "";
+    const base = this.base();
     if (this.backend !== "server") {
       return `${base}/v1/messages`;
     }
@@ -449,11 +524,15 @@ export class TextGenerationService implements HostedService {
     const server = this.backend === "server";
 
     try {
+      const model = server
+        ? null
+        : await claudeModel(this.base(), this.model, this.headers(apiKey));
+      const structured = !!model && this.usesStructuredOutputs(model);
       const response = await fetch(this.endpoint(), {
         method: "POST",
         headers: this.headers(apiKey),
         body: JSON.stringify(
-          server ? this.serverRequestBody(messages) : this.requestBody(messages),
+          model ? this.requestBody(messages, model) : this.serverRequestBody(messages),
         ),
         signal: controller.signal,
       });
@@ -474,20 +553,14 @@ export class TextGenerationService implements HostedService {
 
       const result = server
         ? this.toServerResult(message, started)
-        : this.toResult(message, started);
+        : this.toResult(message, started, structured);
 
       // Handing an empty answer onward is worse than failing: the services
       // after this one cannot tell it from a real one, so a board that settles
       // its work at the end would mark the item done having produced nothing.
       // Stopping here leaves it exactly where a failed run should leave it.
       if (!result.text && result.json === undefined) {
-        return this.fail(
-          notify,
-          result.finishReason === "length"
-            ? `the model used all ${this.maxTokens} tokens without answering — ` +
-              "raise maxTokens, or set thinking: false if it reasons first"
-            : "the model returned an empty answer",
-        );
+        return this.fail(notify, this.emptyAnswer(result.finishReason, server));
       }
 
       this.setStatus(notify, "idle");
@@ -535,14 +608,56 @@ export class TextGenerationService implements HostedService {
     return this.stream && !this.jsonSchema;
   }
 
-  private requestBody(messages: Message[]): JsonRecord {
-    const thinkingOn = this.thinking === true;
-    // Reasoning is drawn from the same budget as the answer, so a budget that
-    // meets or exceeds it leaves nothing to answer with — the API rejects that
-    // outright. Lift the ceiling rather than fail the call.
-    const maxTokens = thinkingOn
-      ? Math.max(this.maxTokens, this.thinkingBudgetTokens + 1)
-      : this.maxTokens;
+  /** Whether a schema goes as structured outputs rather than a forced tool. */
+  private usesStructuredOutputs(model: ClaudeModel): boolean {
+    return !!this.jsonSchema && !model.forcedTool && model.structuredOutputs;
+  }
+
+  /** The effort sent: the board's, where the model takes that level. */
+  private effortFor(model: ClaudeModel): Effort | undefined {
+    return this.effort && model.efforts.includes(this.effort) ? this.effort : undefined;
+  }
+
+  /**
+   * How the board's `thinking` is said to this model, if at all.
+   *
+   * `true` asks for reasoning, `false` asks for none, and null leaves the
+   * model to its default — which on current models is to think. Saying
+   * nothing is always the fallback, because it is the one form every model
+   * accepts: a model that cannot be told not to think is not sent the word.
+   */
+  private thinkingFor(model: ClaudeModel): JsonRecord | undefined {
+    if (model.thinking === "budget") {
+      return this.thinking === true
+        ? { type: "enabled", budget_tokens: this.thinkingBudgetTokens }
+        : undefined;
+    }
+    if (model.thinking !== "adaptive") {
+      return undefined;
+    }
+    if (this.thinking === true) {
+      return { type: "adaptive" };
+    }
+    if (this.thinking === false && model.thinkingOff) {
+      const effort = this.effortFor(model) ?? model.defaultEffort;
+      if (!model.thinkingOffUpTo || atMost(effort, model.thinkingOffUpTo)) {
+        return { type: model.thinkingOff };
+      }
+    }
+    return undefined;
+  }
+
+  private requestBody(messages: Message[], model: ClaudeModel): JsonRecord {
+    const thinking = this.thinkingFor(model);
+    // A budget is drawn from the same tokens as the answer, so one that meets
+    // or exceeds them leaves nothing to answer with — the API rejects that
+    // outright. Lift the ceiling rather than fail the call. Adaptive thinking
+    // has no budget to compare, which is why a board's maxTokens has to leave
+    // room for it.
+    const maxTokens =
+      thinking?.type === "enabled"
+        ? Math.max(this.maxTokens, this.thinkingBudgetTokens + 1)
+        : this.maxTokens;
 
     const body: JsonRecord = {
       model: this.model,
@@ -554,30 +669,44 @@ export class TextGenerationService implements HostedService {
       // A system prompt is a parameter here, not a message with a role.
       body.system = this.systemPrompt;
     }
-    if (thinkingOn) {
-      body.thinking = {
-        type: "enabled",
-        budget_tokens: this.thinkingBudgetTokens,
-      };
-      // Sampling is fixed while reasoning: sending any of the three is an
-      // error, so they are left out rather than sent and ignored.
-    } else {
-      // Not `top_p` as well: this API rejects a request carrying both it and
+    if (thinking) {
+      body.thinking = thinking;
+    } else if (model.sampling) {
+      // Only to the models that still take them: current Claude models accept
+      // only their defaults and refuse any other value. Sampling is fixed
+      // while reasoning, so a model that thinks is sent none. Not `top_p` as
+      // well: these models refuse a request carrying both it and
       // `temperature`, and temperature is the one a board that touched either
-      // is far more likely to have meant. `top_p` is left to the backends
-      // that accept the pair.
+      // is far more likely to have meant.
       body.temperature = this.temperature;
       body.top_k = this.topK;
     }
+    const outputConfig: JsonRecord = {};
+    const effort = this.effortFor(model);
+    if (effort) {
+      outputConfig.effort = effort;
+    }
     if (this.jsonSchema) {
-      body.tools = [
-        {
-          name: SCHEMA_TOOL_NAME,
-          description: "Return the answer in the required shape.",
-          input_schema: this.jsonSchema,
-        },
-      ];
-      body.tool_choice = { type: "tool", name: SCHEMA_TOOL_NAME };
+      if (this.usesStructuredOutputs(model)) {
+        // The models that refuse a forced tool take the schema as the answer's
+        // format instead, in the stricter dialect that requires.
+        outputConfig.format = {
+          type: "json_schema",
+          schema: structuredSchema(this.jsonSchema),
+        };
+      } else {
+        body.tools = [
+          {
+            name: SCHEMA_TOOL_NAME,
+            description: "Return the answer in the required shape.",
+            input_schema: this.jsonSchema,
+          },
+        ];
+        body.tool_choice = { type: "tool", name: SCHEMA_TOOL_NAME };
+      }
+    }
+    if (Object.keys(outputConfig).length) {
+      body.output_config = outputConfig;
     }
     return body;
   }
@@ -778,6 +907,7 @@ export class TextGenerationService implements HostedService {
     let model = this.model;
     let inputTokens = 0;
     let outputTokens = 0;
+    let stopReason: string | undefined;
     let lastNotifiedAt = 0;
 
     for await (const event of readEvents(response)) {
@@ -813,6 +943,10 @@ export class TextGenerationService implements HostedService {
           if (isNumber(usage.output_tokens)) {
             outputTokens = usage.output_tokens;
           }
+          const delta = (event.delta ?? {}) as JsonRecord;
+          if (typeof delta.stop_reason === "string") {
+            stopReason = delta.stop_reason;
+          }
           break;
         }
         default:
@@ -830,12 +964,13 @@ export class TextGenerationService implements HostedService {
     return {
       model,
       content,
+      stop_reason: stopReason,
       usage: { input_tokens: inputTokens, output_tokens: outputTokens },
     };
   }
 
   /** Reduces a response message to the output contract shared across runtimes. */
-  private toResult(message: JsonRecord, started: number): Result {
+  private toResult(message: JsonRecord, started: number, structured = false): Result {
     const blocks = Array.isArray(message.content)
       ? (message.content as JsonRecord[])
       : [];
@@ -853,6 +988,17 @@ export class TextGenerationService implements HostedService {
         thoughts.push(block.thinking);
       } else if (block.type === "tool_use" && block.name === SCHEMA_TOOL_NAME) {
         json = block.input;
+      }
+    }
+
+    if (structured && json === undefined) {
+      // Structured outputs answer in text that is the object. Left as text
+      // when it is not — an answer cut off by max_tokens — so the failure that
+      // follows says why instead of claiming the model said nothing.
+      try {
+        json = JSON.parse(texts.join("").trim());
+      } catch {
+        // Not an object; reported through finishReason.
       }
     }
 
@@ -875,6 +1021,13 @@ export class TextGenerationService implements HostedService {
     const thinking = thoughts.join("").trim();
     if (thinking) {
       result.thinking = thinking;
+    }
+    // In the server backend's vocabulary, so one check reads either: an
+    // answer cut off by `max_tokens` and one the model declined both arrive
+    // with no text, and only this says which.
+    const finishReason = ANTHROPIC_FINISH_REASONS[String(message.stop_reason)];
+    if (finishReason) {
+      result.finishReason = finishReason;
     }
     return result;
   }
@@ -969,6 +1122,24 @@ export class TextGenerationService implements HostedService {
       this.lastError = "";
     }
     notify(detail === undefined ? { status } : { status, detail });
+  }
+
+  /** Why an answer came back with nothing in it, as far as the backend said. */
+  private emptyAnswer(finishReason: string | undefined, server: boolean): string {
+    if (finishReason === "length") {
+      // Current Claude models think before answering whatever the board says,
+      // and that thinking is drawn from the same budget; only a local server
+      // can be told not to.
+      return server
+        ? `the model used all ${this.maxTokens} tokens without answering — ` +
+            "raise maxTokens, or set thinking: false if it reasons first"
+        : `the model used all ${this.maxTokens} tokens without answering — ` +
+            "raise maxTokens: its thinking counts against them";
+    }
+    if (finishReason === "refusal") {
+      return "the model declined to answer this input";
+    }
+    return "the model returned an empty answer";
   }
 
   /** Reports a failure and produces nothing, so the pipeline stops here. */

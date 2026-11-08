@@ -4,13 +4,14 @@
  * Service Name: SQL
  * Runtime: hkp-node
  * Modes: query | run | exec | databases | export | import
- * Key Config: statement, schema, mode, database
+ * Key Config: statement, schema, mode, database, format
  * IO: in=JSON (the statement's named parameters) -> out=JSON
  *     query     -> { rows, count }
  *     run       -> { changes, lastInsertRowid }
  *     exec      -> { executed: true }
  *     databases -> { rows: [{ name, bytes }], count }   (in: ignored)
- *     export    -> the database as SQL text             (in: ignored)
+ *     export    -> the database as SQL text, or with     (in: ignored)
+ *                  format "sqlite" as an SQLite file (bytes)
  *     import    -> { executed: true }                   (in: SQL text)
  *
  * The generic half of the pair: it knows SQL and nothing else. Tables, columns
@@ -52,7 +53,9 @@
  * is how tables built in a browser continue here. An import is text from
  * outside, possibly from a mount nobody signed in to, so it is refused
  * anything that reaches past the database's own file. `databases` lists the
- * owner's named databases.
+ * owner's named databases. With `format: "sqlite"`, `export` hands on the
+ * database file itself instead, for a person keeping their data rather than
+ * another runtime: any SQLite tool opens it.
  *
  * **What it hands onward is separate from what it did.** By default the result
  * travels, which is what a service asked a question wants. `emit: "input"`
@@ -93,6 +96,12 @@ const STATEMENT_MODES: SqlMode[] = ["query", "run", "exec"];
 type SqlEmit = "result" | "input";
 
 const EMITS: SqlEmit[] = ["result", "input"];
+
+/** What `export` hands on: SQL text that recreates the database, or the
+ *  SQLite file itself. */
+type SqlFormat = "sql" | "sqlite";
+
+const FORMATS: SqlFormat[] = ["sql", "sqlite"];
 
 /** `$name`, `:name` and `@name` are all named parameters to SQLite. */
 const NAMED_PARAMETER = /[$:@]([A-Za-z_][A-Za-z0-9_]*)/g;
@@ -192,6 +201,8 @@ export class SqlService implements HostedService {
   private database = "";
   /** What travels onward: the statement's result, or the input it ran on. */
   private emit: SqlEmit = "result";
+  /** What `export` hands on. */
+  private format: SqlFormat = "sql";
 
   constructor(
     config: ServiceConfiguration,
@@ -211,6 +222,7 @@ export class SqlService implements HostedService {
     return {
       mode: this.mode,
       emit: this.emit,
+      format: this.format,
       database: this.database,
       statement: this.statement,
       schema: this.schema,
@@ -225,6 +237,9 @@ export class SqlService implements HostedService {
     }
     if (typeof config.emit === "string" && EMITS.includes(config.emit as SqlEmit)) {
       this.emit = config.emit as SqlEmit;
+    }
+    if (typeof config.format === "string" && FORMATS.includes(config.format as SqlFormat)) {
+      this.format = config.format as SqlFormat;
     }
     if (typeof config.statement === "string") {
       this.statement = config.statement;
@@ -284,18 +299,22 @@ export class SqlService implements HostedService {
 
     try {
       if (this.mode === "export") {
-        const dump = dumpDatabase(db);
+        const exported = this.format === "sqlite" ? db.file() : dumpDatabase(db);
         this.lastError = "";
-        // Reported as what was exported, not as the dump itself: the text
+        // Reported as what was exported, not as the export itself: it
         // travels to the next service, and a panel has no use for a copy.
         notify({
           exported: this.database || scope.boardName,
-          bytes: dump.length,
+          format: this.format,
+          bytes: exported.length,
         });
-        return this.emit === "input" ? input : dump;
+        return this.emit === "input" ? input : exported;
       }
       const result = this.execute(db, input);
       this.lastError = "";
+      // What the statement did, for the board's log: how many rows, never
+      // which — the parameters are the caller's data, and the log keeps none.
+      this.host?.log("info", `sql.${this.mode}`, summaryOf(this.mode, result));
       // Reported either way: what the statement did is this service's own news,
       // and a panel showing it does not depend on the board choosing to pass it
       // on. Only what travels to the next service is `emit`'s to decide.
@@ -392,6 +411,17 @@ export class SqlService implements HostedService {
     notify({ error });
     return null;
   }
+}
+
+/** A statement's outcome as counts only. */
+function summaryOf(mode: SqlMode, result: JsonRecord): JsonRecord {
+  if (mode === "run") {
+    return { changes: result.changes };
+  }
+  if (mode === "query") {
+    return { count: result.count };
+  }
+  return {};
 }
 
 function reason(err: unknown): string {

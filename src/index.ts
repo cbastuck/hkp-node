@@ -378,6 +378,38 @@ function isDevCheckout(): boolean {
 }
 
 /**
+ * Signing keys a test harness serves itself, so that end-to-end runs exercise
+ * real token verification with identities the harness mints — an owner, a
+ * member and a stranger — instead of turning authentication off.
+ *
+ * Fail closed in both directions that matter: never from the published
+ * package, and never from anywhere but this machine, so a stray variable on a
+ * deployed server cannot hand its trust to somebody else's keys.
+ */
+function testJwksUri(value: string | undefined): string | undefined {
+  if (!value) {
+    return undefined;
+  }
+  let host = "";
+  try {
+    host = new URL(value).hostname;
+  } catch {
+    // Reported below with the rest.
+  }
+  if (!isDevCheckout() || !host || !isLoopbackHost(host)) {
+    console.error(
+      "[hkp-node] HKP_TEST_JWKS_URI is for test harnesses: it is honoured only from a " +
+        "checkout and only for a loopback address — refusing to start.",
+    );
+    process.exit(1);
+  }
+  console.warn(
+    `[hkp-node] Verifying tokens against test signing keys at ${value}. Test harness only.`,
+  );
+  return value;
+}
+
+/**
  * Fail closed: refuse to start without authentication unless the server is
  * reachable only locally (loopback bind) or this is a local checkout that
  * explicitly opts in via ALLOW_NO_AUTH=true. The npm package bound to a public
@@ -393,7 +425,14 @@ function resolveServerAuthConfig(host: string): AuthConfig {
         `[hkp-node] Access restricted to ${allowedEmails.length} allowlisted email(s).`,
       );
     }
-    return { mode: "jwt", domain, audience: audiences, allowedEmails };
+    const jwksUri = testJwksUri(process.env.HKP_TEST_JWKS_URI);
+    return {
+      mode: "jwt",
+      domain,
+      audience: audiences,
+      allowedEmails,
+      ...(jwksUri ? { jwksUri } : {}),
+    };
   }
 
   // An allowlist without JWT auth cannot be enforced; starting anyway would

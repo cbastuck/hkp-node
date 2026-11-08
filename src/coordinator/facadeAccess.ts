@@ -331,11 +331,19 @@ export function projectNotification(
 }
 
 /** The values at `paths` in `value`, at the same paths in an object of their
- *  own. A pathless entry names no part of it and picks nothing. */
+ *  own. A pathless entry names no part of it and picks nothing.
+ *
+ *  A path inside one that is picked whole adds nothing and is skipped: given
+ *  `rows` and `rows.0.day`, the rows are already there, and writing the second
+ *  would build `rows` again as an object holding `0` — a calendar reading the
+ *  list would then be given none. */
 function pick(value: unknown, paths: Iterable<string>): Record<string, unknown> {
   const picked: Record<string, unknown> = Object.create(null);
-  for (const path of paths) {
-    if (!path) {
+  const all = [...paths].filter(Boolean);
+  const covered = (path: string) =>
+    all.some((other) => other !== path && path.startsWith(`${other}.`));
+  for (const path of all) {
+    if (covered(path)) {
       continue;
     }
     const found = readPath(value, path);

@@ -290,6 +290,29 @@ describe("RssService", () => {
     ]);
   });
 
+  it("drops a round a newer one has overtaken, so a removed feed stays removed", async () => {
+    // The feed about to be removed answers slowly: the round that still has
+    // it finishes after the round started once it was gone.
+    const server = http.createServer((req, res) => {
+      const body = req.url === "/slow" ? ATOM : RSS_2;
+      setTimeout(() => res.end(body), req.url === "/slow" ? 300 : 0);
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    endpoints.push({ url, close: () => new Promise<void>((resolve) => server.close(() => resolve())) });
+    const { svc, notify, notified, pushed } = service({ feeds: [`${url}/rss`, `${url}/slow`] });
+
+    svc.process(undefined, notify);
+    svc.configure({ removeFeed: `${url}/slow` });
+    svc.process(undefined, notify);
+    await new Promise((resolve) => setTimeout(resolve, 600));
+
+    const lists = notified.filter((n) => Array.isArray(n.items)).map((n) => (n.items as Article[]).map((a) => a.title));
+    expect(lists).toEqual([["Newest thing", "Older thing"]]);
+    expect(pushed).toHaveLength(1);
+    expect(notified[notified.length - 1].fetching).toBe(false);
+  });
+
   it("fetches on a refresh command, which is all a remote panel can send", async () => {
     const server = await feedServer(() => ({ body: RSS_2 }));
     const { svc, notified, pushed } = service({ feeds: [`${server.url}/rss`] });
