@@ -10,8 +10,7 @@
  *             thinking, thinkingBudgetTokens, effort, jsonSchema
  * IO: in=String (the prompt) or JSON ({prompt} | {text} | {messages: [...]}),
  *     optionally carrying images ({meta, binary} | {images: [...]})
- *     out=null immediately; the result is pushed through the rest of the
- *     pipeline when it arrives, shaped
+ *     out=the result once the model has answered, shaped
  *     { text, json?, thinking?, model, durationMs,
  *       usage: { promptTokens, completionTokens } }
  *
@@ -49,9 +48,10 @@
  * it wants and keeps working when its model changes.
  *
  * The API key is write-only in the same way `smtp-email` treats its password:
- * `configure` accepts it, `getState` never gives it back. It also falls back to
- * ANTHROPIC_API_KEY in the runtime's environment, which is how a deployed board
- * avoids carrying a credential at all.
+ * `configure` accepts it, `getState` never gives it back. It is a
+ * `{{secret.…}}` reference, resolved from the vault of whoever runs the board,
+ * and never read from the runtime's environment: on a server several people
+ * share, a key in the environment would be the operator's, spent by everyone.
  */
 import { resolveCredential } from "../secrets";
 import { refusalIn } from "../egress";
@@ -428,16 +428,9 @@ export class TextGenerationService implements HostedService {
       );
     }
 
-    // The environment's key belongs to the hosted API. A `server` board names
-    // its own address, so falling back there would hand that credential to
-    // whatever is listening — the key is used only if a board set one.
-    const configured =
-      this.backend === "server"
-        ? this.apiKey
-        : this.apiKey || process.env.ANTHROPIC_API_KEY || "";
     const { value: key, problem } = resolveCredential(
       this.host?.secrets?.(),
-      configured,
+      this.apiKey,
       this.endpoint(),
     );
     // A credential that was named and could not be produced is a failure
@@ -451,7 +444,7 @@ export class TextGenerationService implements HostedService {
     if (!key && this.backend === "anthropic") {
       return this.fail(
         notify,
-        "no API key — configure apiKey, or set ANTHROPIC_API_KEY where this runtime runs",
+        "no API key — set apiKey to a secret, such as {{secret.anthropic.key}}",
       );
     }
 
@@ -472,10 +465,7 @@ export class TextGenerationService implements HostedService {
    * a value that existed for no reason.
    */
   private hasKey(): boolean {
-    if (this.apiKey) {
-      return true;
-    }
-    return this.backend !== "server" && !!process.env.ANTHROPIC_API_KEY;
+    return !!this.apiKey;
   }
 
   /** The backend's address, before any API path. */

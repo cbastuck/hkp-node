@@ -94,9 +94,9 @@ afterEach(async () => {
 });
 
 beforeEach(() => {
-  // A key in the developer's own environment would otherwise decide what these
-  // tests are testing.
-  vi.stubEnv("ANTHROPIC_API_KEY", "");
+  // The service reads no key from the environment; one set there must make no
+  // difference to what these tests see.
+  vi.stubEnv("ANTHROPIC_API_KEY", "sk-from-env");
 });
 
 async function endpoint(
@@ -707,15 +707,18 @@ describe("text-generation credentials", () => {
     expect(t.service.getState().apiKeyConfigured).toBe(false);
   });
 
-  it("takes the key from the environment when the board carries none", async () => {
-    // What a deployed board does, so the credential never enters the board.
+  it("never takes the key from the environment", async () => {
+    // On a server several people share, the environment's key is the
+    // operator's: every board on it would spend it, and any board could send
+    // it to an address of its choosing. Keys come from secrets only.
     vi.stubEnv("ANTHROPIC_API_KEY", "sk-from-env");
     const api = await endpoint(() => ({ json: ANSWER }));
     const t = serviceWith({ serverUrl: api.url, stream: false });
 
-    await t.service.process("hi", t.notify);
+    expect(await t.service.process("hi", t.notify)).toBeNull();
 
-    expect(api.received[0].headers["x-api-key"]).toBe("sk-from-env");
+    expect(api.received).toHaveLength(0);
+    expect(t.service.getState().apiKeyConfigured).toBe(false);
   });
 
   it("says so rather than calling without one", async () => {
@@ -725,7 +728,7 @@ describe("text-generation credentials", () => {
     expect(t.notifications).toContainEqual({ status: "error" });
     expect(
       t.notifications.some(
-        (n: any) => typeof n?.error === "string" && n.error.includes("ANTHROPIC_API_KEY"),
+        (n: any) => typeof n?.error === "string" && n.error.includes("no API key"),
       ),
     ).toBe(true);
   });
@@ -739,7 +742,7 @@ describe("text-generation credentials", () => {
 
     const state = t.service.getState();
     expect(state.status).toBe("error");
-    expect(String(state.error)).toContain("ANTHROPIC_API_KEY");
+    expect(String(state.error)).toContain("no API key");
   });
 
   it("stops complaining once it works", async () => {
@@ -747,7 +750,7 @@ describe("text-generation credentials", () => {
     const t = serviceWith({ serverUrl: api.url, stream: false });
 
     t.service.process("hi", t.notify);
-    expect(String(t.service.getState().error)).toContain("ANTHROPIC_API_KEY");
+    expect(String(t.service.getState().error)).toContain("no API key");
 
     t.service.configure({ apiKey: "sk-test" });
     await t.service.process("hi", t.notify);
@@ -843,10 +846,7 @@ describe("text-generation server backend", () => {
     });
   });
 
-  it("never sends the hosted API's key to an address a board named", async () => {
-    // The env key exists for the anthropic backend. A board pointing `server`
-    // at any URL it likes would otherwise hand that credential to whatever is
-    // listening there.
+  it("never sends the environment's key to an address a board named", async () => {
     vi.stubEnv("ANTHROPIC_API_KEY", "sk-ant-secret");
     const server = await endpoint(() => ({ json: CHAT_ANSWER }));
     const t = serviceWith({

@@ -240,6 +240,26 @@ describe("when something in the detour fails", () => {
     });
   });
 
+  it("keeps a failure under a name of its own when no name is given", async () => {
+    // Spread like a result, it would be hidden by an `error` the item already
+    // carried in `add` mode, and replace the item's own `service` otherwise.
+    const added = judged({ onFailure: "merge", mode: "add" });
+    expect(await added({ id: "a", fail: "boom", error: "" })).toEqual({
+      id: "a",
+      fail: "boom",
+      error: "",
+      failure: { error: "boom", service: "write" },
+    });
+
+    const overwritten = judged({ onFailure: "merge" });
+    expect(await overwritten({ id: "a", fail: "boom", service: "court-3" })).toEqual({
+      id: "a",
+      fail: "boom",
+      service: "court-3",
+      failure: { error: "boom", service: "write" },
+    });
+  });
+
   it("still stops on a detour that chose to stop", async () => {
     const run = judged({ as: "brief", onFailure: "merge" });
     expect(await run({ id: "a", skip: true })).toBeNull();

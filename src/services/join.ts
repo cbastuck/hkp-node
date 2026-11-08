@@ -46,8 +46,9 @@
  * reasons: a service chose to stop — a filter, a claim that found nothing to
  * take — or a service failed, and said why in an `error` notification. The
  * first is flow and still stops. The second, with `merge`, passes the input on
- * with `{ error, service }` where the result would have gone, so the services
- * after the Join can record the failure beside the thing it happened to rather
+ * with `{ error, service }` where the result would have gone — under `as`, or
+ * under `failure` when no name is given — so the services after the Join can
+ * record the failure beside the thing it happened to rather
  * than the run ending with the reason in a notification nobody kept. Only a
  * service directly in the detour is heard: one inside a scope of its own
  * reports to that scope.
@@ -163,7 +164,7 @@ export class JoinService extends SubService {
 
     if (result === null || result === undefined) {
       if (failure && this.onFailure === "merge") {
-        return this.merged(input, failure);
+        return this.failed(input, failure);
       }
       // Nothing to merge, so nothing to pass on. Continuing with the input
       // alone would be indistinguishable downstream from a merge that worked.
@@ -171,6 +172,20 @@ export class JoinService extends SubService {
     }
 
     return this.merged(input, result);
+  }
+
+  /**
+   * The input with the detour's failure beside it, always under a name of its
+   * own: spread into the input like a result, an `error` the input already
+   * carried would hide it in `add` mode, and in `overwrite` it would replace
+   * the input's own `service`.
+   */
+  private failed(
+    input: unknown,
+    failure: { error: string; service: string },
+  ): unknown {
+    const as = this.as || "failure";
+    return isRecord(input) ? { ...input, [as]: failure } : { input, [as]: failure };
   }
 
   /** The input with what came back from the detour beside it. */
