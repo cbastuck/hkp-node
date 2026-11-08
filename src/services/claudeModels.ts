@@ -50,12 +50,23 @@ export type ClaudeModel = {
   forcedTool: boolean;
   /** Whether `output_config.format` may constrain the answer to a schema. */
   structuredOutputs: boolean;
+  /**
+   * Whether `temperature` and `top_k` are accepted, under the API version
+   * text-generation pins. Current models refuse any value but their own, and
+   * from API version 2026-10-21 every model refuses them — moving to it makes
+   * this false throughout.
+   */
+  sampling: boolean;
 };
 
 const ALL_EFFORTS = EFFORTS;
 const NO_XHIGH: readonly Effort[] = ["low", "medium", "high", "max"];
 
-/** What every model the table has no line for is assumed to accept. */
+/**
+ * What every model the table has no line for is assumed to accept. Sampling is
+ * the exception to "what this service sent before": leaving it out is accepted
+ * by every model, and sending it is refused by every recent one.
+ */
 const UNKNOWN: ClaudeModel = {
   thinking: "budget",
   thinkingOff: null,
@@ -63,6 +74,7 @@ const UNKNOWN: ClaudeModel = {
   efforts: [],
   forcedTool: true,
   structuredOutputs: false,
+  sampling: false,
 };
 
 /**
@@ -77,6 +89,7 @@ const TABLE: Record<string, ClaudeModel> = {
     efforts: ALL_EFFORTS,
     forcedTool: false,
     structuredOutputs: true,
+    sampling: false,
   },
   "claude-fable-5": {
     thinking: "adaptive",
@@ -85,6 +98,7 @@ const TABLE: Record<string, ClaudeModel> = {
     efforts: ALL_EFFORTS,
     forcedTool: true,
     structuredOutputs: true,
+    sampling: false,
   },
   "claude-opus-5-5": {
     thinking: "adaptive",
@@ -93,6 +107,7 @@ const TABLE: Record<string, ClaudeModel> = {
     efforts: ALL_EFFORTS,
     forcedTool: false,
     structuredOutputs: true,
+    sampling: false,
   },
   "claude-opus-5": {
     thinking: "adaptive",
@@ -102,6 +117,7 @@ const TABLE: Record<string, ClaudeModel> = {
     efforts: ALL_EFFORTS,
     forcedTool: true,
     structuredOutputs: true,
+    sampling: false,
   },
   "claude-opus-4-8": {
     thinking: "adaptive",
@@ -110,6 +126,7 @@ const TABLE: Record<string, ClaudeModel> = {
     efforts: ALL_EFFORTS,
     forcedTool: true,
     structuredOutputs: true,
+    sampling: false,
   },
   "claude-opus-4-7": {
     thinking: "adaptive",
@@ -118,6 +135,7 @@ const TABLE: Record<string, ClaudeModel> = {
     efforts: ALL_EFFORTS,
     forcedTool: true,
     structuredOutputs: false,
+    sampling: false,
   },
   "claude-opus-4-6": {
     thinking: "adaptive",
@@ -126,6 +144,7 @@ const TABLE: Record<string, ClaudeModel> = {
     efforts: NO_XHIGH,
     forcedTool: true,
     structuredOutputs: false,
+    sampling: true,
   },
   "claude-sonnet-5-5": {
     thinking: "adaptive",
@@ -135,6 +154,7 @@ const TABLE: Record<string, ClaudeModel> = {
     efforts: ALL_EFFORTS,
     forcedTool: false,
     structuredOutputs: true,
+    sampling: false,
   },
   "claude-sonnet-5": {
     thinking: "adaptive",
@@ -143,6 +163,7 @@ const TABLE: Record<string, ClaudeModel> = {
     efforts: ALL_EFFORTS,
     forcedTool: true,
     structuredOutputs: true,
+    sampling: false,
   },
   "claude-sonnet-4-6": {
     thinking: "adaptive",
@@ -151,6 +172,7 @@ const TABLE: Record<string, ClaudeModel> = {
     efforts: NO_XHIGH,
     forcedTool: true,
     structuredOutputs: false,
+    sampling: true,
   },
   "claude-haiku-5-5": {
     thinking: "adaptive",
@@ -160,6 +182,7 @@ const TABLE: Record<string, ClaudeModel> = {
     efforts: ALL_EFFORTS,
     forcedTool: true,
     structuredOutputs: true,
+    sampling: false,
   },
   "claude-haiku-4-5": {
     thinking: "budget",
@@ -168,6 +191,7 @@ const TABLE: Record<string, ClaudeModel> = {
     efforts: [],
     forcedTool: true,
     structuredOutputs: true,
+    sampling: true,
   },
 };
 // The Project Glasswing models are the same models under other names.

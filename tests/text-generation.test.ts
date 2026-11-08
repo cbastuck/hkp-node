@@ -261,6 +261,30 @@ describe("text-generation request", () => {
     expect(t.service.getState().topP).toBe(0.95);
   });
 
+  it("sends temperature and top_k to the older models that still take them", async () => {
+    const api = await endpoint(() => ({ json: ANSWER }));
+    const t = serviceWith({
+      serverUrl: api.url,
+      apiKey: "sk-test",
+      model: "claude-haiku-4-5",
+      stream: false,
+      temperature: 0.3,
+      topP: 0.95,
+      topK: 20,
+    });
+
+    await t.service.process("decide", t.notify);
+
+    const body = api.received[0].body;
+    expect(body.temperature).toBe(0.3);
+    expect(body.top_k).toBe(20);
+    // Refused beside temperature on these models.
+    expect(body.top_p).toBeUndefined();
+    const meta = t.service.getState().__meta__ as any;
+    expect(meta?.temperature).toBeUndefined();
+    expect(meta?.topP?.data?.note).toContain("top_p");
+  });
+
   it("gives a model that thinks on a budget the budget", async () => {
     // Sampling is fixed during extended thinking and sending any of the three
     // is rejected outright, so they have to be absent rather than defaulted.

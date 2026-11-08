@@ -262,23 +262,28 @@ export class TextGenerationService implements HostedService {
       };
     }
     if (this.backend === "anthropic") {
-      // Kept for the `server` backend, which uses them; the Claude API refuses
-      // every sampling parameter on its current models.
-      const unsent = {
-        type: "number",
-        data: {
-          note:
-            "Not sent to this backend: Claude models use their own sampling " +
-            "and refuse a request that sets it.",
-        },
-      };
-      meta.temperature = unsent;
-      meta.topP = unsent;
-      meta.topK = unsent;
-
-      // What this model does with the reasoning settings, as far as is known
-      // without asking — the last lookup's answer, or the table's.
+      // What this model does with the settings, as far as is known without
+      // asking — the last lookup's answer, or the table's.
       const model = knownClaudeModel(this.base(), this.model);
+
+      // Kept for the `server` backend, which uses them, and for the older
+      // Claude models that still take temperature and top_k.
+      const unsent = (note: string) => ({ type: "number", data: { note } });
+      if (model.sampling) {
+        meta.topP = unsent(
+          "Not sent to this backend, which rejects a request carrying both " +
+            "temperature and top_p. Temperature is the one sent.",
+        );
+      } else {
+        const refused = unsent(
+          `Not sent: ${this.model} uses its own sampling and refuses a ` +
+            "request that sets it.",
+        );
+        meta.temperature = refused;
+        meta.topP = refused;
+        meta.topK = refused;
+      }
+
       const effortNote = !this.effort
         ? undefined
         : model.efforts.includes(this.effort)
@@ -473,6 +478,11 @@ export class TextGenerationService implements HostedService {
     return this.backend !== "server" && !!process.env.ANTHROPIC_API_KEY;
   }
 
+  /** The backend's address, before any API path. */
+  private base(): string {
+    return this.serverUrl || DEFAULT_URLS[this.backend] || "";
+  }
+
   /**
    * Where the request goes.
    *
@@ -482,11 +492,6 @@ export class TextGenerationService implements HostedService {
    * to that reaches nothing. Both forms are accepted rather than one being
    * declared correct, because both are what the two kinds of server hand out.
    */
-  /** The backend's address, before any API path. */
-  private base(): string {
-    return this.serverUrl || DEFAULT_URLS[this.backend] || "";
-  }
-
   private endpoint(): string {
     const base = this.base();
     if (this.backend !== "server") {
@@ -676,11 +681,16 @@ export class TextGenerationService implements HostedService {
     }
     if (thinking) {
       body.thinking = thinking;
+    } else if (model.sampling) {
+      // Only to the models that still take them: current Claude models accept
+      // only their defaults and refuse any other value. Sampling is fixed
+      // while reasoning, so a model that thinks is sent none. Not `top_p` as
+      // well: these models refuse a request carrying both it and
+      // `temperature`, and temperature is the one a board that touched either
+      // is far more likely to have meant.
+      body.temperature = this.temperature;
+      body.top_k = this.topK;
     }
-    // No sampling parameters, ever. Current Claude models accept only their
-    // defaults and refuse any other value, and from API version 2026-10-21 a
-    // request carrying `temperature`, `top_p` or `top_k` is refused on every
-    // model — so the board's values stay with the backends that use them.
     const outputConfig: JsonRecord = {};
     const effort = this.effortFor(model);
     if (effort) {
@@ -1124,7 +1134,6 @@ export class TextGenerationService implements HostedService {
     notify(detail === undefined ? { status } : { status, detail });
   }
 
-  /** Reports a failure and produces nothing, so the pipeline stops here. */
   /** Why an answer came back with nothing in it, as far as the backend said. */
   private emptyAnswer(finishReason: string | undefined, server: boolean): string {
     if (finishReason === "length") {
@@ -1143,6 +1152,7 @@ export class TextGenerationService implements HostedService {
     return "the model returned an empty answer";
   }
 
+  /** Reports a failure and produces nothing, so the pipeline stops here. */
   private fail(notify: Notify, error: string): null {
     this.lastError = error;
     this.setStatus(notify, "error");

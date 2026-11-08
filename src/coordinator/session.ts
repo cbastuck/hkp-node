@@ -1051,7 +1051,6 @@ export class BoardSession {
     }
   }
 
-  /** Sends a message to every browser the board's owner has attached. */
   /**
    * Who a `sub` in this board's log is, as the board's list calls them, for
    * the owner's live view of it. Learnt from the bridges people attach with,
@@ -1072,6 +1071,7 @@ export class BoardSession {
     this.knownCallers.set(sub, { ...(name ? { name } : {}), role });
   }
 
+  /** Sends a message to every browser the board's owner has attached. */
   private toOwners(message: BridgeMessage): void {
     const payload = JSON.stringify(message);
     for (const bridge of this.bridges) {
