@@ -422,8 +422,15 @@ export class HostedRuntime implements RuntimeHost {
       this.assetStore.replace(config.assets);
     }
 
-    for (const serviceConfig of config.services) {
-      this.addService(serviceConfig);
+    // Whole or not at all: a service that cannot be built leaves those before
+    // it running — timers, connections, mounts — in a runtime nobody holds.
+    try {
+      for (const serviceConfig of config.services) {
+        this.addService(serviceConfig);
+      }
+    } catch (err) {
+      this.destroy();
+      throw err;
     }
   }
 
@@ -1249,14 +1256,22 @@ export class RuntimeApp {
     const existing = owned.get(config.id);
     existing?.destroy();
 
-    const runtime = new HostedRuntime(
-      config,
-      (serviceConfig) => this.createService(serviceConfig),
-      this.mountsFor?.(owner, config.id, space),
-      owner,
-      this.readAssetFile,
-      this.assetLimits,
-    );
+    let runtime: HostedRuntime;
+    try {
+      runtime = new HostedRuntime(
+        config,
+        (serviceConfig) => this.createService(serviceConfig),
+        this.mountsFor?.(owner, config.id, space),
+        owner,
+        this.readAssetFile,
+        this.assetLimits,
+      );
+    } catch (err) {
+      // What was there is destroyed already, and must not be listed as if it
+      // still ran.
+      if (existing) this.removeRuntime(space, config.id);
+      throw err;
+    }
     owned.set(runtime.id, runtime);
     return runtime;
   }
@@ -1327,13 +1342,19 @@ export class RuntimeApp {
   createService(config: ServiceConfiguration): HostedService {
     const factory = this.registry.get(config.serviceId);
     if (!factory) {
-      throw new Error(`Unknown serviceId: ${config.serviceId}`);
+      throw new UnknownServiceError(`Unknown serviceId: ${config.serviceId}`);
     }
     return factory.create(config, (serviceConfig) =>
       this.createService(serviceConfig),
     );
   }
 }
+
+/**
+ * A service id this server has no service for: the request's mistake, not the
+ * server's, and said back to it as such.
+ */
+export class UnknownServiceError extends Error {}
 
 /** Whether a value is worth awaiting — a promise, or anything promise-like. */
 function isThenable(value: unknown): value is PromiseLike<unknown> {

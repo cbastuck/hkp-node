@@ -6,6 +6,7 @@ import request from "supertest";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { createRuntimeServer } from "../src/server";
+import { HostedRuntime, UnknownServiceError } from "../src/runtime";
 import { monitorDescriptor } from "../src/services/monitor";
 
 /**
@@ -145,5 +146,57 @@ describe("a runtime nobody ever connected to", () => {
     await new Promise((resolve) => setTimeout(resolve, 100));
 
     await request(server.httpServer).get("/runtimes/rt-1").expect(200);
+  });
+});
+
+describe("a runtime naming a service this server does not have", () => {
+  it("is refused with the id it named, and replaces nothing", async () => {
+    const { server } = await startServer();
+    await createRuntime(server, "rt-1", {});
+
+    const { body } = await request(server.httpServer)
+      .post("/runtimes")
+      .send({
+        id: "rt-1",
+        name: "Node",
+        services: [
+          { uuid: "mon-1", serviceId: monitorDescriptor.serviceId },
+          { uuid: "store", serviceId: "hookup.to/service/storage" },
+        ],
+      })
+      .expect(400);
+    expect(body.error).toBe("Unknown serviceId: hookup.to/service/storage");
+
+    // The runtime it would have replaced was destroyed to make room, so it is
+    // no longer listed as if it still ran.
+    await request(server.httpServer).get("/runtimes/rt-1").expect(404);
+  });
+
+  it("takes down the services it had already built", () => {
+    const destroyed: string[] = [];
+    const build = (config: { uuid: string; serviceId: string }) => {
+      if (config.serviceId === "missing")
+        throw new UnknownServiceError(`Unknown serviceId: ${config.serviceId}`);
+      return {
+        uuid: config.uuid,
+        getState: () => ({}),
+        destroy: () => destroyed.push(config.uuid),
+      } as never;
+    };
+    expect(
+      () =>
+        new HostedRuntime(
+          {
+            id: "rt",
+            name: "Node",
+            services: [
+              { uuid: "a", serviceId: "timer" },
+              { uuid: "b", serviceId: "missing" },
+            ],
+          } as never,
+          build,
+        ),
+    ).toThrow(UnknownServiceError);
+    expect(destroyed).toEqual(["a"]);
   });
 });

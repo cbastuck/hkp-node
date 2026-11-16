@@ -100,6 +100,7 @@ import {
   newRun,
   RuntimeApp,
   TenantRuntimes,
+  UnknownServiceError,
 } from "./runtime";
 import { MountRegistry } from "./mounts";
 import { outgoingPayload } from "./callReport";
@@ -1664,6 +1665,11 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
     (err: Error, req: Request, res: Response, _next: NextFunction) => {
       if (err instanceof SyntaxError) {
         res.sendStatus(400);
+        return;
+      }
+      // Names only the id the request sent, so it can say which one.
+      if (err instanceof UnknownServiceError) {
+        res.status(400).json({ error: err.message });
         return;
       }
       // Said in words: the caller is a board editor, and "too large" is
