@@ -36,6 +36,7 @@ import {
   projectConfig,
   projectNotification,
   projectState,
+  readBroadcast,
   readFacadeAccess,
   runtimeHolding,
 } from "./facadeAccess";
@@ -155,6 +156,9 @@ export class BoardSession {
   // the life of a session — deploying again makes a new one — so it is read
   // once.
   private readonly access: FacadeAccess;
+  // The services whose news is the board's rather than the actor's: what they
+  // say in a person's run goes to everybody attached. Fixed with the config.
+  private readonly boardNews: Set<string>;
   // When each member last asked for something to be processed, by email, for
   // the rate that bounds them.
   private readonly memberProcessTimes = new Map<string, number[]>();
@@ -189,6 +193,7 @@ export class BoardSession {
     this.createdAt = restored?.createdAt ?? new Date().toISOString();
     this.stopped = restored?.stopped ?? false;
     this.access = readFacadeAccess(config.facade);
+    this.boardNews = readBroadcast(config.facade);
   }
 
   /** The runtimes this board cannot run without, in chain order. */
@@ -1000,6 +1005,10 @@ export class BoardSession {
    * and nobody else's — what one member's action produced is not another
    * member's to read, and not the owner's to watch. Board, mount and local
    * actors produce shared board news, so those notifications go to everyone.
+   * So does what a service the facade names in `broadcast` says, in anybody's
+   * run: the board declared that service's answer to be everybody's — a chat's
+   * thread, read back after one member wrote to it. Its account of the flow
+   * stays the actor's: that carries what they sent, not what the board says.
    *
    * A member is sent it only from a service the facade reads, cut down to
    * what the facade reads of it, and never the runtime's own account of its
@@ -1015,8 +1024,10 @@ export class BoardSession {
     if (!this.runMayContinue(context)) {
       return;
     }
+    const news =
+      this.boardNews.has(serviceUuid) && !isFlowNotification(payload);
     const caller =
-      context?.actor.kind === "person" ? context.actor : undefined;
+      context?.actor.kind === "person" && !news ? context.actor : undefined;
     const frameOf = (said: unknown) =>
       JSON.stringify({ type: "notification", runtimeId, serviceUuid, payload: said });
     let whole: string | null = null;
