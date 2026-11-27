@@ -954,6 +954,81 @@ describe("what a member may send", () => {
     expect(anna.all("notification").every((n) => n.serviceUuid === "book")).toBe(true);
     expect(JSON.stringify(anna.all("notification"))).not.toContain("__internal");
   });
+
+  it("produces news for everybody from a service the facade broadcasts", async () => {
+    const board: CloudBoardConfig = {
+      ...BOARD,
+      facade: { ...(BOARD.facade as Record<string, unknown>), broadcast: ["book"] },
+    };
+    const made = await hostWith({ board });
+    for (const [person, name] of [
+      [ANNA, "Anna"],
+      [BEN, "Ben"],
+    ] as const) {
+      await made.host.coordinator.setMember(OWNER.sub, BOARD.boardName, {
+        email: person.email!,
+        name,
+      });
+    }
+    const owner = await attached(made.host, OWNER);
+    const anna = await attached(made.host, ANNA);
+    const ben = await attached(made.host, BEN);
+
+    await anna.ask({
+      type: "processService",
+      requestId: "p-1",
+      runtimeId: "node",
+      serviceUuid: "book",
+      payload: {},
+    });
+    await eventually(() => rowsOf(ben).length > 0, "Ben hearing Anna's run");
+    await eventually(() => rowsOf(owner).length > 0, "the owner hearing it");
+
+    // The same answer — the board's, not Ben's — and only what the facade
+    // reads of it.
+    const [said] = ben.all("notification").filter((n) => n.serviceUuid === "book");
+    expect(Object.keys(said.payload as object).sort()).toEqual(["rows"]);
+    expect(rowsOf(ben)[0]).toEqual([
+      { sub: ANNA.sub, email: ANNA.email, name: "Anna", role: "member" },
+    ]);
+    // Nothing else the run went through, and not its account of the flow.
+    expect(ben.all("notification").every((n) => n.serviceUuid === "book")).toBe(true);
+    expect(JSON.stringify(ben.all("notification"))).not.toContain("__internal");
+    expect(JSON.stringify(owner.all("notification"))).not.toContain("__internal");
+  });
+
+  it("is broadcast only for the services the facade names", async () => {
+    const board: CloudBoardConfig = {
+      ...BOARD,
+      facade: { ...(BOARD.facade as Record<string, unknown>), broadcast: ["admin"] },
+    };
+    const made = await hostWith({ board });
+    for (const [person, name] of [
+      [ANNA, "Anna"],
+      [BEN, "Ben"],
+    ] as const) {
+      await made.host.coordinator.setMember(OWNER.sub, BOARD.boardName, {
+        email: person.email!,
+        name,
+      });
+    }
+    const anna = await attached(made.host, ANNA);
+    const ben = await attached(made.host, BEN);
+
+    await anna.ask({
+      type: "processService",
+      requestId: "p-1",
+      runtimeId: "node",
+      serviceUuid: "book",
+      payload: {},
+    });
+    await eventually(() => rowsOf(anna).length > 0, "Anna's answer");
+    await settle();
+
+    // `book` is not named, so it stays Anna's; `admin` is named but no member
+    // reads it, so broadcasting it grants Ben nothing.
+    expect(ben.all("notification")).toEqual([]);
+  });
 });
 
 describe("a member's bridge and the board's runtimes", () => {

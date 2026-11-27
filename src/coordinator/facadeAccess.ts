@@ -143,6 +143,24 @@ export function readFacadeAccess(facade: unknown): FacadeAccess {
 }
 
 /**
+ * The services a facade says are the board's news (`broadcast`): what they say
+ * in anybody's run is for everybody attached, not only for whoever acted.
+ *
+ * Read from the facade as written rather than as a member is shown it. This
+ * decides who hears a service, not what a member may read of it, which the
+ * member's own `sources` still decide.
+ */
+export function readBroadcast(facade: unknown): Set<string> {
+  const said = isRecord(facade) ? facade.broadcast : undefined;
+  if (!Array.isArray(said)) {
+    return new Set();
+  }
+  return new Set(
+    said.filter((uuid): uuid is string => typeof uuid === "string" && isLiteral(uuid)),
+  );
+}
+
+/**
  * The source paths a facade may not have, anywhere in it — kept for the owner
  * or not, since what the owner keeps today a member may be shown tomorrow.
  * Asked where a board is taken in, so that one carrying them is refused there
