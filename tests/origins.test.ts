@@ -65,8 +65,13 @@ describe("origins", () => {
     expect(admits(allowed, "saucer://embedded")).toBe(true);
     expect(admits(allowed, "hkp://app")).toBe(true);
     expect(admits(allowed, "https://appassets.androidplatform.net")).toBe(true);
+    expect(
+      admits(allowed, "vscode-webview://1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d"),
+    ).toBe(true);
     expect(admits(allowed, "http://localhost:5173")).toBe(true);
 
+    expect(admits(allowed, "vscode-webview://")).toBe(false);
+    expect(admits(allowed, "vscode-webview://evil/path")).toBe(false);
     expect(admits(allowed, "https://evil.example")).toBe(false);
     // The project's own website is a site like any other until somebody says so.
     expect(admits(allowed, "https://readymadeit.com")).toBe(false);
