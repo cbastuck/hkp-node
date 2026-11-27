@@ -1,6 +1,7 @@
 import { MountHandle, MountHandlers } from "./mounts";
 import { SecretVault } from "./secrets";
 import { AssetDescriptor, AssetStore } from "./assets";
+import { ResourceBinding, ResourceStore } from "./resources";
 
 export type JsonRecord = Record<string, unknown>;
 
@@ -63,6 +64,12 @@ export type RuntimeConfiguration = {
    * for. They go into the runtime's asset store and never into service state.
    */
   assets?: Record<string, AssetDescriptor>;
+  /**
+   * Bindings for the `hkp-resource://<id>` references this runtime's services
+   * carry, by id. Unpacked into the runtime's resource store and never placed
+   * into service state or a serialized runtime.
+   */
+  resources?: Record<string, ResourceBinding>;
   /**
    * Whether this runtime records anything at all.
    *
@@ -452,6 +459,11 @@ export interface RuntimeHost {
    * because a host that was not provisioned with any has nothing to answer.
    */
   assets?(): AssetStore;
+  /**
+   * The runtime's resource bindings, for a service that connects to an
+   * external resource by reference (`hkp-resource://<id>`).
+   */
+  resources?(): ResourceStore;
   /**
    * The slots this pipeline's values may be held in, or nothing where no store
    * has been provided.

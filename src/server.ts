@@ -138,6 +138,7 @@ import {
   DEFAULT_MAX_INLINE_ASSET_BYTES,
   readAssetsPayload,
 } from "./assets";
+import { ResourceBinding, readResourcesPayload } from "./resources";
 import {
   CoordinatorLinks,
   CoordinatorLinksOptions,
@@ -1399,6 +1400,25 @@ export function createRuntimeServer(options: CreateRuntimeServerOptions = {}) {
   });
 
   /**
+   * Bindings for the resources this runtime's services reference.
+   *
+   * Provisioning carries them already; this is for a binding added or changed
+   * while the board runs — which reaches a service on its next resolution
+   * without reconfiguring it — and for a re-push after a restart. It merges,
+   * and `null` unbinds or removes a resource.
+   *
+   * Answers with the ids held, never addresses or credentials.
+   */
+  expressApp.post("/runtimes/:runtimeId/resources", (req, res) => {
+    const runtime = getRuntimeOr404(req, res, req.params.runtimeId);
+    if (!runtime) {
+      return;
+    }
+    runtime.setResources(readResourcesPayload(req.body));
+    res.json({ ids: runtime.resources().ids() });
+  });
+
+  /**
    * Whether an asset resolves here, and to what — its media type and size, or
    * the reason it does not. A check, not a download: the content stays where
    * it is, and a URL source is fetched from where it will actually be used.
@@ -2046,6 +2066,7 @@ function validateRuntimeConfiguration(
     // Descriptors for the assets the services reference; a removal means
     // nothing to a runtime being created, so only descriptors are kept.
     assets: presentAssets(readAssetsPayload(value.assets)),
+    resources: presentResources(readResourcesPayload(value.resources)),
     services,
   };
 }
@@ -2054,6 +2075,18 @@ function presentAssets(
   entries: Record<string, AssetDescriptor | null>,
 ): Record<string, AssetDescriptor> {
   const present: Record<string, AssetDescriptor> = {};
+  for (const [id, entry] of Object.entries(entries)) {
+    if (entry) {
+      present[id] = entry;
+    }
+  }
+  return present;
+}
+
+function presentResources(
+  entries: Record<string, ResourceBinding | null>,
+): Record<string, ResourceBinding> {
+  const present: Record<string, ResourceBinding> = {};
   for (const [id, entry] of Object.entries(entries)) {
     if (entry) {
       present[id] = entry;

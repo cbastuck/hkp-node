@@ -65,6 +65,7 @@ export class NestedPipeline {
     this.applyScope();
     this.applySecrets();
     this.applyAssets();
+    this.applyResources();
     this.applySlots();
     this.applyMounts();
   }
@@ -252,6 +253,7 @@ export class NestedPipeline {
     this.applyScope();
     this.applySecrets();
     this.applyAssets();
+    this.applyResources();
     this.applySlots();
     this.applyMounts();
   }
@@ -292,6 +294,10 @@ export class NestedPipeline {
    */
   private applyAssets(): void {
     this.runtime?.delegateAssets(() => this.host?.assets?.() ?? null);
+  }
+
+  private applyResources(): void {
+    this.runtime?.delegateResources(() => this.host?.resources?.() ?? null);
   }
 
   /**

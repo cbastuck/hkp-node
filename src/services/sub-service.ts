@@ -120,6 +120,7 @@ export class SubService implements HostedService {
     this.applyScope();
     this.applySecrets();
     this.applyAssets();
+    this.applyResources();
     this.applySlots();
     this.applyMounts();
   }
@@ -176,6 +177,10 @@ export class SubService implements HostedService {
    */
   private applyAssets(): void {
     this.pipeline?.delegateAssets(() => this.host?.assets?.() ?? null);
+  }
+
+  private applyResources(): void {
+    this.pipeline?.delegateResources(() => this.host?.resources?.() ?? null);
   }
 
   /**
@@ -533,6 +538,7 @@ export class SubService implements HostedService {
     this.applyScope();
     this.applySecrets();
     this.applyAssets();
+    this.applyResources();
     this.applySlots();
     this.applyMounts();
   }

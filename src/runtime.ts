@@ -23,6 +23,7 @@ import {
 import { ADDRESS_SEPARATOR, descend, splitAddress } from "./address";
 import { SecretVault } from "./secrets";
 import { AssetDescriptor, AssetStore, AssetStoreOptions } from "./assets";
+import { ResourceBinding, ResourceStore } from "./resources";
 import { ANONYMOUS_SUB, AuthenticatedUser } from "./auth";
 import { MountHandle, MountHandlers } from "./mounts";
 
@@ -365,6 +366,8 @@ export class HostedRuntime implements RuntimeHost {
    * see `delegateAssets`.
    */
   private assetsFrom: (() => AssetStore | null) | null = null;
+  private readonly resourceStore = new ResourceStore();
+  private resourcesFrom: (() => ResourceStore | null) | null = null;
   /**
    * The cells services in this runtime hold values in between passes.
    *
@@ -420,6 +423,9 @@ export class HostedRuntime implements RuntimeHost {
     );
     if (config.assets) {
       this.assetStore.replace(config.assets);
+    }
+    if (config.resources) {
+      this.resourceStore.replace(config.resources);
     }
 
     // Whole or not at all: a service that cannot be built leaves those before
@@ -901,6 +907,18 @@ export class HostedRuntime implements RuntimeHost {
    */
   setAssets(entries: Record<string, AssetDescriptor | null>): void {
     this.assetStore.merge(entries);
+  }
+
+  resources(): ResourceStore {
+    return this.resourcesFrom?.() ?? this.resourceStore;
+  }
+
+  delegateResources(source: () => ResourceStore | null): void {
+    this.resourcesFrom = source;
+  }
+
+  setResources(entries: Record<string, ResourceBinding | null>): void {
+    this.resourceStore.merge(entries);
   }
 
   slots(): SlotStore {
