@@ -37,12 +37,19 @@
  */
 export type AllowedOrigins = "default" | "*" | string[];
 
-/** Where the Readymade apps load their pages from: desktop, iOS, Android. */
+/** Where the Readymade apps load their pages from: desktop, iOS, Android, VS Code. */
 const APP_ORIGINS = [
   "saucer://embedded",
   "hkp://app",
   "https://appassets.androidplatform.net",
 ];
+
+function isAppOrigin(origin: string): boolean {
+  return (
+    APP_ORIGINS.includes(origin) ||
+    /^vscode-webview:\/\/[0-9a-z.-]+$/.test(origin)
+  );
+}
 
 /** Reads `ALLOWED_ORIGINS`. */
 export function parseAllowedOrigins(value: string | undefined): AllowedOrigins {
@@ -143,7 +150,7 @@ export function allowsOriginWithoutCredential(
   if (Array.isArray(allowed)) {
     return allowed.includes(value);
   }
-  return APP_ORIGINS.includes(value) || isLoopbackOrigin(value);
+  return isAppOrigin(value) || isLoopbackOrigin(value);
 }
 
 /**
